@@ -57,7 +57,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD": "",
     "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE": "OTG 派彩/min",
     "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD": "",
-    "GRAFANA_DASHBOARD_FROM": "now-6h",
+    "GRAFANA_DASHBOARD_FROM": "now-30m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
@@ -127,11 +127,11 @@ _CFG: Dict[str, Any] = {
     # 全面板加载等待预算（毫秒）
     "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 12000,
     # Set via environment (systemd Environment=) — do not commit real secrets.
-    "GRAFANA_USER": "",
-    "GRAFANA_PASSWORD": "",
-    "VERIFICATION_TOKEN": "",
-    "APP_ID": "",
-    "APP_SECRET": "",
+    "GRAFANA_USER": "om_duty",
+    "GRAFANA_PASSWORD": "5tgb%TGB094",
+    "VERIFICATION_TOKEN": "nzdtU1ZFrMJHz2V6kZeFsrEFa7vs0H3C",
+    "APP_ID": "cli_a97490f2bcf89ed2",
+    "APP_SECRET": "Uo1YHHiWfDo7MOOYVIUFRgJvxf1VyJFE",
     "MONITORING_TRIGGER": "/mo",
     "MONITORING_MUTE_TRIGGER": "/m",
     "MONITORING_CANCELMUTE_TRIGGER": "/c",
@@ -1767,7 +1767,7 @@ def fetch_request_total_1m_series(
     end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Primary monitored panel (``GRAFANA_PANEL_TITLE``) via Grafana proxy / ds query.
+    Same data as Grafana panel「请求总数/1m」via Prometheus ``query_range`` (Grafana proxy).
 
     Default window (unless ``start_unix``/``end_unix`` passed, or watchdog overrides):
 
@@ -4199,7 +4199,7 @@ def _filter_low_outlier_points(
 ) -> List[Tuple[float, float]]:
     """
     Remove tiny baseline outliers (e.g. 1/2/3/5) that can explode % change for
-    high-volume series (30k~50k). Used for keyword-merge panels (e.g. provider slots).
+    high-volume series (30k~50k). This is used for Provider/Games keyword panels.
     """
     if len(points) < 4:
         return points
@@ -4917,6 +4917,21 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             a2 = _analysis_for_provider_inhouse_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
             series = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines(title, a2)
+        elif k == "games_jili":
+            a2 = _analysis_for_games_jili_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_JILI
+            series = MONITORING_GAMES_JILI_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines(title, a2)
+        elif k == "games_general":
+            a2 = _analysis_for_games_general_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_GENERAL
+            series = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
+            extra_footer = _format_extra_analysis_lines(title, a2)
+        elif k == "games_inhouse":
+            a2 = _analysis_for_games_inhouse_payload(p2)
+            title = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
+            series = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
             extra_footer = _format_extra_analysis_lines(title, a2)
         else:
             continue
