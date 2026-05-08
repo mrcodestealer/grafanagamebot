@@ -177,6 +177,8 @@ _CFG: Dict[str, Any] = {
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
     "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Resend screenshot",
+    "MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS": "16000",
+    "MONITORING_MESSAGE_CARD_TRUNCATE": "1",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -3232,14 +3234,36 @@ def _lark_send_monitoring_user_message(
     rid = (receive_id or "").strip()
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
-    # Card markdown body has strict cap; for long replies, send split text messages directly.
-    # Keep this threshold conservative to avoid card-side clipping.
-    if len(reply or "") > 3000:
-        _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
-        return False, False
+    raw_reply = reply or ""
+    max_card = _cfg_int("MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS", 16000)
+    if max_card <= 0:
+        max_card = 3000
+
+    reply_for_card = raw_reply
+    if len(raw_reply) > max_card:
+        if MONITORING_MESSAGE_CARD_ENABLE and _lark_env_truthy_or_default(
+            "MONITORING_MESSAGE_CARD_TRUNCATE",
+            default=True,
+        ):
+            trunc_note = "\n\n… *(truncated for Feishu card size)*"
+            budget = max(800, max_card - len(trunc_note))
+            reply_for_card = raw_reply[:budget].rstrip() + trunc_note
+            logger.warning(
+                "monitoring interactive card: truncated body %s→%s chars "
+                "(MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS=%s)",
+                len(raw_reply),
+                len(reply_for_card),
+                max_card,
+            )
+        else:
+            _lark_send_text_auto(receive_id_type, rid, raw_reply, max_chars=3200)
+            return False, False
+
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
-            card = _monitoring_interactive_card_dict(reply, receive_id_type, rid, lark_img_key)
+            card = _monitoring_interactive_card_dict(
+                reply_for_card, receive_id_type, rid, lark_img_key
+            )
             _lark_send_interactive_card(receive_id_type, rid, card)
             return True, bool((lark_img_key or "").strip())
         except Exception as e:
@@ -3248,7 +3272,7 @@ def _lark_send_monitoring_user_message(
                 'check app permission "Send message cards".',
                 e,
             )
-    _lark_send_text_auto(receive_id_type, rid, reply, max_chars=3200)
+    _lark_send_text_auto(receive_id_type, rid, raw_reply, max_chars=3200)
     return False, False
 
 
