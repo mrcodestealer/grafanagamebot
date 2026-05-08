@@ -89,7 +89,8 @@ _CFG: Dict[str, Any] = {
     # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
     "GRAFANA_SCREENSHOT_REFRESH": "1",
     # Refresh 后等 Spinner 的最长毫秒（过大会拖慢整条截图）
-    "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 1600,
+    # Refresh 后等 Spinner；过小易截到半加载图，过大拖慢整条链路（可调）
+    "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 900,
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
     # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-15m / now）；0 则用 Prometheus 窗口的绝对毫秒时间戳
@@ -109,16 +110,16 @@ _CFG: Dict[str, Any] = {
     # 常驻浏览器每次截图前：不清空全部 cookie，只追加/覆盖新登录（减轻 SPA 主区闪空白）
     "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
     # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
-    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "800",
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "350",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
     # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 2800,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
-    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 100,
-    "GRAFANA_SCREENSHOT_SETTLE_MS": 300,
-    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 7000,
+    "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 70,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 120,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 4500,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
@@ -126,7 +127,7 @@ _CFG: Dict[str, Any] = {
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 7,
     # 全面板加载等待预算（毫秒）
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 12000,
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 7500,
     # Set via environment (systemd Environment=) — do not commit real secrets.
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
@@ -187,6 +188,8 @@ _CFG: Dict[str, Any] = {
     "LARK_WEBHOOK_TIMING_LOG": "0",
     "MONITORING_HTTP_DROP_ALERT_PCT": 15,
     "MONITORING_HTTP_CONTINUOUS_ALERT_PCT": 15,
+    # 0=本 Game 看板无 HTTP「请求总数/1m」聚合：不拉该面板，不出现 ``no http-labeled series`` 等行；1=保留旧行为
+    "MONITORING_HTTP_PRIMARY_ENABLE": "0",
     "MONITORING_9280_ENABLE": "1",
     "MONITORING_9280_ALERT_PCT": 15,
     "MONITORING_9280_CONTINUOUS_ALERT_PCT": 15,
@@ -520,6 +523,10 @@ TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).s
 MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
 MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
 MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
+MONITORING_HTTP_PRIMARY_ENABLE = _lark_env_truthy_or_default(
+    "MONITORING_HTTP_PRIMARY_ENABLE",
+    default=False,
+)
 MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_9280_CONTINUOUS_ALERT_PCT", 25.0)
 MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
 MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
@@ -2321,7 +2328,19 @@ def fetch_monitoring_payload(
                 w_start,
                 w_end,
             )
-    primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
+    else:
+        primary = {
+            "panelTitle": GRAFANA_PANEL_TITLE,
+            "dashboardUid": GRAFANA_DASHBOARD_UID,
+            "window": {
+                "startUnix": 0,
+                "endUnix": 0,
+                "stepSeconds": GRAFANA_QUERY_STEP,
+            },
+            "series": [],
+        }
     extra: List[Dict[str, Any]] = []
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
         try:
@@ -2391,6 +2410,10 @@ def fetch_monitoring_payload(
             logger.exception("fetch provider INHOUSE panel failed (optional monitor)")
     if extra:
         primary["extraPanels"] = extra
+        if not MONITORING_HTTP_PRIMARY_ENABLE:
+            w0 = (extra[0].get("payload") or {}).get("window") or {}
+            if int(w0.get("startUnix") or 0) > 0 and int(w0.get("endUnix") or 0) > 0:
+                primary["window"] = dict(w0)
     return primary
 
 
@@ -2723,7 +2746,9 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
     """
     (channel_id, display_label) for enabled monitors. channel_id matches extraPanels ``kind`` or ``http``.
     """
-    out: List[Tuple[str, str]] = [("http", GRAFANA_PANEL_TITLE)]
+    out: List[Tuple[str, str]] = []
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        out.append(("http", GRAFANA_PANEL_TITLE))
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
         out.append(("9280_push", GRAFANA_PANEL_TITLE_9280))
     if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
@@ -3497,7 +3522,7 @@ def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
             try:
                 loc.nth(i).click(timeout=900)
                 clicked += 1
-                page.wait_for_timeout(40)
+                page.wait_for_timeout(28)
             except Exception:
                 pass
         if clicked:
@@ -3506,7 +3531,7 @@ def _grafana_expand_collapsed_dashboard_rows(page: Any) -> None:
                 clicked,
                 sel,
             )
-            page.wait_for_timeout(180)
+            page.wait_for_timeout(110)
         return
 
 
@@ -3556,7 +3581,7 @@ def _grafana_click_dashboard_refresh(
         try:
             loc.click(timeout=tclick)
             logger.info("Grafana screenshot: clicked Refresh/run control (locator #%s)", idx)
-            page.wait_for_timeout(220)
+            page.wait_for_timeout(120)
             _grafana_close_open_menus(page)
             _grafana_wait_loading_like_gone(page, spin_cap)
             return
@@ -3566,7 +3591,7 @@ def _grafana_click_dashboard_refresh(
     try:
         logger.info("Grafana screenshot: no explicit Refresh control — using full page reload instead")
         page.reload(wait_until="load", timeout=timeout_ms)
-        page.wait_for_timeout(380)
+        page.wait_for_timeout(260)
         _grafana_wait_loading_like_gone(page, spin_cap)
     except Exception as e:
         logger.info("Grafana screenshot: refresh fallback reload failed: %s", e)
@@ -3662,7 +3687,7 @@ def _grafana_wait_loading_like_gone(page: Any, budget_ms: int) -> None:
                 return
         else:
             stable = 0
-        page.wait_for_timeout(160)
+        page.wait_for_timeout(100)
     c = _grafana_loading_like_count(page)
     busy = _grafana_refresh_toolbar_busy(page)
     if c > 0 or busy:
@@ -3763,7 +3788,7 @@ def _grafana_wait_panels_fully_loaded(page: Any, budget_ms: int) -> None:
                 return
         else:
             stable = 0
-        page.wait_for_timeout(220)
+        page.wait_for_timeout(150)
     total, ready = _grafana_panel_ready_stats(page)
     logger.warning(
         "Grafana screenshot: panel readiness timeout after %sms (ready=%s/%s ratio_target=%.2f min=%s)",
@@ -3809,8 +3834,8 @@ def _grafana_stabilize_dashboard_render(
     """
     r = GRAFANA_SCREENSHOT_STABILIZE_ROUNDS if rounds is None else max(1, min(8, int(rounds)))
     sm = int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS)
-    per_round = max(600, min(3200, int(sm * 0.36)))
-    final_spin = max(800, min(4000, int(sm * 0.5)))
+    per_round = max(450, min(2400, int(sm * 0.28)))
+    final_spin = max(550, min(3200, int(sm * 0.42)))
 
     if GRAFANA_SCREENSHOT_MIN_GRID_ITEMS > 0:
         _grafana_wait_min_react_grid_items(
@@ -3939,7 +3964,7 @@ def _grafana_wait_dashboard_ready(page: Any, timeout_ms: int) -> None:
     else:
         logger.info("Grafana screenshot: dashboard content wait matched %r", matched)
 
-    page.wait_for_timeout(320)
+    page.wait_for_timeout(160)
 
 
 def _playwright_cookie_list(session: requests.Session) -> List[Dict[str, Any]]:
@@ -4011,7 +4036,7 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     Caller must have injected Grafana cookies (and optional boot-warm root ``/``) beforehand.
     """
     page.goto(url, wait_until="load", timeout=timeout_ms)
-    page.wait_for_timeout(200)
+    page.wait_for_timeout(120)
     _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_click_dashboard_refresh(page, timeout_ms)
     # Refresh 有时会重新弹出 mega-menu；再收一次侧栏
@@ -4021,7 +4046,7 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
     _grafana_stabilize_dashboard_render(page, timeout_ms)
     _grafana_wait_panels_fully_loaded(page, int(GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS))
-    page.wait_for_timeout(180)
+    page.wait_for_timeout(90)
 
     if not _grafana_dashboard_has_visual_content(page):
         _grafana_expand_collapsed_dashboard_rows(page)
@@ -4168,7 +4193,7 @@ class GrafanaPlaywrightKeeper:
             context.add_cookies(_playwright_cookie_list(sess0))
             if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
-                page.wait_for_timeout(220)
+                page.wait_for_timeout(140)
 
             warm_url = _grafana_build_screenshot_dashboard_url(0, 0)
             logger.info("GrafanaPlaywrightKeeper: warm-up load url=%s…", warm_url[:220])
@@ -4346,7 +4371,7 @@ def _grafana_headless_screenshot_png(
             base = str(GRAFANA_BASE_URL).rstrip("/")
             if _lark_env_truthy("GRAFANA_SCREENSHOT_BOOT_WARM"):
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
-                page.wait_for_timeout(220)
+                page.wait_for_timeout(140)
 
             return _grafana_playwright_render_dashboard_and_png(page, url, timeout_ms)
         finally:
@@ -5236,18 +5261,10 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         "",
     ]
     reason_blocks: List[str] = []
-    a_http = _http_analysis_for_payload(payload)
-    if not _monitoring_alert_channel_muted("http"):
-        reasons = _format_trigger_lines(
-            GRAFANA_PANEL_TITLE,
-            "all series merged",
-            a_http,
-            MONITORING_HTTP_DROP_ALERT_PCT,
-            MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
-            MONITORING_ALERT_WINDOW_SECONDS,
-        )
-        if not reasons:
-            fb = _format_trigger_fallback_line(
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        a_http = _http_analysis_for_payload(payload)
+        if not _monitoring_alert_channel_muted("http"):
+            reasons = _format_trigger_lines(
                 GRAFANA_PANEL_TITLE,
                 "all series merged",
                 a_http,
@@ -5255,16 +5272,27 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
                 MONITORING_ALERT_WINDOW_SECONDS,
             )
-            if fb:
-                reasons.append(fb)
-        if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
-            reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "all series merged", a_http)]
-        elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons.append(
-                _format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "all series merged", a_http)
-            )
-        if reasons:
-            reason_blocks.append("\n\n".join(reasons))
+            if not reasons:
+                fb = _format_trigger_fallback_line(
+                    GRAFANA_PANEL_TITLE,
+                    "all series merged",
+                    a_http,
+                    MONITORING_HTTP_DROP_ALERT_PCT,
+                    MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+                    MONITORING_ALERT_WINDOW_SECONDS,
+                )
+                if fb:
+                    reasons.append(fb)
+            if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
+                reasons = [
+                    _format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "all series merged", a_http)
+                ]
+            elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
+                reasons.append(
+                    _format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "all series merged", a_http)
+                )
+            if reasons:
+                reason_blocks.append("\n\n".join(reasons))
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -5348,10 +5376,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     _mute_purge_expired()
-    if not _monitoring_alert_channel_muted("http") and bool(
-        _http_analysis_for_payload(payload).get("hit_alert")
-    ):
-        return True
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        if not _monitoring_alert_channel_muted("http") and bool(
+            _http_analysis_for_payload(payload).get("hit_alert")
+        ):
+            return True
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -5433,7 +5462,9 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
     max_rows = MONITORING_TABLE_TAIL_ROWS
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
     base = str(GRAFANA_BASE_URL).rstrip("/")
-    http_ex = _http_analysis_for_payload(payload)
+    http_ex = (
+        _http_analysis_for_payload(payload) if MONITORING_HTTP_PRIMARY_ENABLE else {}
+    )
 
     lines: List[str] = [
         f"[{payload.get('panelTitle')}] graph",
@@ -5508,36 +5539,37 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             lines.append(f"(no points matched for {series_disp})")
         lines.extend(extra_footer)
 
-    for s in payload.get("series") or []:
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        results = pdata.get("result") or []
-        ref = s.get("refId") or "?"
-        if not results:
-            lines.append(f"- [{ref}] no data")
-            continue
-        http_results = [
-            r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
-        ]
-        if not http_results:
-            lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
-            continue
-        for r in http_results[:6]:
-            m = r.get("metric") or {}
-            legend = _compact_http_legend(m, str(ref))
-            vals = r.get("values") or []
-            if not vals:
-                lines.append(f"[{ref}] {legend}: (empty)")
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        for s in payload.get("series") or []:
+            prom = s.get("prometheus") or {}
+            pdata = prom.get("data") or {}
+            results = pdata.get("result") or []
+            ref = s.get("refId") or "?"
+            if not results:
+                lines.append(f"- [{ref}] no data")
                 continue
-            lines.append("")
-            lines.append(f"[{ref}] {legend}")
-            tail = vals[-max_rows:]
-            rows: List[str] = ["time           value"]
-            for pair in tail:
-                rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-            lines.append("```text")
-            lines.extend(rows)
-            lines.append("```")
+            http_results = [
+                r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
+            ]
+            if not http_results:
+                lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
+                continue
+            for r in http_results[:6]:
+                m = r.get("metric") or {}
+                legend = _compact_http_legend(m, str(ref))
+                vals = r.get("values") or []
+                if not vals:
+                    lines.append(f"[{ref}] {legend}: (empty)")
+                    continue
+                lines.append("")
+                lines.append(f"[{ref}] {legend}")
+                tail = vals[-max_rows:]
+                rows = ["time           value"]
+                for pair in tail:
+                    rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                lines.append("```text")
+                lines.extend(rows)
+                lines.append("```")
 
     if (
         include_target_mention
@@ -5545,7 +5577,8 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         and TARGET_USER_OPEN_ID
     ):
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
-    lines.extend(_format_http_analysis_lines(http_ex, section_label=GRAFANA_PANEL_TITLE))
+    if MONITORING_HTTP_PRIMARY_ENABLE:
+        lines.extend(_format_http_analysis_lines(http_ex, section_label=GRAFANA_PANEL_TITLE))
 
     return "\n".join(lines)
 
@@ -5593,7 +5626,7 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
         if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
             raise RuntimeError("GRAFANA_SCREENSHOT_ENABLE=0")
         sess = grafana_login_session()
-        payload = fetch_request_total_1m_series(session=sess)
+        payload = fetch_monitoring_payload(session=sess)
         w = payload.get("window") or {}
         su = int(w.get("startUnix") or 0)
         eu = int(w.get("endUnix") or 0)
@@ -6863,6 +6896,10 @@ def grafana_ping():
 def metrics_request_total_1m():
     """Last 10 minutes of「请求总数/1m」panel (1-minute step). Poll every 1m from cron or Lark."""
     try:
+        if not MONITORING_HTTP_PRIMARY_ENABLE:
+            return jsonify(
+                {"error": "MONITORING_HTTP_PRIMARY_ENABLE=0 — HTTP primary panel disabled on this bot"}
+            ), 404
         data = fetch_request_total_1m_series()
         data["httpAnalysis"] = _http_analysis_for_payload(data)
         return jsonify(data)
