@@ -6213,7 +6213,7 @@ def webhook_event():
 
     if request.method == "GET":
         # No secrets — use to confirm env + URL reachability from browser/curl.
-        _listen_port = _cfg_listen_port(5002)
+        _listen_port = _cfg_listen_port()
         app_id = (APP_ID or "").strip()
         lark_sdk_version: Optional[str] = None
         try:
@@ -6275,7 +6275,7 @@ def webhook_event():
                     "飞书约 3s 超时：请用 python main.py 启动；webhook 先 200，Grafana 在后台线程执行。",
                     "发消息依赖 lark-oapi：pip install -U lark-oapi；GET 本 URL 可查看 lark_oapi_version。",
                     "lark_oapi_installed=false 只影响发消息，不影响「请求 URL 校验」；校验失败多半是 VERIFICATION_TOKEN 与后台不一致。",
-                    "若用 systemd：可在 unit 里 Environment=VERIFICATION_TOKEN=… / Environment=PORT=5002（与同机 Chatbox 的 5000 区分），或 EnvironmentFile=-/path/to/.env；修改后 daemon-reload && restart。",
+                    "若用 systemd：可在 unit 里 Environment=VERIFICATION_TOKEN=… / Environment=PORT=5088（grafanagamebot 默认 5088；与同机 grafanaplatformbot 5002、Chatbox 5000 区分），或 EnvironmentFile=-/path/to/.env；修改后 daemon-reload && restart。",
                     f"若飞书提示 3s 超时：云厂商安全组/防火墙须放行公网入站 TCP {_listen_port}；本机 curl -m 5 -X POST http://IP:{_listen_port}/webhook/event -H Content-Type:application/json -d '{{...}}' 测连通。",
                     "仍超时：核对控制台 URL 与监听一致（http/https）；排查时设 LARK_WEBHOOK_WSGI_LOG=1 再看 journal。",
                     "curl 勿只发 {\"challenge\":\"ping\"}→403 正常；应用 {\"type\":\"url_verification\",\"token\":\"…\",\"challenge\":\"ping\"} 测 POST 延迟。",
@@ -6419,7 +6419,7 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
-    port = _cfg_listen_port(5002)
+    port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()
         if MONITORING_AT_MENTION_ENABLE and not _oid:
