@@ -1,35 +1,12 @@
 #!/usr/bin/env python3
 """
-Lark events：**HTTP webhook** 或 **WebSocket 长连接**（二选一，由 ``LARK_EVENT_MODE`` 决定）+ Grafana。
+grafanagamebot — Lark + Grafana「Online Number」仪表盘（7 面板）、默认端口 **5088**。
 
-**grafanagamebot**：默认仪表盘 `Online Number`（uid ``fe70d4bd-4729-471f-9ede-e981ad277963``）、HTTP 端口 **5088**、跌幅/连续告警阈值 **15%**。面板：`LiveSlots Online Number`、`Egame Online Number`、`OTG Online Number`。
+- **配置**：文件顶部 ``_CFG``；可用环境变量覆盖同名键。
+- **HTTP**：``LARK_EVENT_MODE=http`` 时 ``POST /webhook/event``；可选 ``ws`` 长连接（见 ``LARK_EVENT_MODE``）。
+- **命令**：``/mo`` 摘要；``/m`` / ``/c`` 静音；机器人回复为英文。
 
-启动: ``python main.py``
-
-**配置**：编辑本文件顶部 ``_CFG`` 字典（不再读取 ``.env``）。也可用 **systemd ``Environment=KEY=value``** 覆盖同名键。
-
-**``LARK_EVENT_MODE=http``（纯 HTTP，不启 WebSocket）** — 监听 ``PORT``，事件只走 ``POST /webhook/event``。飞书后台请选 **「将事件发送至开发者服务器」** Request URL，**不要**再选「使用长连接接收事件」，否则事件可能仍发到别处或产生混淆。
-
-**``LARK_EVENT_MODE=ws``** — 仅 Lark **长连接**收事件；可选 ``ENABLE_HTTP=1`` 并行起 HTTP 侧车（健康检查等），此时建议 ``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=1``，避免 IM 在 HTTP+WS 各收一次。
-若同一条触发出现 **两条回复**：见 ``LARK_WS_REGISTER_IM_MESSAGE_V2``、``LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS``、``MONITORING_IM_DEBOUNCE_SECONDS``。
-
-**HTTP 模式** — 监听 ``PORT``（本仓库默认 **5088**，与同机运行的 ``Chatbox/main.py``（常用 **5000**）错开端口），事件走 ``POST /webhook/event``。
-默认 HTTP 栈为 **Flask ``threaded=True``**（实现方式对齐 Chatbox）；生产可设 ``HTTP_SERVER=waitress``。
-
-端口解析顺序：**环境变量 ``PORT`` → ``LARKBOT_PORT`` → ``_CFG["PORT"]``**（与 Chatbox 的 ``PORT``/``LARKBOT_PORT`` 习惯一致）。
-
-飞书后台「事件与回调」；``APP_ID`` / ``APP_SECRET`` 必填。国际 Lark ``LARK_HOST=https://open.larksuite.com``。
-
-群/at 机器人发监控命令（默认 ``/mo``）**或仅 @ 机器人（无其它正文）** → Grafana 摘要（默认最近 **15** 分钟）。
-User-visible bot text is **English-only**. Short commands (configurable): ``/mo`` monitoring, ``/m`` mute card, ``/c`` cancel all mutes. **@bot + any other text** → bot replies with this command list.
-默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：用户侧 **一条** 交互卡片（``msg_type=interactive``），截图嵌在卡片内，不再跟一条独立 PNG。设 ``0`` 则仍为「纯文字 + 独立图片」两条消息。需在飞书应用开通「发送消息卡片」权限。
-
-HTTP 回调先返回 ``{}`` 再后台处理。HTTP 跌幅告警命中时可额外转发到 ``MONITORING_ALERT_CHAT_ID``（群 ``chat_id``，如 ``oc_…``）。
-
-可选 ``GRAFANA_SCREENSHOT_ENABLE=1``：与卡片同开时先截一张上传为 ``image_key`` 嵌入卡片；仅关卡片时仍为无头 Chromium 截图后单独发图（需 ``pip install playwright`` 与 ``playwright install chromium``）。
-默认 ``GRAFANA_PERSISTENT_BROWSER=1``：进程启动时后台常驻一颗 Chromium，先预热 Grafana；``/monitoring`` 与告警截图复用该页，失败时自动回退为「每次新开浏览器」。
-默认 ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` 截整页滚动区域（长 dashboard 全部图表）；设为 ``0`` 则仅视口大小（易只拍到上半屏）。
-多轮滚动 + Spinner 轮询见 ``GRAFANA_SCREENSHOT_STABILIZE_ROUNDS`` 等键；Prometheus 无数据/报错的格子无法被脚本「画出曲线」。
+依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
 """
 
 import base64
@@ -66,25 +43,20 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_BASE_URL": "https://grafana.client8.me",
     "GRAFANA_DASHBOARD_PATH": "/d/fe70d4bd-4729-471f-9ede-e981ad277963/online-number",
     "GRAFANA_DASHBOARD_UID": "fe70d4bd-4729-471f-9ede-e981ad277963",
+    # --- Online Number 仪表盘：仅下列 7 个面板（标题须与 Grafana 面板标题完全一致）---
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_9280": "Egame Online Number",
     "MONITORING_9280_SERIES_KEYWORD": "",
     "GRAFANA_PANEL_TITLE_DEPOSIT": "OTG Online Number",
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_WITHDRAW": "提款 (Withdrawal)",
-    "MONITORING_WITHDRAW_SERIES_KEYWORD": "InitiateWithdrawal",
-    "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "IGO Distributions of Providers JILI",
-    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "3201",
-    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "IGO Distributions of Providers GENERAL",
-    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD": "3204",
-    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE": "IGO Distributions of Providers INHOUSE",
-    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD": "3085",
-    "GRAFANA_PANEL_TITLE_GAMES_JILI": "IGO Distributions of Games（Jili）",
-    "MONITORING_GAMES_JILI_SERIES_KEYWORD": "49",
-    "GRAFANA_PANEL_TITLE_GAMES_GENERAL": "IGO Distributions of Games（General）",
-    "MONITORING_GAMES_GENERAL_SERIES_KEYWORD": "1492288",
-    "GRAFANA_PANEL_TITLE_GAMES_INHOUSE": "IGO Distributions of Games（Inhouse）",
-    "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD": "6005",
+    "GRAFANA_PANEL_TITLE_WITHDRAW": "Liveslot 下注Bet/min",
+    "MONITORING_WITHDRAW_SERIES_KEYWORD": "",
+    "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "Egames 下注Bet/min",
+    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "",
+    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "OTG 下注Bet/min",
+    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD": "",
+    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE": "OTG 派彩/min",
+    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD": "",
     "GRAFANA_DASHBOARD_FROM": "now-6h",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -151,7 +123,7 @@ _CFG: Dict[str, Any] = {
     # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
     "GRAFANA_SCREENSHOT_PANEL_READY_RATIO": 0.92,
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
-    "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 8,
+    "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 7,
     # 全面板加载等待预算（毫秒）
     "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 12000,
     # Set via environment (systemd Environment=) — do not commit real secrets.
@@ -206,27 +178,18 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DEPOSIT_ENABLE": "1",
     "MONITORING_DEPOSIT_ALERT_PCT": 15,
     "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_WITHDRAW_ENABLE": "0",
+    "MONITORING_WITHDRAW_ENABLE": "1",
     "MONITORING_WITHDRAW_ALERT_PCT": 15,
     "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_JILI_ENABLE": "0",
+    "MONITORING_PROVIDER_JILI_ENABLE": "1",
     "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
     "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_GENERAL_ENABLE": "0",
+    "MONITORING_PROVIDER_GENERAL_ENABLE": "1",
     "MONITORING_PROVIDER_GENERAL_ALERT_PCT": 15,
     "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_INHOUSE_ENABLE": "0",
+    "MONITORING_PROVIDER_INHOUSE_ENABLE": "1",
     "MONITORING_PROVIDER_INHOUSE_ALERT_PCT": 15,
     "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_GAMES_JILI_ENABLE": "0",
-    "MONITORING_GAMES_JILI_ALERT_PCT": 15,
-    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_GAMES_GENERAL_ENABLE": "0",
-    "MONITORING_GAMES_GENERAL_ALERT_PCT": 15,
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_GAMES_INHOUSE_ENABLE": "0",
-    "MONITORING_GAMES_INHOUSE_ALERT_PCT": 15,
-    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
     "MONITORING_ALERT_WINDOW_SECONDS": 120,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
@@ -461,49 +424,33 @@ GRAFANA_DASHBOARD_UID = _cfg_str(
 )
 GRAFANA_PANEL_TITLE = _cfg_str("GRAFANA_PANEL_TITLE", "LiveSlots Online Number")
 GRAFANA_PANEL_TITLE_9280 = _cfg_str("GRAFANA_PANEL_TITLE_9280", "Egame Online Number")
-MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "9280 + Push").strip()
+MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "").strip()
 GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "OTG Online Number")
-MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "createProposal").strip()
-GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str("GRAFANA_PANEL_TITLE_WITHDRAW", "提款 (Withdrawal)")
-MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "InitiateWithdrawal").strip()
+MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "").strip()
+GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str(
+    "GRAFANA_PANEL_TITLE_WITHDRAW", "Liveslot 下注Bet/min"
+)
+MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "").strip()
 GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "IGO Distributions of Providers JILI"
+    "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "Egames 下注Bet/min"
 )
 MONITORING_PROVIDER_JILI_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD", "3201"
+    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD", ""
 ).strip()
 GRAFANA_PANEL_TITLE_PROVIDER_GENERAL = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL", "IGO Distributions of Providers GENERAL"
+    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL", "OTG 下注Bet/min"
 )
 MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD", "3204"
+    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD", ""
 ).strip()
 GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE", "IGO Distributions of Providers INHOUSE"
+    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE", "OTG 派彩/min"
 )
 MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD", "3085"
-).strip()
-GRAFANA_PANEL_TITLE_GAMES_JILI = _cfg_str(
-    "GRAFANA_PANEL_TITLE_GAMES_JILI", "IGO Distributions of Games（Jili）"
-)
-MONITORING_GAMES_JILI_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_GAMES_JILI_SERIES_KEYWORD", "49"
-).strip()
-GRAFANA_PANEL_TITLE_GAMES_GENERAL = _cfg_str(
-    "GRAFANA_PANEL_TITLE_GAMES_GENERAL", "IGO Distributions of Games（General）"
-)
-MONITORING_GAMES_GENERAL_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_GAMES_GENERAL_SERIES_KEYWORD", "1492288"
-).strip()
-GRAFANA_PANEL_TITLE_GAMES_INHOUSE = _cfg_str(
-    "GRAFANA_PANEL_TITLE_GAMES_INHOUSE", "IGO Distributions of Games（Inhouse）"
-)
-MONITORING_GAMES_INHOUSE_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_GAMES_INHOUSE_SERIES_KEYWORD", "6005"
+    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD", ""
 ).strip()
 # Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-15m")
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-6h")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
@@ -587,18 +534,6 @@ MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
 MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 15.0)
 MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
     "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_GAMES_JILI_ALERT_PCT = _cfg_float("MONITORING_GAMES_JILI_ALERT_PCT", 15.0)
-MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_GAMES_GENERAL_ALERT_PCT = _cfg_float("MONITORING_GAMES_GENERAL_ALERT_PCT", 15.0)
-MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_GAMES_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_GAMES_INHOUSE_ALERT_PCT", 15.0)
-MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 MONITORING_DROP_LAST_MERGED_MINUTES = max(
@@ -1832,7 +1767,7 @@ def fetch_request_total_1m_series(
     end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Same data as Grafana panel「请求总数/1m」via Prometheus ``query_range`` (Grafana proxy).
+    Primary monitored panel (``GRAFANA_PANEL_TITLE``) via Grafana proxy / ds query.
 
     Default window (unless ``start_unix``/``end_unix`` passed, or watchdog overrides):
 
@@ -1988,39 +1923,6 @@ def fetch_monitoring_payload(
             extra.append({"kind": "provider_inhouse", "payload": ppi})
         except Exception:
             logger.exception("fetch provider INHOUSE panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_GAMES_JILI_ENABLE"):
-        try:
-            pgj = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_GAMES_JILI,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "games_jili", "payload": pgj})
-        except Exception:
-            logger.exception("fetch games JILI panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_GAMES_GENERAL_ENABLE"):
-        try:
-            pgg = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_GAMES_GENERAL,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "games_general", "payload": pgg})
-        except Exception:
-            logger.exception("fetch games GENERAL panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_GAMES_INHOUSE_ENABLE"):
-        try:
-            pgi = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_GAMES_INHOUSE,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "games_inhouse", "payload": pgi})
-        except Exception:
-            logger.exception("fetch games INHOUSE panel failed (optional monitor)")
     if extra:
         primary["extraPanels"] = extra
     return primary
@@ -2286,25 +2188,19 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
     """
     (channel_id, display_label) for enabled monitors. channel_id matches extraPanels ``kind`` or ``http``.
     """
-    out: List[Tuple[str, str]] = [("http", f"HTTP · {GRAFANA_PANEL_TITLE}")]
+    out: List[Tuple[str, str]] = [("http", GRAFANA_PANEL_TITLE)]
     if _lark_env_truthy("MONITORING_9280_ENABLE"):
-        out.append(("9280_push", f"9280 · {GRAFANA_PANEL_TITLE_9280}"))
+        out.append(("9280_push", GRAFANA_PANEL_TITLE_9280))
     if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
-        out.append(("deposit", f"Deposit · {GRAFANA_PANEL_TITLE_DEPOSIT}"))
+        out.append(("deposit", GRAFANA_PANEL_TITLE_DEPOSIT))
     if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
-        out.append(("withdraw", f"Withdraw · {GRAFANA_PANEL_TITLE_WITHDRAW}"))
+        out.append(("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW))
     if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
-        out.append(("provider_jili", f"Provider JILI"))
+        out.append(("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI))
     if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
-        out.append(("provider_general", "Provider GENERAL"))
+        out.append(("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL))
     if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
-        out.append(("provider_inhouse", "Provider INHOUSE"))
-    if _lark_env_truthy("MONITORING_GAMES_JILI_ENABLE"):
-        out.append(("games_jili", f"Games JILI"))
-    if _lark_env_truthy("MONITORING_GAMES_GENERAL_ENABLE"):
-        out.append(("games_general", "Games GENERAL"))
-    if _lark_env_truthy("MONITORING_GAMES_INHOUSE_ENABLE"):
-        out.append(("games_inhouse", "Games INHOUSE"))
+        out.append(("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE))
     return out
 
 
@@ -4303,7 +4199,7 @@ def _filter_low_outlier_points(
 ) -> List[Tuple[float, float]]:
     """
     Remove tiny baseline outliers (e.g. 1/2/3/5) that can explode % change for
-    high-volume series (30k~50k). This is used for Provider/Games keyword panels.
+    high-volume series (30k~50k). Used for keyword-merge panels (e.g. provider slots).
     """
     if len(points) < 4:
         return points
@@ -4623,33 +4519,6 @@ def _analysis_for_provider_inhouse_payload(payload: Dict[str, Any]) -> Dict[str,
     )
 
 
-def _analysis_for_games_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
-        payload,
-        MONITORING_GAMES_JILI_SERIES_KEYWORD,
-        MONITORING_GAMES_JILI_ALERT_PCT,
-        MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT,
-    )
-
-
-def _analysis_for_games_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
-        payload,
-        MONITORING_GAMES_GENERAL_SERIES_KEYWORD,
-        MONITORING_GAMES_GENERAL_ALERT_PCT,
-        MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT,
-    )
-
-
-def _analysis_for_games_inhouse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _analysis_for_keyword_payload(
-        payload,
-        MONITORING_GAMES_INHOUSE_SERIES_KEYWORD,
-        MONITORING_GAMES_INHOUSE_ALERT_PCT,
-        MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT,
-    )
-
-
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
     if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
         return []
@@ -4814,7 +4683,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     if not _monitoring_alert_channel_muted("http"):
         reasons = _format_trigger_lines(
             GRAFANA_PANEL_TITLE,
-            "HTTP",
+            "all series merged",
             a_http,
             MONITORING_HTTP_DROP_ALERT_PCT,
             MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
@@ -4823,7 +4692,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         if not reasons:
             fb = _format_trigger_fallback_line(
                 GRAFANA_PANEL_TITLE,
-                "HTTP",
+                "all series merged",
                 a_http,
                 MONITORING_HTTP_DROP_ALERT_PCT,
                 MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
@@ -4832,9 +4701,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             if fb:
                 reasons.append(fb)
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
-            reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "HTTP", a_http)]
+            reasons = [_format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "all series merged", a_http)]
         elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons.append(_format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "HTTP", a_http))
+            reasons.append(
+                _format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "all series merged", a_http)
+            )
         if reasons:
             reason_blocks.append("\n\n".join(reasons))
     for ex in payload.get("extraPanels") or []:
@@ -4880,29 +4751,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             a2 = _analysis_for_provider_inhouse_payload(p2)
             fast2 = MONITORING_PROVIDER_INHOUSE_ALERT_PCT
             cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
-        elif kind == "games_jili":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_JILI
-            s_lbl = MONITORING_GAMES_JILI_SERIES_KEYWORD
-            a2 = _analysis_for_games_jili_payload(p2)
-            fast2 = MONITORING_GAMES_JILI_ALERT_PCT
-            cont2 = MONITORING_GAMES_JILI_CONTINUOUS_ALERT_PCT
-        elif kind == "games_general":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_GENERAL
-            s_lbl = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
-            a2 = _analysis_for_games_general_payload(p2)
-            fast2 = MONITORING_GAMES_GENERAL_ALERT_PCT
-            cont2 = MONITORING_GAMES_GENERAL_CONTINUOUS_ALERT_PCT
-        elif kind == "games_inhouse":
-            g_lbl = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
-            s_lbl = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
-            a2 = _analysis_for_games_inhouse_payload(p2)
-            fast2 = MONITORING_GAMES_INHOUSE_ALERT_PCT
-            cont2 = MONITORING_GAMES_INHOUSE_CONTINUOUS_ALERT_PCT
         else:
             continue
+        s_disp = (s_lbl or "").strip() or "all series merged"
         reasons2 = _format_trigger_lines(
             g_lbl,
-            s_lbl,
+            s_disp,
             a2,
             fast2,
             cont2,
@@ -4911,7 +4765,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         if not reasons2:
             fb2 = _format_trigger_fallback_line(
                 g_lbl,
-                s_lbl,
+                s_disp,
                 a2,
                 fast2,
                 cont2,
@@ -4920,9 +4774,9 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             if fb2:
                 reasons2.append(fb2)
         if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
-            reasons2 = [_format_simple_series_alert_block(g_lbl, s_lbl, a2)]
+            reasons2 = [_format_simple_series_alert_block(g_lbl, s_disp, a2)]
         elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons2.append(_format_alert_series_table_footer(g_lbl, s_lbl, a2))
+            reasons2.append(_format_alert_series_table_footer(g_lbl, s_disp, a2))
         if reasons2:
             reason_blocks.append("\n\n".join(reasons2))
     if not reason_blocks:
@@ -4960,12 +4814,6 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             return True
         if k == "provider_inhouse" and bool(_analysis_for_provider_inhouse_payload(p2).get("hit_alert")):
             return True
-        if k == "games_jili" and bool(_analysis_for_games_jili_payload(p2).get("hit_alert")):
-            return True
-        if k == "games_general" and bool(_analysis_for_games_general_payload(p2).get("hit_alert")):
-            return True
-        if k == "games_inhouse" and bool(_analysis_for_games_inhouse_payload(p2).get("hit_alert")):
-            return True
     return False
 
 
@@ -4987,17 +4835,20 @@ def _fmt_num(v: Any) -> str:
         return str(v)
 
 
-def _format_http_analysis_lines(analysis: Dict[str, Any]) -> List[str]:
+def _format_http_analysis_lines(
+    analysis: Dict[str, Any], *, section_label: Optional[str] = None
+) -> List[str]:
     """
     Compact footer: max drop/spike from best consecutive monotonic run (first→last bucket %).
     Threshold line matches product copy; @mention is still driven by ``hit_alert`` (mean windows).
     """
+    sec = (section_label or GRAFANA_PANEL_TITLE or "panel").strip() or "panel"
     fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
     cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_HTTP_CONTINUOUS_ALERT_PCT)
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
     lines: List[str] = [
         "",
-        f"[HTTP] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
+        f"[{sec}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
         f"or continuous drop/spike > {cont_thr:g}%",
     ]
 
@@ -5041,52 +4892,38 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             a2 = _analysis_for_9280_payload(p2)
             title = GRAFANA_PANEL_TITLE_9280
             series = MONITORING_9280_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("9280 + Push", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         elif k == "deposit":
             a2 = _analysis_for_deposit_payload(p2)
             title = GRAFANA_PANEL_TITLE_DEPOSIT
             series = MONITORING_DEPOSIT_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Deposit", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         elif k == "withdraw":
             a2 = _analysis_for_withdraw_payload(p2)
             title = GRAFANA_PANEL_TITLE_WITHDRAW
             series = MONITORING_WITHDRAW_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Withdraw", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         elif k == "provider_jili":
             a2 = _analysis_for_provider_jili_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_JILI
             series = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Provider JILI", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         elif k == "provider_general":
             a2 = _analysis_for_provider_general_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
             series = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Provider GENERAL", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         elif k == "provider_inhouse":
             a2 = _analysis_for_provider_inhouse_payload(p2)
             title = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
             series = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Provider INHOUSE", a2)
-        elif k == "games_jili":
-            a2 = _analysis_for_games_jili_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_JILI
-            series = MONITORING_GAMES_JILI_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Games JILI", a2)
-        elif k == "games_general":
-            a2 = _analysis_for_games_general_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_GENERAL
-            series = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Games GENERAL", a2)
-        elif k == "games_inhouse":
-            a2 = _analysis_for_games_inhouse_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
-            series = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines("Games INHOUSE", a2)
+            extra_footer = _format_extra_analysis_lines(title, a2)
         else:
             continue
         pts2 = a2.get("merged_points") or []
         lines.append("")
-        lines.append(f"[{title}] series: {series}")
+        series_disp = (series or "").strip() or "all series merged"
+        lines.append(f"[{title}] series: {series_disp}")
         if pts2:
             tail2 = pts2[-max_rows:]
             rows2: List[str] = ["time           value", "-------------  ------------"]
@@ -5096,7 +4933,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             lines.extend(rows2)
             lines.append("```")
         else:
-            lines.append(f"(no {series} points matched)")
+            lines.append(f"(no points matched for {series_disp})")
         lines.extend(extra_footer)
 
     for s in payload.get("series") or []:
@@ -5136,7 +4973,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         and TARGET_USER_OPEN_ID
     ):
         lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
-    lines.extend(_format_http_analysis_lines(http_ex))
+    lines.extend(_format_http_analysis_lines(http_ex, section_label=GRAFANA_PANEL_TITLE))
 
     return "\n".join(lines)
 
