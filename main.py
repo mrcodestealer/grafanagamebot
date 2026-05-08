@@ -172,7 +172,7 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
     # 1=监控摘要一条交互卡片（须保持 1 才有下方 MONITORING_MESSAGE_CARD_BUTTON_*「Resend screenshot」）
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
-    # 1=截图嵌进同一张卡片（一条气泡）；0=卡片文字 + 截图单独一条
+    # /mo 路径：**先**发卡/字再截图（避免 Playwright 卡住导致长时间无回复）；截图单独一条。Watchdog 告警仍可先截再发。
     "MONITORING_CARD_EMBED_SCREENSHOT": "1",
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
@@ -5832,29 +5832,13 @@ def _monitoring_background_worker(
         used_interactive_card = False
         embedded_png_in_card = False
         try:
+            # Never block the Lark reply on Playwright: pre-screenshot-before-send left users with **no**
+            # message until Grafana finished (often minutes). Send card/text first; screenshot follows below.
             pre_key: Optional[str] = None
-            if (
-                (chat_id or open_id)
-                and MONITORING_MESSAGE_CARD_ENABLE
-                and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
-                and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE")
-                and grafana_session is not None
-                and payload is not None
-            ):
-                w0 = payload.get("window") or {}
-                su0 = int(w0.get("startUnix") or 0)
-                eu0 = int(w0.get("endUnix") or 0)
-                if su0 > 0 and eu0 > 0:
-                    try:
-                        pre_key = _lark_upload_png_image_key(
-                            _grafana_headless_screenshot_png(grafana_session, su0, eu0)
-                        )
-                    except Exception:
-                        logger.exception("monitoring pre-screenshot for interactive card failed")
 
             if chat_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "chat_id", chat_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
+                    "chat_id", chat_id, reply, None
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -5867,7 +5851,7 @@ def _monitoring_background_worker(
                 )
             elif open_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "open_id", open_id, reply, pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None
+                    "open_id", open_id, reply, None
                 )
                 sent = True
                 user_visible_send_ok = True
