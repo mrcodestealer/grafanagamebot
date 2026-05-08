@@ -1396,8 +1396,10 @@ _LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
 
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
     """
-    Feishu sometimes omits usable ``mentions[]`` but keeps ``<at user_id=\"ou_…\">`` inside ``content`` JSON.
-    Used to avoid the weak-nonempty ``/mo`` path when the body clearly @'s another bot in the same group.
+    Parse ``<at …>`` ids from **message body fields only** (``content`` / ``text`` / ``body``).
+
+    Do **not** scan ``json.dumps(msg)``: the envelope repeats ``mentions[]`` open_ids and falsely looks like a
+    peer ``<at>`` in the visible text — Game then peer-skips ``@_user_1 /mo`` even when the user @'d Game.
     """
     blobs: List[str] = []
     if isinstance(msg, dict):
@@ -1412,10 +1414,6 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 blobs.append(v)
-        try:
-            blobs.append(json.dumps(msg, ensure_ascii=False))
-        except Exception:
-            pass
     out: List[str] = []
     seen: Set[str] = set()
     for b in blobs:
@@ -2652,9 +2650,16 @@ def _lark_send_image_message(receive_id_type: str, receive_id: str, image_key: s
 
 
 def _monitoring_reply_to_card_md(reply: str) -> str:
-    s = (reply or "")[:3000]
-    s = s.replace("```", "'''")
-    return s
+    """See grafanaplatformbot: Feishu card markdown + dashed separator rows caused oversized headings."""
+    out: List[str] = []
+    for line in (reply or "").splitlines():
+        st = line.strip()
+        if st:
+            compact = st.replace("|", "").replace(" ", "")
+            if compact and all(c == "-" for c in compact):
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _monitoring_card_body_md_strip_title(reply: str) -> str:
@@ -5164,7 +5169,7 @@ def _format_alert_series_table_footer(
         return f"{title}\n(no points)"
     cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
     tail = pts[-cap:]
-    rows = ["```text", "time           value", "-------------  ------------"]
+    rows = ["```text", "time           value"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
     rows.append("```")
@@ -5191,7 +5196,7 @@ def _format_simple_series_alert_block(
         return "\n".join(head + ["(no points in window)"])
     cap = MONITORING_TABLE_TAIL_ROWS if max_rows is None else max(1, min(99, int(max_rows)))
     tail = pts[-cap:]
-    rows = ["```text", "time           value", "-------------  ------------"]
+    rows = ["```text", "time           value"]
     for pair in tail:
         rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
     rows.append("```")
@@ -5493,7 +5498,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         lines.append(f"[{title}] series: {series_disp}")
         if pts2:
             tail2 = pts2[-max_rows:]
-            rows2: List[str] = ["time           value", "-------------  ------------"]
+            rows2: List[str] = ["time           value"]
             for pair in tail2:
                 rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
             lines.append("```text")
@@ -5527,7 +5532,7 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             lines.append("")
             lines.append(f"[{ref}] {legend}")
             tail = vals[-max_rows:]
-            rows: List[str] = ["time           value", "-------------  ------------"]
+            rows: List[str] = ["time           value"]
             for pair in tail:
                 rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
             lines.append("```text")
