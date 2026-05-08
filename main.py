@@ -1325,9 +1325,13 @@ def _lark_string_is_strong_feishu_at_target(s: str) -> bool:
 
 def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, mentions: Any) -> bool:
     """
-    True if some mention carries a strong id (``ou_``/``cli_``/…) that is neither this bot nor this app.
+    True if some mention carries a strong id (``ou_``/``cli_``) that clearly targets **another** app/bot.
 
     Weak payloads (only ``@_user_N`` / display name) → False so ``@_user_N`` placeholder can still fire ``/mo``.
+
+    When **bot open_id is unknown** (empty ``LARK_BOT_OPEN_ID`` and ``bot/v3/info`` failed), any ``ou_`` in
+    the payload might still be this bot — we **do not** treat ``ou_`` as conflicting in that case; only a
+    ``cli_`` different from ``APP_ID`` blocks (otherwise ``mentions_other_ou_cli`` stays stuck True forever).
     """
     if not isinstance(mentions, list):
         return False
@@ -1342,6 +1346,10 @@ def _lark_mentions_carry_strong_identity_other_than_bot(bot: str, app: str, ment
             if bot and s == bot:
                 continue
             if app_s and s == app_s:
+                continue
+            if not bot:
+                if s.startswith("cli_") and (not app_s or s != app_s):
+                    return True
                 continue
             return True
     return False
@@ -5935,7 +5943,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         logger.info(
             "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_cfg=%s body_has_@_user_N=%s mentions_other_ou_cli=%s",
+            "mo_placeholder_cfg=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -5946,6 +5954,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
             body_ph,
             mo_ph_blocked_by_other,
+            bool((_lark_effective_bot_open_id() or "").strip()),
         )
         return
 
