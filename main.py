@@ -144,8 +144,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 1=mentions **非空**但只有弱 meta 时仍可用正文 @_user_N + /mo（Fix Game）；Platform 同群须 **0** 否则会双回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "1",
-    # 同群 **另一只**监控机器人的 open_id（可多个，逗号/空格）。content 里 ``<at user_id=\"ou_…\">`` 只指向 peer 时本 bot 不走弱 mentions /mo（防 @Platform 却 Game 回）
-    "MONITORING_PEER_BOT_OPEN_IDS": "",
+    # 本仓库 = Grafana **Game** Bot：解析到明确 ou_/cli_ @ 目标时须包含此 id 才跑 /mo（双 webhook 同群）
+    "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
+    # Platform 机器人 open_id（逗号/空格）。弱 mentions 兜底时若 <at> 只指向 peer 则不回
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_0bfd185231d6beb669425fdf8f13e9df",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "",
     "LARK_WS_LOG_LEVEL": "INFO",
@@ -663,6 +665,7 @@ MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
     for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
     if p.strip()
 }
+MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy("MONITORING_MESSAGE_CARD_ENABLE")
 
@@ -1372,6 +1375,10 @@ _LARK_AT_ENTITY_ID_IN_CONTENT_RE = re.compile(
     r"<at\b[^>]*?\b(?:user_id|open_id|openId|userId)\s*=\s*[\"']([^\"']+)[\"']",
     re.IGNORECASE,
 )
+_LARK_AT_ID_ATTR_OU_CLI_RE = re.compile(
+    r"<at\b[^>]*?\bid\s*=\s*[\"']((?:?:ou_|cli_)[^\"']+)[\"']",
+    re.IGNORECASE,
+)
 
 
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
@@ -1392,10 +1399,19 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 blobs.append(v)
+        try:
+            blobs.append(json.dumps(msg, ensure_ascii=False))
+        except Exception:
+            pass
     out: List[str] = []
     seen: Set[str] = set()
     for b in blobs:
         for m in _LARK_AT_ENTITY_ID_IN_CONTENT_RE.finditer(b or ""):
+            s = m.group(1).strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        for m in _LARK_AT_ID_ATTR_OU_CLI_RE.finditer(b or ""):
             s = m.group(1).strip()
             if s and s not in seen:
                 seen.add(s)
@@ -1428,6 +1444,26 @@ def _mo_peer_at_blocks_weak_nonempty_mo(
     return any(i in peer_open_ids for i in ids)
 
 
+def _lark_collect_explicit_bot_at_ids(
+    mentions_list: List[Any],
+    content_at_entity_ids: Optional[List[str]],
+) -> Set[str]:
+    """``ou_``/``cli_`` from mention payloads plus parsed ``<at>`` ids — used with ``MONITORING_CANONICAL_BOT_OPEN_ID``."""
+    out: Set[str] = set()
+    for x in content_at_entity_ids or []:
+        s = str(x).strip()
+        if s:
+            out.add(s)
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        for s in _lark_collect_mention_identity_strings_for_at_conflict(m):
+            t = str(s).strip()
+            if t and _lark_string_is_strong_feishu_at_target(t):
+                out.add(t)
+    return out
+
+
 def _text_should_run_monitoring(
     raw_text: str,
     clean: str,
@@ -1454,11 +1490,16 @@ def _text_should_run_monitoring(
 
     ``MONITORING_PEER_BOT_OPEN_IDS``: when ``content`` contains ``<at user_id=\"ou_…\">`` for a peer bot only,
     skip weak-nonempty ``/mo`` here (set to the **other** bot's ``open_id`` on each app).
+
+    If ``mentions[]`` is weak but ``content`` JSON still contains ``<at …>`` with **this** bot's ``open_id``
+    (requires ``LARK_BOT_OPEN_ID`` or working ``bot/v3/info``), ``/mo`` triggers — fixes Platform with
+    ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``.
+
+    ``MONITORING_CANONICAL_BOT_OPEN_ID``: when non-empty and we can parse at least one explicit ``ou_``/``cli_``
+    target, **only** trigger if that set includes this id (stops wrong bot when both apps receive the same chat).
     """
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
-            return True
-        if _lark_message_mentions_bot(mentions):
             return True
         if isinstance(mentions, list):
             mentions_list = mentions
@@ -1466,6 +1507,32 @@ def _text_should_run_monitoring(
             mentions_list = [mentions]
         else:
             mentions_list = []
+        canon = (MONITORING_CANONICAL_BOT_OPEN_ID or "").strip()
+        explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
+        if canon:
+            if explicit_ids and canon not in explicit_ids:
+                logger.info(
+                    "monitoring /mo: skip — explicit @ targets %s exclude MONITORING_CANONICAL_BOT_OPEN_ID=%s",
+                    sorted(explicit_ids),
+                    canon,
+                )
+                return False
+            if explicit_ids and canon in explicit_ids:
+                logger.info(
+                    "monitoring /mo: trigger — MONITORING_CANONICAL_BOT_OPEN_ID in explicit @ targets"
+                )
+                return True
+        if _lark_message_mentions_bot(mentions):
+            return True
+        cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
+        sb = (_lark_effective_bot_open_id() or "").strip()
+        sa = (str(APP_ID).strip() if APP_ID else "") or ""
+        if sb and sb in cat_ids:
+            logger.info("monitoring /mo: trigger via content <at> matching this bot open_id")
+            return True
+        if sa and sa in cat_ids:
+            logger.info("monitoring /mo: trigger via content <at> matching APP_ID")
+            return True
         body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
         conflict_other = (
             _lark_mentions_carry_strong_identity_other_than_bot(
