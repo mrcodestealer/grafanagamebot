@@ -260,33 +260,9 @@ def _cfg_float(key: str, default: float) -> float:
         return default
 
 
-def _cfg_listen_port(default: int = 5088) -> int:
-    """
-    Same order as ``Chatbox/main.py``: ``PORT`` or ``LARKBOT_PORT`` in env (skip blanks),
-    then ``_CFG["PORT"]`` / ``_CFG["LARKBOT_PORT"]``, then ``default`` (grafanagamebot default **5088** vs Chatbox **5000**).
-    """
-    for raw in (os.environ.get("PORT"), os.environ.get("LARKBOT_PORT")):
-        if raw is None:
-            continue
-        s = str(raw).strip()
-        if not s:
-            continue
-        try:
-            return int(s)
-        except ValueError:
-            continue
-    for key in ("PORT", "LARKBOT_PORT"):
-        v = _CFG.get(key)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if not s:
-            continue
-        try:
-            return int(s)
-        except ValueError:
-            continue
-    return default
+def _cfg_listen_port() -> int:
+    """grafanagamebot always binds **5088**; ``PORT`` / ``LARKBOT_PORT`` / ``_CFG`` are ignored."""
+    return 5088
 
 
 # ``lark_oapi`` → ``ws/pb/google/__init__.py`` uses ``pkg_resources.declare_namespace`` (no upstream fix yet).
