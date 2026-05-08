@@ -1368,7 +1368,12 @@ def _text_should_run_monitoring(raw_text: str, clean: str, mentions: Any) -> boo
             return True
         if _lark_message_mentions_bot(mentions):
             return True
-        mentions_list = mentions if isinstance(mentions, list) else []
+        if isinstance(mentions, list):
+            mentions_list = mentions
+        elif isinstance(mentions, dict) and mentions:
+            mentions_list = [mentions]
+        else:
+            mentions_list = []
         body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
         conflict_other = (
             _lark_mentions_carry_strong_identity_other_than_bot(
