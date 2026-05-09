@@ -665,7 +665,31 @@ LARK_ENCRYPT_KEY = (
     or _cfg_str("FEISHU_ENCRYPT_KEY")
     or ""
 ).strip()
-LARK_BOT_OPEN_ID = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+
+MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
+    p.strip()
+    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
+    if p.strip()
+}
+
+# Grafana Game Bot：合并进 canonical；用于纠正误把 Platform ou_ 写进 MONITORING_CANONICAL_* 的 systemd 配置。
+_GAME_EMBEDDED_CANONICAL_IDS: Tuple[str, ...] = (
+    "ou_1830c6697311e779471888a420233eed",
+    "ou_848fc4640b48b9845cbc5b0cfa2f1af1",
+    "ou_a51dad55e46f665d740b85c5ae22f940",
+)
+
+_lark_oid_cfg = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
+if not _lark_oid_cfg or _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
+    LARK_BOT_OPEN_ID = "ou_1830c6697311e779471888a420233eed"
+    if _lark_oid_cfg and _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
+        logger.warning(
+            "LARK_BOT_OPEN_ID=%r is a Platform peer id on grafanagamebot — using embedded Game bot open_id",
+            _lark_oid_cfg,
+        )
+else:
+    LARK_BOT_OPEN_ID = _lark_oid_cfg
+
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
@@ -678,17 +702,25 @@ MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=True,
 )
-MONITORING_PEER_BOT_OPEN_ID_SET: Set[str] = {
-    p.strip()
-    for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_PEER_BOT_OPEN_IDS", "").strip())
-    if p.strip()
-}
-MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
-MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET: Set[str] = {
+
+_cfg_canon_primary = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
+if not _cfg_canon_primary or _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+    MONITORING_CANONICAL_BOT_OPEN_ID = "ou_1830c6697311e779471888a420233eed"
+    if _cfg_canon_primary and _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+        logger.warning(
+            "MONITORING_CANONICAL_BOT_OPEN_ID=%r is a Platform peer id — using embedded Game canonical",
+            _cfg_canon_primary,
+        )
+else:
+    MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_canon_primary
+
+_extra_canon_cfg = {
     p.strip()
     for p in re.split(r"[\s,;]+", _cfg_str("MONITORING_CANONICAL_BOT_OPEN_IDS", "").strip())
     if p.strip()
 }
+MONITORING_CANONICAL_BOT_OPEN_ID_EXTRA_SET = set(_GAME_EMBEDDED_CANONICAL_IDS) | _extra_canon_cfg
+
 MONITORING_ALERT_CHAT_ID = _cfg_str("MONITORING_ALERT_CHAT_ID", "").strip()
 MONITORING_MESSAGE_CARD_ENABLE = _lark_env_truthy_or_default(
     "MONITORING_MESSAGE_CARD_ENABLE",
@@ -1230,11 +1262,13 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
         key=len,
         reverse=True,
     )
+    tl = text.lower()
     for tri in triggers:
         if len(tri) < 2 or not tri.startswith("/"):
             continue
-        idx = text.find(tri)
-        if idx > 0:
+        tri_l = tri.lower()
+        idx = tl.find(tri_l)
+        if idx >= 0:
             text = text[idx:].strip()
             break
     return text
