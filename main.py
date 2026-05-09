@@ -1616,6 +1616,8 @@ def _lark_primary_strong_from_feishu_user_placeholders(
                 key_to_oid[ks] = oid
                 if ks.startswith("@"):
                     key_to_oid.setdefault(ks[1:], oid)
+                elif ks.startswith("_user_"):
+                    key_to_oid.setdefault("@" + ks, oid)
 
     for mm in re.finditer(r"@_user_(\d+)", raw_text):
         tok = mm.group(0)
@@ -1650,9 +1652,16 @@ def _lark_primary_strong_from_mentions_visible_order(
         if not isinstance(m, dict):
             continue
         keys_to_try: List[str] = []
-        k = m.get("key") or m.get("Key")
-        if k:
-            keys_to_try.append(str(k))
+        for fk in ("key", "Key", "mention_key", "mentionKey"):
+            k = m.get(fk)
+            if not k:
+                continue
+            ks = str(k).strip()
+            if not ks:
+                continue
+            keys_to_try.append(ks)
+            if ks.startswith("_user_"):
+                keys_to_try.append("@" + ks)
         nm = m.get("name") or m.get("Name")
         if nm:
             keys_to_try.append(f"@{nm}")
@@ -1682,8 +1691,8 @@ def _monitoring_resolved_primary_at_target(
     """
     Resolve primary @ target for shared multi-bot groups:
 
-    1. Feishu ``@_user_N`` placeholders (``mentions[].key`` if present, else row ``mentions[N-1]``).
-    2. If ``@_user_`` appears anywhere, leftmost ``key`` / ``@name`` match (before parsing body ``<at>``).
+    1. Leftmost visible ``key`` / ``mention_key`` / ``@name`` match in plain text (preferred over raw ``mentions[]`` order).
+    2. First ``@_user_N`` token mapped via ``mentions[].key`` when present, else ``mentions[N-1]`` (1-based index).
     3. When **several bot-like mentions** exist and visible body has **exactly one** ``<at>`` in the peer/canon bag,
        use that id (avoids trusting a misleading first tag when two bots appear in ``mentions[]``).
     4. Strong ids from visible ``<at user_id=…>`` in message body (metadata-safe blobs only).
@@ -1698,10 +1707,8 @@ def _monitoring_resolved_primary_at_target(
             rt = alt
         elif not (rt or "").strip():
             rt = alt
+    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
     ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
-    vis_early: Optional[str] = None
-    if "@_user_" in rt:
-        vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
 
     distinct_bot_like: Set[str] = set()
     body_chain: List[str] = []
@@ -1725,18 +1732,15 @@ def _monitoring_resolved_primary_at_target(
             vis_early,
         )
 
-    if ph:
-        return ph
     if vis_early:
         return vis_early
+    if ph:
+        return ph
     if len(distinct_bot_like) >= 2 and len(body_chain) == 1:
         return body_chain[0]
     b = _lark_primary_strong_at_from_im_message(msg)
     if b:
         return b
-    vis = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
-    if vis:
-        return vis
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
@@ -1946,11 +1950,20 @@ def _monitoring_at_bot_requirement_satisfied(
     )
 
     if canon_ids and primary and primary not in canon_ids:
-        logger.info(
-            "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
-            primary,
-            sorted(canon_ids),
-        )
+        if primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+            logger.info(
+                "monitoring: skip — primary @ target %r is the configured peer bot (Platform), "
+                "not Game (canonical=%s). Feishu mapped @_user_N / mentions to the peer id — "
+                "@ Grafana Game Bot in the picker, not Grafana Platform Bot.",
+                primary,
+                sorted(canon_ids),
+            )
+        else:
+            logger.info(
+                "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
+                primary,
+                sorted(canon_ids),
+            )
         return False
 
     if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_group_multi_bot_first_mention_gate(
