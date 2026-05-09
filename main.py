@@ -147,6 +147,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 1=mentions **非空**但只有弱 meta 时仍可用正文 @_user_N + /mo（Fix Game）；Platform 同群须 **0** 否则会双回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "1",
+    # 1=仅一条 mentions 且 open_id 为 Platform peer、正文 @_user_N + /mo 时仍触发 Game（飞书常把 @_user_1 绑错 ou_）；**0** 恢复严格 primary 判定。若订阅「群全部消息」慎开。
+    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION": "1",
     # 本仓库 = Grafana **Game** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
     # 同一 Game 应用在飞书里可能出现的其它 open_id（HTTP mentions 仍可能带旧 ou_）
@@ -700,6 +702,10 @@ MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
 )
 MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
+    default=True,
+)
+MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION = _lark_env_truthy_or_default(
+    "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION",
     default=True,
 )
 
@@ -1974,6 +1980,29 @@ def _monitoring_at_bot_requirement_satisfied(
     )
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
+    cl = _lark_clean_command_text(raw_text, mentions_list)
+    if (
+        MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION
+        and MONITORING_PEER_BOT_OPEN_ID_SET
+        and len(mentions_list) == 1
+    ):
+        one = mentions_list[0]
+        sole = _lark_mention_row_main_open_id(one) if isinstance(one, dict) else ""
+        if (
+            sole
+            and sole in MONITORING_PEER_BOT_OPEN_ID_SET
+            and _lark_raw_text_has_feishu_at_placeholder(raw_text)
+            and _im_command_matches(cl, MONITORING_TRIGGER)
+            and not _lark_body_peer_only_strong_at_targets(
+                content_at_entity_ids,
+                MONITORING_PEER_BOT_OPEN_ID_SET,
+            )
+        ):
+            logger.info(
+                "monitoring /mo: trigger — single peer mention + @_user_N + /mo "
+                "(MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION; Feishu open_id/placeholder skew)"
+            )
+            return True
 
     if canon_ids and primary and primary not in canon_ids:
         if row_app_id_is_self:
