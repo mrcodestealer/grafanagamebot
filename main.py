@@ -147,7 +147,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 1=mentions **非空**但只有弱 meta 时仍可用正文 @_user_N + /mo（Fix Game）；Platform 同群须 **0** 否则会双回
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "1",
-    # 1=仅一条 mentions 且 open_id 为 Platform peer、正文 @_user_N + /mo 时仍触发 Game（飞书常把 @_user_1 绑错 ou_）；**0** 恢复严格 primary 判定。若订阅「群全部消息」慎开。
+    # 1=仅一条 mentions 且 open_id 为 Platform peer、正文 @_user_N + /mo|/m|/c 时仍触发 Game（飞书常把 @_user_1 绑错 ou_）；**0** 恢复严格 primary。若订阅「群全部消息」慎开。
     "MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION": "1",
     # 本仓库 = Grafana **Game** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
@@ -1988,19 +1988,28 @@ def _monitoring_at_bot_requirement_satisfied(
     ):
         one = mentions_list[0]
         sole = _lark_mention_row_main_open_id(one) if isinstance(one, dict) else ""
+        mo_hit = _im_command_matches(cl, MONITORING_TRIGGER)
+        mute_hit = _im_command_matches(cl, MONITORING_MUTE_TRIGGER)
+        cancel_hit = _im_command_matches(cl, MONITORING_CANCELMUTE_TRIGGER)
         if (
             sole
             and sole in MONITORING_PEER_BOT_OPEN_ID_SET
             and _lark_raw_text_has_feishu_at_placeholder(raw_text)
-            and _im_command_matches(cl, MONITORING_TRIGGER)
+            and (mo_hit or mute_hit or cancel_hit)
             and not _lark_body_peer_only_strong_at_targets(
                 content_at_entity_ids,
                 MONITORING_PEER_BOT_OPEN_ID_SET,
             )
         ):
+            tri = (
+                (MONITORING_TRIGGER or "/mo")
+                if mo_hit
+                else ((MONITORING_MUTE_TRIGGER or "/m") if mute_hit else (MONITORING_CANCELMUTE_TRIGGER or "/c"))
+            )
             logger.info(
-                "monitoring /mo: trigger — single peer mention + @_user_N + /mo "
-                "(MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION; Feishu open_id/placeholder skew)"
+                "monitoring %s: trigger — single peer mention + @_user_N "
+                "(MONITORING_MO_TRUST_PLACEHOLDER_OVER_PEER_SINGLE_MENTION; Feishu open_id/placeholder skew)",
+                tri,
             )
             return True
 
