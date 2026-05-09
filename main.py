@@ -1577,30 +1577,39 @@ def _lark_ordered_strong_ids_from_at_tags(blob: str) -> List[str]:
     return ordered
 
 
-def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Optional[str]:
+def _lark_primary_strong_at_from_im_message(
+    msg: Optional[Dict[str, Any]],
+    mentions_list: Optional[List[Any]] = None,
+) -> Optional[str]:
     """First strong bot/user id from ``<at>`` tags or post JSON ``{\"tag\":\"at\"}`` cells (document order)."""
     if not isinstance(msg, dict):
         return None
+    ml = (
+        mentions_list
+        if mentions_list is not None
+        else _lark_collect_im_message_mentions(msg, {})
+    )
     for blob in _lark_im_content_blobs_for_at_parse(msg):
         ids = _lark_ordered_strong_ids_from_at_tags(blob)
         if ids:
             return ids[0]
     root = _lark_im_parsed_content_root(msg)
     if isinstance(root, dict):
-        mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
-        ordered = _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve)
+        ordered = _lark_ordered_post_at_strong_ids_from_root(root, ml)
         if ordered:
             return ordered[0]
         post_first: List[str] = []
         post_seen: Set[str] = set()
-        _lark_collect_post_at_user_ids(root, post_first, post_seen, mentions_list=mentions_for_resolve)
+        _lark_collect_post_at_user_ids(root, post_first, post_seen, mentions_list=ml)
         if post_first:
             return post_first[0]
     return None
 
 
 def _lark_visible_bot_like_at_chain(
-    msg: Optional[Dict[str, Any]], bot_like_bag: Set[str]
+    msg: Optional[Dict[str, Any]],
+    bot_like_bag: Set[str],
+    mentions_list: Optional[List[Any]] = None,
 ) -> List[str]:
     """Strong ``ou_``/``cli_`` from visible ``<at>`` tags (document order), filtered to ``bot_like_bag``."""
     if not isinstance(msg, dict) or not bot_like_bag:
@@ -1613,10 +1622,14 @@ def _lark_visible_bot_like_at_chain(
                 out.append(t)
         if out:
             return out
-    mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
+    ml = (
+        mentions_list
+        if mentions_list is not None
+        else _lark_collect_im_message_mentions(msg, {})
+    )
     root = _lark_im_parsed_content_root(msg)
     if isinstance(root, dict):
-        for x in _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve):
+        for x in _lark_ordered_post_at_strong_ids_from_root(root, ml):
             t = str(x).strip()
             if t and _lark_string_is_strong_feishu_at_target(t) and t in bot_like_bag:
                 out.append(t)
@@ -1787,7 +1800,7 @@ def _monitoring_resolved_primary_at_target(
             peer_ids=bot_like_bag,
         )
         if len(distinct_bot_like) >= 2:
-            body_chain = _lark_visible_bot_like_at_chain(msg, bot_like_bag)
+            body_chain = _lark_visible_bot_like_at_chain(msg, bot_like_bag, mentions_list)
 
     if MONITORING_LOG_PRIMARY_AT:
         logger.info(
@@ -1806,7 +1819,7 @@ def _monitoring_resolved_primary_at_target(
         return ph
     if len(distinct_bot_like) >= 2 and len(body_chain) == 1:
         return body_chain[0]
-    b = _lark_primary_strong_at_from_im_message(msg)
+    b = _lark_primary_strong_at_from_im_message(msg, mentions_list)
     if b:
         return b
     return _lark_primary_strong_from_mentions_order(mentions_list)
@@ -2021,7 +2034,12 @@ def _lark_collect_post_at_user_ids(
             _lark_collect_post_at_user_ids(x, out, seen, depth + 1, mentions_list=ml)
 
 
-def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
+def _lark_extract_at_entity_ids_from_im_message(
+    msg: Dict[str, Any],
+    *,
+    mentions_list: Optional[List[Any]] = None,
+    event: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """
     Parse ``<at …>`` ids from **message body fields only** (``content`` / ``text`` / ``body``).
 
@@ -2030,6 +2048,9 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
 
     Do **not** scan ``json.dumps(msg)``: the envelope repeats ``mentions[]`` open_ids and falsely looks like a
     peer ``<at>`` in the visible text — Game then peer-skips ``@_user_1 /mo`` even when the user @'d Game.
+
+    Pass the same ``mentions_list`` as IM handling (``message`` + ``event`` merged) so post cells whose
+    ``user_id`` is ``union_id`` / internal id can be mapped via ``mentions[]`` rows (HTTP often puts rows on ``event``).
     """
     blobs = _lark_im_content_blobs_for_at_parse(msg)
     out: List[str] = []
@@ -2046,7 +2067,11 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
                 seen.add(s)
                 out.append(s)
 
-    mentions_for_resolve = _lark_collect_im_message_mentions(msg, {})
+    if mentions_list is not None:
+        mentions_for_resolve = mentions_list
+    else:
+        ev = event if isinstance(event, dict) else {}
+        mentions_for_resolve = _lark_collect_im_message_mentions(msg, ev)
     root = _lark_im_parsed_content_root(msg)
     if isinstance(root, dict):
         for uid in _lark_ordered_post_at_strong_ids_from_root(root, mentions_for_resolve):
@@ -7008,7 +7033,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             raw_text = fb
     mentions = _lark_collect_im_message_mentions(msg, event)
     clean = _lark_clean_command_text(raw_text, mentions)
-    content_at_entity_ids = _lark_extract_at_entity_ids_from_im_message(msg)
+    content_at_entity_ids = _lark_extract_at_entity_ids_from_im_message(msg, mentions_list=mentions)
     im_chat_type = _lark_dict_pick_str(msg, "chat_type", "chatType") or ""
 
     chat_id = chat_resolved
