@@ -1249,15 +1249,17 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
                     text = text.replace(str(k), "")
     text = re.sub(r"@_user_\d+", "", text)
     text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"[\u200b\uFEFF\u00A0]", "", text)
+    text = re.sub(r"[\u200b-\u200f\u2060\uFEFF\u00A0]", "", text)
+    for ch in ("\uff0f", "\u2215", "\u2044", "\u29f8"):
+        text = text.replace(ch, "/")
     text = text.replace("／", "/").replace("＼", "\\")
     text = re.sub(r"\s+", " ", text).strip()
     # Rich-text-only payloads may leave ``@Bot Display Name`` before ``/mo`` when ``mentions=[]``.
     triggers = sorted(
         {
-            (MONITORING_TRIGGER or "").strip(),
-            (MONITORING_MUTE_TRIGGER or "").strip(),
-            (MONITORING_CANCELMUTE_TRIGGER or "").strip(),
+            ((MONITORING_TRIGGER or "").strip() or "/mo"),
+            ((MONITORING_MUTE_TRIGGER or "").strip() or "/m"),
+            ((MONITORING_CANCELMUTE_TRIGGER or "").strip() or "/c"),
         },
         key=len,
         reverse=True,
@@ -1267,8 +1269,23 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
             continue
         m_cmd = re.search(re.escape(tri) + r"(?:\s|$)", text, flags=re.IGNORECASE)
         if m_cmd:
-            text = text[m_cmd.start() :].strip()
-            break
+            return text[m_cmd.start() :].strip()
+    tl = text.casefold()
+    for tri in triggers:
+        if len(tri) < 2 or not tri.startswith("/"):
+            continue
+        tri_cf = tri.casefold()
+        start = 0
+        while True:
+            pos = tl.find(tri_cf, start)
+            if pos < 0:
+                break
+            prev_ok = pos == 0 or tl[pos - 1].isspace()
+            endpos = pos + len(tri_cf)
+            next_ok = endpos >= len(tl) or tl[endpos].isspace()
+            if prev_ok and next_ok:
+                return text[pos:].strip()
+            start = pos + 1
     return text
 
 
