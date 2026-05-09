@@ -1585,20 +1585,14 @@ def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Op
         ids = _lark_ordered_strong_ids_from_at_tags(blob)
         if ids:
             return ids[0]
-    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
-    if isinstance(raw_c, str):
-        raw_cs = raw_c.strip()
-        if raw_cs:
-            try:
-                raw_c = json.loads(raw_cs)
-            except (json.JSONDecodeError, TypeError):
-                raw_c = None
-        else:
-            raw_c = None
-    if isinstance(raw_c, dict):
+    root = _lark_im_parsed_content_root(msg)
+    if isinstance(root, dict):
+        ordered = _lark_ordered_post_at_strong_ids_from_root(root)
+        if ordered:
+            return ordered[0]
         post_first: List[str] = []
         post_seen: Set[str] = set()
-        _lark_collect_post_at_user_ids(raw_c, post_first, post_seen)
+        _lark_collect_post_at_user_ids(root, post_first, post_seen)
         if post_first:
             return post_first[0]
     return None
@@ -1880,22 +1874,88 @@ def _monitoring_group_multi_bot_first_mention_gate(
     return True
 
 
-def _lark_collect_post_at_user_ids(obj: Any, out: List[str], seen: Set[str], depth: int = 0) -> None:
-    """Collect ``ou_`` / ``cli_`` from ``{\"tag\": \"at\", \"user_id\": \"...\"}`` in Feishu **post** JSON."""
-    if depth > 12 or obj is None:
-        return
-    if isinstance(obj, dict):
-        if obj.get("tag") == "at":
-            uid = ""
-            for key in ("user_id", "userId", "open_id", "openId"):
-                v = obj.get(key)
-                if v:
-                    uid = str(v).strip()
-                    if uid:
-                        break
-            if uid and _lark_string_is_strong_feishu_at_target(uid) and uid not in seen:
+def _lark_im_parsed_content_root(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parsed ``message.content`` / ``body`` JSON object when it is (or parses to) a dict."""
+    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
+    if isinstance(raw_c, dict):
+        return raw_c
+    if isinstance(raw_c, str):
+        raw_cs = raw_c.strip()
+        if not raw_cs:
+            return None
+        try:
+            o = json.loads(raw_cs)
+            return o if isinstance(o, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _lark_post_cell_strong_at_user_id(cell: Dict[str, Any]) -> Optional[str]:
+    """Strong ``ou_``/``cli_`` from a post/rich-text cell (``tag``: ``at`` / ``mention``)."""
+    tag_s = str(cell.get("tag") or cell.get("Tag") or "").strip().lower()
+    if tag_s not in ("at", "mention"):
+        return None
+    for key in ("user_id", "userId", "open_id", "openId"):
+        v = cell.get(key)
+        if v:
+            s = str(v).strip()
+            if s and _lark_string_is_strong_feishu_at_target(s):
+                return s
+    user = cell.get("user") or cell.get("User")
+    if isinstance(user, dict):
+        for key in ("open_id", "openId", "user_id", "userId", "id", "Id"):
+            v = user.get(key)
+            if v:
+                s = str(v).strip()
+                if s and _lark_string_is_strong_feishu_at_target(s):
+                    return s
+    return None
+
+
+def _lark_ordered_post_at_strong_ids_from_root(root: Dict[str, Any]) -> List[str]:
+    """Document-order @ targets: locale ``content`` rows, then ``elements`` / ``body.elements`` (mobile post)."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    for locale_key in ("zh_cn", "en_us", "ja_jp"):
+        block = root.get(locale_key)
+        if not isinstance(block, dict):
+            continue
+        for row in block.get("content") or []:
+            cells = row if isinstance(row, list) else [row]
+            for cell in cells:
+                if not isinstance(cell, dict):
+                    continue
+                uid = _lark_post_cell_strong_at_user_id(cell)
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    out.append(uid)
+    for el in root.get("elements") or []:
+        if isinstance(el, dict):
+            uid = _lark_post_cell_strong_at_user_id(el)
+            if uid and uid not in seen:
                 seen.add(uid)
                 out.append(uid)
+    body = root.get("body")
+    if isinstance(body, dict):
+        for el in body.get("elements") or []:
+            if isinstance(el, dict):
+                uid = _lark_post_cell_strong_at_user_id(el)
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    out.append(uid)
+    return out
+
+
+def _lark_collect_post_at_user_ids(obj: Any, out: List[str], seen: Set[str], depth: int = 0) -> None:
+    """Collect ``ou_`` / ``cli_`` from nested post / rich-text JSON (DFS)."""
+    if depth > 14 or obj is None:
+        return
+    if isinstance(obj, dict):
+        uid = _lark_post_cell_strong_at_user_id(obj)
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.append(uid)
         for v in obj.values():
             _lark_collect_post_at_user_ids(v, out, seen, depth + 1)
     elif isinstance(obj, list):
@@ -1928,18 +1988,13 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
                 seen.add(s)
                 out.append(s)
 
-    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
-    if isinstance(raw_c, str):
-        raw_cs = raw_c.strip()
-        if raw_cs:
-            try:
-                raw_c = json.loads(raw_cs)
-            except (json.JSONDecodeError, TypeError):
-                raw_c = None
-        else:
-            raw_c = None
-    if isinstance(raw_c, dict):
-        _lark_collect_post_at_user_ids(raw_c, out, seen)
+    root = _lark_im_parsed_content_root(msg)
+    if isinstance(root, dict):
+        for uid in _lark_ordered_post_at_strong_ids_from_root(root):
+            if uid not in seen:
+                seen.add(uid)
+                out.append(uid)
+        _lark_collect_post_at_user_ids(root, out, seen)
 
     return out
 
@@ -2052,6 +2107,11 @@ def _monitoring_at_bot_requirement_satisfied(
         raw_text,
         bot_like_bag=canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET,
     )
+    root = _lark_im_parsed_content_root(msg) if isinstance(msg, dict) else None
+    post_at_ordered = _lark_ordered_post_at_strong_ids_from_root(root) if root else []
+    if post_at_ordered:
+        # Mobile post: trust document-order @ in body over mentions[] order (often lists both bots).
+        primary = post_at_ordered[0]
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
     # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
