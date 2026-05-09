@@ -151,8 +151,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
     # 同一机器人在飞书里可能出现的其它 open_id（逗号/空格）；与上一项及运行时 bot/v3/info 结果 **并集** 匹配
     "MONITORING_CANONICAL_BOT_OPEN_IDS": "",
-    # Grafana **Platform** Bot open_id（逗号/空格列多条）；须含对方以便同群 @ 路由 / peer-only skip
-    "MONITORING_PEER_BOT_OPEN_IDS": "ou_0bfd185231d6beb669425fdf8f13e9df",
+    # Platform 机器人可能出现的全部 ou_（含历史 alternate）；须列全以便 primary / peer-only 判定
+    "MONITORING_PEER_BOT_OPEN_IDS": "ou_0bfd185231d6beb669425fdf8f13e9df ou_ee1af664e18d9c2d25e0ab6fded66388 ou_04878d0cdae2ca774e1d4a1716fa9ac3",
     "LARK_ENCRYPT_KEY": "",
     "LARK_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
     "LARK_WS_LOG_LEVEL": "INFO",
