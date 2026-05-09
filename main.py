@@ -1389,6 +1389,30 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
     return False
 
 
+def _lark_mentions_any_row_matches_app(mentions_list: List[Any], app: str) -> bool:
+    """
+    True when any ``mentions[]`` row carries this Lark app's ``app_id``.
+
+    Feishu occasionally binds ``@_user_N`` / ``open_id`` to a peer bot while the row still encodes this
+    app's ``app_id`` — strict ``primary open_id`` would skip incorrectly.
+    """
+    ap = (app or "").strip()
+    if not ap:
+        return False
+    for m in mentions_list:
+        if not isinstance(m, dict):
+            continue
+        for ak in ("app_id", "appId"):
+            if str(m.get(ak) or "").strip() == ap:
+                return True
+        ido = m.get("id")
+        if isinstance(ido, dict):
+            for ak in ("app_id", "appId"):
+                if str(ido.get(ak) or "").strip() == ap:
+                    return True
+    return False
+
+
 def _lark_collect_mention_identity_strings_for_at_conflict(m: dict) -> List[str]:
     """Id-like strings from ``id`` / standard keys only (skip ``name`` / ``tenant_key`` subtrees)."""
     out: List[str] = []
@@ -1948,9 +1972,17 @@ def _monitoring_at_bot_requirement_satisfied(
         raw_text,
         bot_like_bag=canon_ids | MONITORING_PEER_BOT_OPEN_ID_SET,
     )
+    app = str(APP_ID or "").strip()
+    row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
 
     if canon_ids and primary and primary not in canon_ids:
-        if primary in MONITORING_PEER_BOT_OPEN_ID_SET:
+        if row_app_id_is_self:
+            logger.info(
+                "monitoring: primary @ open_id=%r not in canonical but mention row app_id matches "
+                "this app — continuing (Feishu open_id/placeholder skew)",
+                primary,
+            )
+        elif primary in MONITORING_PEER_BOT_OPEN_ID_SET:
             logger.info(
                 "monitoring: skip — primary @ target %r is the configured peer bot (Platform), "
                 "not Game (canonical=%s). Feishu mapped @_user_N / mentions to the peer id — "
@@ -1964,7 +1996,8 @@ def _monitoring_at_bot_requirement_satisfied(
                 primary,
                 sorted(canon_ids),
             )
-        return False
+        if not row_app_id_is_self:
+            return False
 
     if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_group_multi_bot_first_mention_gate(
         chat_type=chat_type,
@@ -2047,6 +2080,13 @@ def _monitoring_at_bot_requirement_satisfied(
             if primary in canon_ids:
                 logger.info(
                     "monitoring /mo: trigger — mentions include this bot and primary @ matches canonical"
+                )
+                return True
+            if row_app_id_is_self:
+                logger.info(
+                    "monitoring /mo: trigger — mentions include this bot (app_id) while primary "
+                    "open_id=%r is not canonical (Feishu skew)",
+                    primary,
                 )
                 return True
             logger.info(
@@ -3851,7 +3891,21 @@ def _grafana_playwright_dock_nav_only(page: Any, timeout_ms: int) -> None:
     ``#dock-menu-button``（aria-label Dock menu）常在 ``[data-testid='data-testid navigation mega-menu']``
     对话框内；使用 ``visible`` 等待 + ``force=True`` 避免被遮罩/动画挡住导致 silent 失败。
     若仍无按钮则尝试打开 #mega-menu-toggle 后再点 Dock。
+
+    Set ``GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK=1`` to call ``page.reload()`` instead of Dock clicks.
     """
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK"):
+        t = min(25000, max(5000, int(timeout_ms)))
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=t)
+            page.wait_for_timeout(400)
+            logger.info(
+                "Grafana screenshot: page.reload() instead of Dock menu "
+                "(GRAFANA_SCREENSHOT_PAGE_RELOAD_INSTEAD_OF_DOCK=1)"
+            )
+        except Exception as e:
+            logger.warning("Grafana screenshot: page.reload failed: %s", e)
+        return
     if not _lark_env_truthy("GRAFANA_SCREENSHOT_DOCK_NAV"):
         return
     t = min(25000, max(5000, int(timeout_ms)))
