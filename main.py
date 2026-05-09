@@ -7053,9 +7053,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     sp_cmd: Optional[str] = None
     req_at_bot = MONITORING_TRIGGER_REQUIRES_AT_BOT
-    # One evaluation shared by /m|/c gate and inner skip (avoid duplicate work).
+    mute_or_cancel = _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) or _im_command_matches(
+        clean or "", MONITORING_CANCELMUTE_TRIGGER
+    )
+    # Only evaluate @-routing when /m|/c present — avoids ``monitoring: skip`` spam + wasted work on normal chat.
     monitoring_addressed_ok = True
-    if req_at_bot:
+    if req_at_bot and mute_or_cancel:
         monitoring_addressed_ok = _monitoring_at_bot_requirement_satisfied(
             raw_text,
             mentions,
@@ -7070,6 +7073,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
         or monitoring_addressed_ok
     )
+    if mute_or_cancel and req_at_bot and not _mute_cancel_allowed:
+        logger.info(
+            "im.command @gate reject: %s raw=%r clean=%r (same primary rules as /mo — payload targets another bot)",
+            ("mute /m" if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) else "cancelmute /c"),
+            (raw_text or "")[:160],
+            (clean or "")[:160],
+        )
     if _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER):
         if _mute_cancel_allowed:
             sp_cmd = "mute"
@@ -7193,9 +7203,13 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             if ml
             else False
         )
+        mute_like = _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) or _im_command_matches(
+            clean or "", MONITORING_CANCELMUTE_TRIGGER
+        )
         logger.info(
             "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s",
+            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s "
+            "mute_cancel_cmd=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
             len(mentions),
@@ -7208,6 +7222,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             body_ph,
             mo_ph_blocked_by_other,
             bool((_lark_effective_bot_open_id() or "").strip()),
+            mute_like,
         )
         return
 
