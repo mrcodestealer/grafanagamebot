@@ -4,7 +4,7 @@ grafanagamebot — Lark + Grafana「Online Number」仪表盘（7 面板）、�
 
 - **配置**：文件顶部 ``_CFG``；可用环境变量覆盖同名键。
 - **HTTP**：``LARK_EVENT_MODE=http`` 时 ``POST /webhook/event``；可选 ``ws`` 长连接（见 ``LARK_EVENT_MODE``）。
-- **命令**：``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时须 @ **本**机器人再发 ``/mo``；``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1``（默认）允许「非空弱 mentions + 正文 ``@_user_N``」触发。**同群 Platform** 须 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，且 **Game** 须在 ``MONITORING_PEER_BOT_OPEN_IDS`` 填 **Platform 机器人的 open_id**，否则正文虽 @ Platform，HTTP 仍可能按弱 mentions 落到 Game。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仍用于 **mentions 完全为空** 的兜底。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。``/m`` / ``/c`` 静音；机器人回复为英文。
+- **命令**：``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时须 @ **本**机器人再发 ``/mo``，**``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**（群内裸发 ``/m`` 不会触发）。``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1``（默认）允许「非空弱 mentions + 正文 ``@_user_N``」触发。**同群 Platform** 须 ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``，且 **Game** 须在 ``MONITORING_PEER_BOT_OPEN_IDS`` 填 **Platform 机器人的 open_id**，否则正文虽 @ Platform，HTTP 仍可能按弱 mentions 落到 Game。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仍用于 **mentions 完全为空** 的兜底。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。机器人回复为英文。
 
 依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）时截图嵌卡片内 — **一条消息**；embed=``0`` 则卡片 + 单独图片两条。``MONITORING_MESSAGE_CARD_BUTTON_ENABLE=1`` 时有 **Resend screenshot**。若 ``MONITORING_MESSAGE_CARD_ENABLE=0`` 则为纯文字 + 独立图。
@@ -88,8 +88,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
     # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
     "GRAFANA_SCREENSHOT_REFRESH": "1",
-    # Refresh 后等 Spinner 的最长毫秒（过大会拖慢整条截图）
-    # Refresh 后等 Spinner；过小易截到半加载图，过大拖慢整条链路（可调）
+    # Refresh 后等 Spinner（过小易半加载，过大拖慢）
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 900,
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
@@ -113,8 +112,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "350",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
-    # 等 #reactRoot 出现图表 DOM 的最长毫秒（过大会拖很久）
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 2800,
+    # 等 #reactRoot 出现图表 DOM；过小易超时后多走 reload，整体更慢
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
     "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 70,
@@ -126,8 +125,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PANEL_READY_RATIO": 0.92,
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 7,
-    # 全面板加载等待预算（毫秒）
+    # 全面板加载等待预算（毫秒）；仅当能数到面板头时跑满；Scenes 见下一项
     "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 7500,
+    # Panel header 选择器匹配数为 0（Scenes 等）时，最多再等这么久即放行，避免空转 7.5s
+    "GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS": 1400,
     # Set via environment (systemd Environment=) — do not commit real secrets.
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
@@ -499,6 +500,10 @@ GRAFANA_SCREENSHOT_PANEL_READY_MIN = max(
 )
 GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS = max(
     2000, min(120_000, _cfg_int("GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS", 12000))
+)
+GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS = max(
+    400,
+    min(60_000, _cfg_int("GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS", 1400)),
 )
 GRAFANA_SCREENSHOT_KIOSK = _cfg_str("GRAFANA_SCREENSHOT_KIOSK", "").strip()
 GRAFANA_SCREENSHOT_RELATIVE_RANGE = _lark_env_truthy("GRAFANA_SCREENSHOT_RELATIVE_RANGE")
@@ -1516,6 +1521,111 @@ def _lark_body_peer_only_strong_at_targets(
     return body_ids <= peer_open_ids
 
 
+def _monitoring_at_bot_requirement_satisfied(
+    raw_text: str,
+    mentions: Any,
+    *,
+    content_at_entity_ids: Optional[List[str]] = None,
+) -> bool:
+    """
+    Same @-target rules as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``.
+    Used for ``/m`` / ``/c`` so mute commands in a shared group only hit the bot that was actually @'d.
+    """
+    if isinstance(mentions, list):
+        mentions_list = mentions
+    elif isinstance(mentions, dict) and mentions:
+        mentions_list = [mentions]
+    else:
+        mentions_list = []
+    canon_ids = _monitoring_canonical_open_id_match_set()
+    explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
+    if canon_ids:
+        if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
+            logger.info(
+                "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
+            )
+            return True
+        if explicit_ids and explicit_ids.isdisjoint(canon_ids):
+            peer_only = (
+                bool(MONITORING_PEER_BOT_OPEN_ID_SET)
+                and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
+            )
+            if peer_only:
+                body_peer_only = _lark_body_peer_only_strong_at_targets(
+                    content_at_entity_ids,
+                    MONITORING_PEER_BOT_OPEN_ID_SET,
+                )
+                if body_peer_only:
+                    logger.info(
+                        "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
+                        sorted(explicit_ids),
+                    )
+                    return False
+                logger.info(
+                    "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — "
+                    "fall through (Feishu mentions vs @_user_N)",
+                    sorted(explicit_ids),
+                )
+            logger.info(
+                "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
+                "(not peer-only; checking mentions/content)",
+                sorted(explicit_ids),
+                sorted(canon_ids),
+            )
+    if _lark_message_mentions_bot(mentions):
+        return True
+    cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
+    sb = (_lark_effective_bot_open_id() or "").strip()
+    sa = (str(APP_ID).strip() if APP_ID else "") or ""
+    if sb and sb in cat_ids:
+        logger.info("monitoring /mo: trigger via content <at> matching this bot open_id")
+        return True
+    if sa and sa in cat_ids:
+        logger.info("monitoring /mo: trigger via content <at> matching APP_ID")
+        return True
+    body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
+    conflict_other = (
+        _lark_mentions_carry_strong_identity_other_than_bot(
+            _lark_effective_bot_open_id(),
+            str(APP_ID).strip() if APP_ID else "",
+            mentions_list,
+        )
+        if mentions_list
+        else False
+    )
+    if mentions_list:
+        if (
+            MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW
+            and body_ph
+            and not conflict_other
+        ):
+            if _mo_peer_at_blocks_weak_nonempty_mo(
+                content_at_entity_ids,
+                self_bot=_lark_effective_bot_open_id(),
+                self_app=str(APP_ID).strip() if APP_ID else "",
+                peer_open_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
+            ):
+                logger.info(
+                    "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
+                    "(weak-nonempty path disabled for peer @)"
+                )
+            else:
+                logger.info(
+                    "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
+                    "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
+                    MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
+                )
+                return True
+        return False
+    if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
+        logger.info(
+            "monitoring /mo: allowed via Feishu @_user_N placeholder "
+            "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
+        )
+        return True
+    return False
+
+
 def _text_should_run_monitoring(
     raw_text: str,
     clean: str,
@@ -1554,99 +1664,9 @@ def _text_should_run_monitoring(
     if _text_has_monitoring_trigger(raw_text, clean):
         if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
             return True
-        if isinstance(mentions, list):
-            mentions_list = mentions
-        elif isinstance(mentions, dict) and mentions:
-            mentions_list = [mentions]
-        else:
-            mentions_list = []
-        canon_ids = _monitoring_canonical_open_id_match_set()
-        explicit_ids = _lark_collect_explicit_bot_at_ids(mentions_list, content_at_entity_ids)
-        if canon_ids:
-            if explicit_ids and not explicit_ids.isdisjoint(canon_ids):
-                logger.info(
-                    "monitoring /mo: trigger — explicit @ targets intersect canonical open_id set"
-                )
-                return True
-            if explicit_ids and explicit_ids.isdisjoint(canon_ids):
-                peer_only = (
-                    bool(MONITORING_PEER_BOT_OPEN_ID_SET)
-                    and explicit_ids <= MONITORING_PEER_BOT_OPEN_ID_SET
-                )
-                if peer_only:
-                    body_peer_only = _lark_body_peer_only_strong_at_targets(
-                        content_at_entity_ids,
-                        MONITORING_PEER_BOT_OPEN_ID_SET,
-                    )
-                    if body_peer_only:
-                        logger.info(
-                            "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
-                            sorted(explicit_ids),
-                        )
-                        return False
-                    logger.info(
-                        "monitoring /mo: explicit meta peer-only %s but body lacks peer-only <at> — "
-                        "fall through (Feishu mentions vs @_user_N)",
-                        sorted(explicit_ids),
-                    )
-                logger.info(
-                    "monitoring /mo: explicit @ targets %s disjoint from canonical %s — fall through "
-                    "(not peer-only; checking mentions/content)",
-                    sorted(explicit_ids),
-                    sorted(canon_ids),
-                )
-        if _lark_message_mentions_bot(mentions):
-            return True
-        cat_ids = [str(x).strip() for x in (content_at_entity_ids or []) if str(x).strip()]
-        sb = (_lark_effective_bot_open_id() or "").strip()
-        sa = (str(APP_ID).strip() if APP_ID else "") or ""
-        if sb and sb in cat_ids:
-            logger.info("monitoring /mo: trigger via content <at> matching this bot open_id")
-            return True
-        if sa and sa in cat_ids:
-            logger.info("monitoring /mo: trigger via content <at> matching APP_ID")
-            return True
-        body_ph = _lark_raw_text_has_feishu_at_placeholder(raw_text)
-        conflict_other = (
-            _lark_mentions_carry_strong_identity_other_than_bot(
-                _lark_effective_bot_open_id(),
-                str(APP_ID).strip() if APP_ID else "",
-                mentions_list,
-            )
-            if mentions_list
-            else False
+        return _monitoring_at_bot_requirement_satisfied(
+            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
         )
-        if mentions_list:
-            if (
-                MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW
-                and body_ph
-                and not conflict_other
-            ):
-                if _mo_peer_at_blocks_weak_nonempty_mo(
-                    content_at_entity_ids,
-                    self_bot=_lark_effective_bot_open_id(),
-                    self_app=str(APP_ID).strip() if APP_ID else "",
-                    peer_open_ids=MONITORING_PEER_BOT_OPEN_ID_SET,
-                ):
-                    logger.info(
-                        "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
-                        "(weak-nonempty path disabled for peer @)"
-                    )
-                else:
-                    logger.info(
-                        "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
-                        "(MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=1 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=%s)",
-                        MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
-                    )
-                    return True
-            return False
-        if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
-            logger.info(
-                "monitoring /mo: allowed via Feishu @_user_N placeholder "
-                "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
-            )
-            return True
-        return False
     if not MONITORING_AT_MENTION_ENABLE:
         return False
     if not _lark_message_mentions_bot(mentions):
@@ -3314,12 +3334,14 @@ _GRAFANA_JS_REACTROOT_HAS_CHARTS = """() => {
   const grid = n('.react-grid-item');
   const uplot = n('[data-testid="uplot-main-div"]');
   const canv = n('canvas');
+  const gridCanv = rr.querySelectorAll('.react-grid-item canvas').length;
   const panels = n('[data-testid^="data-testid Panel"], [class*="PanelChrome"], [class*="panel-content"]');
   const main = document.querySelector('main');
   const mh = main ? main.getBoundingClientRect().height : 0;
   if (grid + uplot + canv >= 1) return true;
-  if (panels >= 1 && mh > 140) return true;
-  if (canv >= 1 && mh > 100) return true;
+  if (gridCanv >= 1) return true;
+  if (panels >= 1 && mh > 110) return true;
+  if (canv >= 1 && mh > 90) return true;
   return false;
 }"""
 
@@ -3588,6 +3610,12 @@ def _grafana_click_dashboard_refresh(
         except Exception:
             _grafana_close_open_menus(page)
             continue
+    if _grafana_click_refresh_dashboard_js(page):
+        logger.info("Grafana screenshot: refresh via in-page JS (toolbar/testid)")
+        page.wait_for_timeout(120)
+        _grafana_close_open_menus(page)
+        _grafana_wait_loading_like_gone(page, spin_cap)
+        return
     try:
         logger.info("Grafana screenshot: no explicit Refresh control — using full page reload instead")
         page.reload(wait_until="load", timeout=timeout_ms)
@@ -3729,17 +3757,31 @@ def _grafana_panel_ready_stats(page: Any) -> Tuple[int, int]:
     """
     Return (total_panels, ready_panels).
     A panel is "ready" when it shows chart canvas/uplot, or explicit "No data"/error text.
+    Falls back to ``dashboard-panel-content`` / sized ``.react-grid-item`` when classic Panel headers
+    are absent (Grafana Scenes and newer shells).
     """
     try:
         r = page.evaluate(
             """() => {
-              const panels = Array.from(
+              let roots = Array.from(
                 document.querySelectorAll(
                   'section[data-testid^="data-testid Panel header"], section[data-testid*="Panel header"]'
                 )
               );
+              if (!roots.length) {
+                roots = Array.from(
+                  document.querySelectorAll('[data-testid="dashboard-panel-content"]')
+                );
+              }
+              if (!roots.length) {
+                roots = Array.from(document.querySelectorAll('.react-grid-item')).filter((el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 80 && r.height > 48;
+                });
+              }
+              roots = roots.slice(0, 48);
               let ready = 0;
-              for (const p of panels) {
+              for (const p of roots) {
                 const root = p.querySelector('[data-testid="data-testid panel content"]') || p;
                 const hasChart = !!(
                   root.querySelector('[data-testid="uplot-main-div"]') ||
@@ -3747,10 +3789,11 @@ def _grafana_panel_ready_stats(page: Any) -> Tuple[int, int]:
                   root.querySelector('[class*="timeseries"]')
                 );
                 const txt = (root.textContent || '').toLowerCase();
-                const hasExplicitNoData = txt.includes('no data') || txt.includes('n/a') || txt.includes('error');
+                const hasExplicitNoData =
+                  txt.includes('no data') || txt.includes('n/a') || txt.includes('error');
                 if (hasChart || hasExplicitNoData) ready += 1;
               }
-              return { total: panels.length, ready };
+              return { total: roots.length, ready };
             }"""
         )
         if isinstance(r, dict):
@@ -3760,21 +3803,108 @@ def _grafana_panel_ready_stats(page: Any) -> Tuple[int, int]:
     return 0, 0
 
 
+def _grafana_click_refresh_dashboard_js(page: Any) -> bool:
+    """
+    Last-resort refresh before ``page.reload``: clicks a real dashboard refresh control in-page.
+    Avoids Playwright locator misses on Grafana toolbar variants.
+    """
+    try:
+        tag = page.evaluate(
+            """() => {
+              const clickVisible = (el) => {
+                try {
+                  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  if (typeof el.click === 'function') el.click();
+                  return true;
+                } catch (e) {
+                  return false;
+                }
+              };
+              const roots = [
+                document.querySelector('[data-testid="topnav-toolbar-content"]'),
+                document.querySelector('[class*="ToolbarButtonRow"]'),
+                document.querySelector('header'),
+                document.body,
+              ].filter(Boolean);
+              for (const root of roots) {
+                for (const b of root.querySelectorAll('button')) {
+                  const al = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+                  if (al === 'refresh dashboard' || al.endsWith('refresh dashboard')) {
+                    if (clickVisible(b)) return 'aria';
+                  }
+                }
+              }
+              const byTest = document.querySelector('[data-testid="refresh-dashboard-button"]');
+              if (byTest && clickVisible(byTest)) return 'testid';
+              const insidePicker = document.querySelector(
+                '[data-testid*="RefreshPicker"] [data-testid*="run"]'
+              );
+              if (insidePicker && clickVisible(insidePicker)) return 'picker_desc';
+              for (const b of document.querySelectorAll('button[data-testid]')) {
+                const tid = (b.getAttribute('data-testid') || '').toLowerCase();
+                if (tid.includes('refresh') && tid.includes('run') && clickVisible(b)) return 'picker_btn';
+              }
+              return '';
+            }"""
+        )
+        return bool(tag)
+    except Exception:
+        return False
+
+
 def _grafana_wait_panels_fully_loaded(page: Any, budget_ms: int) -> None:
     """
     Wait until most dashboard panels are ready before screenshot.
     Uses panel ready ratio + loading-like elements stable at 0.
+    When **no** panel roots match (Scenes DOM), do not burn the full ``budget_ms``: use chart
+    heuristic + idle loading for a short capped window (``GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS``).
     """
     b = max(1000, int(budget_ms))
     deadline = time.monotonic() + b / 1000.0
     stable = 0
+    zero_started: Optional[float] = None
+
     while time.monotonic() < deadline:
         total, ready = _grafana_panel_ready_stats(page)
         loading = _grafana_loading_like_count(page)
-        need = 0
-        if total > 0:
-            need = max(int(math.ceil(total * GRAFANA_SCREENSHOT_PANEL_READY_RATIO)), int(GRAFANA_SCREENSHOT_PANEL_READY_MIN))
-        ok_panels = total > 0 and ready >= min(total, need)
+
+        if total == 0:
+            if zero_started is None:
+                zero_started = time.monotonic()
+                stable = 0
+            z_cap = zero_started + float(GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS) / 1000.0
+
+            vis = _grafana_dashboard_has_visual_content(page)
+            if vis and loading == 0:
+                stable += 1
+                if stable >= 2:
+                    logger.info(
+                        "Grafana screenshot: panel roots=0 (layout); chart heuristic + idle loading OK"
+                    )
+                    return
+            else:
+                stable = 0
+
+            if time.monotonic() >= z_cap:
+                logger.info(
+                    "Grafana screenshot: panel roots=0 — stop ratio wait after %sms "
+                    "(GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS)",
+                    int(GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS),
+                )
+                return
+
+            page.wait_for_timeout(110)
+            continue
+
+        if zero_started is not None:
+            stable = 0
+        zero_started = None
+
+        need = max(
+            int(math.ceil(total * GRAFANA_SCREENSHOT_PANEL_READY_RATIO)),
+            int(GRAFANA_SCREENSHOT_PANEL_READY_MIN),
+        )
+        ok_panels = ready >= min(total, need)
         if ok_panels and loading == 0:
             stable += 1
             if stable >= 2:
@@ -3789,6 +3919,7 @@ def _grafana_wait_panels_fully_loaded(page: Any, budget_ms: int) -> None:
         else:
             stable = 0
         page.wait_for_timeout(150)
+
     total, ready = _grafana_panel_ready_stats(page)
     logger.warning(
         "Grafana screenshot: panel readiness timeout after %sms (ready=%s/%s ratio_target=%.2f min=%s)",
@@ -6127,6 +6258,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         sp_cmd = "cancelmute"
 
     if sp_cmd:
+        if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
+            raw_text, mentions, content_at_entity_ids=content_at_entity_ids
+        ):
+            logger.info(
+                "%s skip — not addressed to this bot (MONITORING_TRIGGER_REQUIRES_AT_BOT=1)",
+                sp_cmd,
+            )
+            return
         processed_stick_m = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
         )
