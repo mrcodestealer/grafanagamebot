@@ -1781,10 +1781,11 @@ def _monitoring_resolved_primary_at_target(
     Resolve primary @ target for shared multi-bot groups:
 
     1. When **two or more** bot-like ids appear in ``mentions[]``, prefer **document-order** strong ``<at …>`` /
-       post cells in the message body (canon ∪ peer bag) — Feishu often misorders ``@_user_N`` vs real ``<at user_id=…>``.
-    2. Leftmost visible ``key`` / ``mention_key`` / ``@name`` in plain text.
-    3. First ``@_user_N`` mapped via ``mentions[].key`` / index.
-    4. Fallback: any strong ``<at>`` / post id, then ``mentions[]`` row order.
+       post cells filtered to the canon ∪ peer bag.
+    2. Else **rich-text / post body**: first strong ``<at …>`` whose id is in the bot_like bag — **before**
+       ``@_user_N`` → ``mentions[]`` mapping (Feishu often binds ``@_user_1`` to the wrong row while HTML keeps the tapped bot).
+    3. Leftmost visible ``key`` / ``mention_key`` / ``@name``.
+    4. First ``@_user_N`` via ``mentions[].key`` / index; then ``mentions[]`` row order.
 
     Set ``MONITORING_LOG_PRIMARY_AT=1`` for one-line diagnostics on the server.
     """
@@ -1795,8 +1796,6 @@ def _monitoring_resolved_primary_at_target(
             rt = alt
         elif not (rt or "").strip():
             rt = alt
-    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
-    ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
 
     distinct_bot_like: Set[str] = set()
     body_chain: List[str] = []
@@ -1809,13 +1808,19 @@ def _monitoring_resolved_primary_at_target(
         if len(distinct_bot_like) >= 2:
             body_chain = _lark_visible_bot_like_at_chain(msg, bot_like_bag, mentions_list)
 
+    body_first_bot_like = _lark_primary_strong_at_from_im_message(msg, mentions_list)
+    vis_early = _lark_primary_strong_from_mentions_visible_order(rt, mentions_list)
+    ph = _lark_primary_strong_from_feishu_user_placeholders(rt, mentions_list)
+
     if MONITORING_LOG_PRIMARY_AT:
         logger.info(
-            "monitoring primary-at dbg rt=%r mentions_n=%s distinct_bot_like=%s body_at_chain=%s ph=%s vis_early=%s",
+            "monitoring primary-at dbg rt=%r mentions_n=%s distinct_bot_like=%s body_at_chain=%s "
+            "body_first_bot_like=%s ph=%s vis_early=%s",
             (rt[:200] + ("…" if len(rt) > 200 else "")),
             len(mentions_list),
             sorted(distinct_bot_like),
             body_chain,
+            body_first_bot_like,
             ph,
             vis_early,
         )
@@ -1823,13 +1828,19 @@ def _monitoring_resolved_primary_at_target(
     if bot_like_bag and len(distinct_bot_like) >= 2 and body_chain:
         return body_chain[0]
 
+    if (
+        body_first_bot_like
+        and bot_like_bag
+        and body_first_bot_like in bot_like_bag
+    ):
+        return body_first_bot_like
+
     if vis_early:
         return vis_early
     if ph:
         return ph
-    b = _lark_primary_strong_at_from_im_message(msg, mentions_list)
-    if b:
-        return b
+    if body_first_bot_like:
+        return body_first_bot_like
     return _lark_primary_strong_from_mentions_order(mentions_list)
 
 
