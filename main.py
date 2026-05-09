@@ -1262,14 +1262,12 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
         key=len,
         reverse=True,
     )
-    tl = text.lower()
     for tri in triggers:
         if len(tri) < 2 or not tri.startswith("/"):
             continue
-        tri_l = tri.lower()
-        idx = tl.find(tri_l)
-        if idx >= 0:
-            text = text[idx:].strip()
+        m_cmd = re.search(re.escape(tri) + r"(?:\s|$)", text, flags=re.IGNORECASE)
+        if m_cmd:
+            text = text[m_cmd.start() :].strip()
             break
     return text
 
@@ -1321,11 +1319,15 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
         return False
     app = (str(APP_ID).strip() if APP_ID else "") or ""
     bot = _lark_effective_bot_open_id()
-    if not bot and not app:
+    canon_self = _monitoring_canonical_open_id_match_set()
+    if not bot and not app and not canon_self:
         return False
     for m in mentions:
         if not isinstance(m, dict):
             continue
+        row_oid = _lark_mention_row_main_open_id(m)
+        if row_oid and row_oid in canon_self:
+            return True
         if app:
             for ak in ("app_id", "appId"):
                 av = m.get(ak)
@@ -1351,7 +1353,7 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
                 if v and str(v).strip() == bot:
                     return True
         # Nested / newer payload shapes (still one mention entity — avoid missing open_id under unknown keys).
-        if bot or app:
+        if bot or app or canon_self:
             n = 0
             for s in _lark_iter_mention_scalar_strings(m):
                 n += 1
@@ -1360,6 +1362,12 @@ def _lark_message_mentions_bot(mentions: Any) -> bool:
                 if bot and s == bot:
                     return True
                 if app and s == app:
+                    return True
+                if (
+                    canon_self
+                    and _lark_string_is_strong_feishu_at_target(s)
+                    and s in canon_self
+                ):
                     return True
     return False
 
