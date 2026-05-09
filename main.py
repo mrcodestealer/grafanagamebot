@@ -1554,13 +1554,29 @@ def _lark_ordered_strong_ids_from_at_tags(blob: str) -> List[str]:
 
 
 def _lark_primary_strong_at_from_im_message(msg: Optional[Dict[str, Any]]) -> Optional[str]:
-    """First strong bot/user id from ``<at>`` tags in message body fields (visible order)."""
+    """First strong bot/user id from ``<at>`` tags or post JSON ``{\"tag\":\"at\"}`` cells (document order)."""
     if not isinstance(msg, dict):
         return None
     for blob in _lark_im_content_blobs_for_at_parse(msg):
         ids = _lark_ordered_strong_ids_from_at_tags(blob)
         if ids:
             return ids[0]
+    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
+    if isinstance(raw_c, str):
+        raw_cs = raw_c.strip()
+        if raw_cs:
+            try:
+                raw_c = json.loads(raw_cs)
+            except (json.JSONDecodeError, TypeError):
+                raw_c = None
+        else:
+            raw_c = None
+    if isinstance(raw_c, dict):
+        post_first: List[str] = []
+        post_seen: Set[str] = set()
+        _lark_collect_post_at_user_ids(raw_c, post_first, post_seen)
+        if post_first:
+            return post_first[0]
     return None
 
 
@@ -1840,9 +1856,35 @@ def _monitoring_group_multi_bot_first_mention_gate(
     return True
 
 
+def _lark_collect_post_at_user_ids(obj: Any, out: List[str], seen: Set[str], depth: int = 0) -> None:
+    """Collect ``ou_`` / ``cli_`` from ``{\"tag\": \"at\", \"user_id\": \"...\"}`` in Feishu **post** JSON."""
+    if depth > 12 or obj is None:
+        return
+    if isinstance(obj, dict):
+        if obj.get("tag") == "at":
+            uid = ""
+            for key in ("user_id", "userId", "open_id", "openId"):
+                v = obj.get(key)
+                if v:
+                    uid = str(v).strip()
+                    if uid:
+                        break
+            if uid and _lark_string_is_strong_feishu_at_target(uid) and uid not in seen:
+                seen.add(uid)
+                out.append(uid)
+        for v in obj.values():
+            _lark_collect_post_at_user_ids(v, out, seen, depth + 1)
+    elif isinstance(obj, list):
+        for x in obj:
+            _lark_collect_post_at_user_ids(x, out, seen, depth + 1)
+
+
 def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str]:
     """
     Parse ``<at …>`` ids from **message body fields only** (``content`` / ``text`` / ``body``).
+
+    Also walks **post** rich-text JSON cells ``{\"tag\": \"at\", \"user_id\": \"ou_…\"}`` (mobile clients),
+    which omit HTML ``<at>`` and plain ``@_user_N`` in extracted text.
 
     Do **not** scan ``json.dumps(msg)``: the envelope repeats ``mentions[]`` open_ids and falsely looks like a
     peer ``<at>`` in the visible text — Game then peer-skips ``@_user_1 /mo`` even when the user @'d Game.
@@ -1861,6 +1903,20 @@ def _lark_extract_at_entity_ids_from_im_message(msg: Dict[str, Any]) -> List[str
             if s and s not in seen:
                 seen.add(s)
                 out.append(s)
+
+    raw_c = msg.get("content") or msg.get("Content") or msg.get("body")
+    if isinstance(raw_c, str):
+        raw_cs = raw_c.strip()
+        if raw_cs:
+            try:
+                raw_c = json.loads(raw_cs)
+            except (json.JSONDecodeError, TypeError):
+                raw_c = None
+        else:
+            raw_c = None
+    if isinstance(raw_c, dict):
+        _lark_collect_post_at_user_ids(raw_c, out, seen)
+
     return out
 
 
