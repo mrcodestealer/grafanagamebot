@@ -185,8 +185,11 @@ _CFG: Dict[str, Any] = {
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
     "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Resend screenshot",
-    "MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS": "16000",
+    # 飞书交互卡片正文上限；超出时先发卡片再自动拆成多条文字消息补全（避免只看到 ~10 条序列）
+    "MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS": "28000",
     "MONITORING_MESSAGE_CARD_TRUNCATE": "1",
+    # 续传文字消息单段上限（总长仍会再按飞书限制二次切块）
+    "MONITORING_MESSAGE_OVERFLOW_TEXT_CHUNK_CHARS": "12000",
     "LARK_WS_TRANSPORT_LOG": "1",
     "LARK_WS_BOOTSTRAP_FRAMES": 16,
     "LARK_WS_LOG_FRAME_METHOD": "0",
@@ -3449,6 +3452,31 @@ def _split_text_for_lark(text: str, max_chars: int = 3200) -> List[str]:
     return chunks or [raw[:max_chars]]
 
 
+def _partition_monitoring_reply_for_card(reply: str, max_card: int) -> Tuple[str, str]:
+    """
+    If ``reply`` exceeds Feishu card budget, put an initial slice in the card and return the remainder
+    for follow-up text messages (prefer cutting at ``\\n\\n[`` panel section boundaries).
+    """
+    raw = reply or ""
+    if len(raw) <= max_card or max_card <= 200:
+        return raw, ""
+    note = "\n\n… *(full report continues in the next message(s))*"
+    budget = max(600, max_card - len(note))
+    cut = raw.rfind("\n\n[", 0, budget)
+    min_cut = max(120, budget // 5)
+    if cut < min_cut:
+        cut = raw.rfind("\n\n", 0, budget)
+    if cut < min_cut:
+        cut = budget
+    head = raw[:cut].rstrip() + note
+    tail = raw[cut:].lstrip()
+    if len(head) > max_card:
+        cut = budget
+        head = raw[:cut].rstrip() + note
+        tail = raw[cut:].lstrip()
+    return head, tail
+
+
 def _lark_send_text_auto(receive_id_type: str, receive_id: str, text: str, max_chars: int = 3200) -> None:
     chunks = _split_text_for_lark(text, max_chars=max_chars)
     total = len(chunks)
@@ -4180,25 +4208,26 @@ def _lark_send_monitoring_user_message(
     if not rid:
         raise ValueError("empty receive_id for monitoring message")
     raw_reply = reply or ""
-    max_card = _cfg_int("MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS", 16000)
+    max_card = _cfg_int("MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS", 28000)
     if max_card <= 0:
         max_card = 3000
+    overflow_chunk = max(2000, _cfg_int("MONITORING_MESSAGE_OVERFLOW_TEXT_CHUNK_CHARS", 12000))
 
     reply_for_card = raw_reply
+    overflow_tail = ""
     if len(raw_reply) > max_card:
         if MONITORING_MESSAGE_CARD_ENABLE and _lark_env_truthy_or_default(
             "MONITORING_MESSAGE_CARD_TRUNCATE",
             default=True,
         ):
-            trunc_note = "\n\n… *(truncated for Feishu card size)*"
-            budget = max(800, max_card - len(trunc_note))
-            reply_for_card = raw_reply[:budget].rstrip() + trunc_note
+            reply_for_card, overflow_tail = _partition_monitoring_reply_for_card(raw_reply, max_card)
             logger.warning(
-                "monitoring interactive card: truncated body %s→%s chars "
-                "(MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS=%s)",
+                "monitoring interactive card: body %s chars exceeds MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS=%s "
+                "— card has %s chars, sending %s more via text message(s)",
                 len(raw_reply),
-                len(reply_for_card),
                 max_card,
+                len(reply_for_card),
+                len(overflow_tail),
             )
         else:
             _lark_send_text_auto(receive_id_type, rid, raw_reply, max_chars=3200)
@@ -4210,6 +4239,13 @@ def _lark_send_monitoring_user_message(
                 reply_for_card, receive_id_type, rid, lark_img_key
             )
             _lark_send_interactive_card(receive_id_type, rid, card)
+            if overflow_tail.strip():
+                _lark_send_text_auto(
+                    receive_id_type,
+                    rid,
+                    overflow_tail,
+                    max_chars=min(20000, overflow_chunk),
+                )
             return True, bool((lark_img_key or "").strip())
         except Exception as e:
             logger.warning(
@@ -5502,26 +5538,52 @@ def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, 
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _interpolate_grafana_legend_template(legend_format: str, metric: Dict[str, Any]) -> str:
+    """
+    Grafana ``legendFormat`` often contains ``{{project}}`` etc.; API snapshots keep the template
+    while values live on Prometheus ``metric`` labels — substitute when keys match.
+    """
+    s = str(legend_format or "").strip()
+    if not s or "{{" not in s:
+        return s
+    md = metric if isinstance(metric, dict) else {}
+
+    def repl(m: re.Match[str]) -> str:
+        key = (m.group(1) or "").strip()
+        if not key:
+            return m.group(0)
+        v = md.get(key)
+        if v is None:
+            return m.group(0)
+        return str(v)
+
+    return re.sub(r"\{\{\s*([^}]+?)\s*\}\}", repl, s).strip()
+
+
 def _series_group_key(legend_format: str, metric: Dict[str, Any]) -> str:
     """Stable key to merge duplicate Prometheus rows that belong to the same Grafana series."""
-    lg = str(legend_format or "").strip()
     md = metric if isinstance(metric, dict) else {}
-    if lg:
-        return f"leg:{lg.casefold()}"
+    raw = str(legend_format or "").strip()
+    interpolated = _interpolate_grafana_legend_template(raw, md)
+    unresolved = "{{" in interpolated
+    if interpolated and not unresolved:
+        return f"leg:{interpolated.casefold()}"
     fp = "|".join(f"{k}={v}" for k, v in sorted(md.items()))
     return f"m:{fp}" if fp else "empty"
 
 
 def _series_row_display_label(legend_format: str, metric: Dict[str, Any]) -> str:
-    lg = str(legend_format or "").strip()
-    if lg:
-        return lg
     md = metric if isinstance(metric, dict) else {}
-    lbl = str(md.get("series") or md.get("name") or "").strip()
+    raw = str(legend_format or "").strip()
+    lg = _interpolate_grafana_legend_template(raw, md)
+    if lg and "{{" not in lg:
+        return lg
+    lbl = str(md.get("series") or md.get("name") or md.get("project") or "").strip()
     if lbl:
         return lbl
     bits = [f"{k}={v}" for k, v in sorted(md.items()) if str(v).strip()]
-    return ", ".join(bits[:6]) or "series"
+    compact = ", ".join(bits[:6])
+    return compact or lg or "series"
 
 
 def _group_per_series_points_from_payload(
@@ -5577,8 +5639,9 @@ def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dic
     kw_raw = (keyword or "").strip()
     if not kw_raw:
         return True
-    lg = str(legend_format or "").strip()
-    metric_blob = " ".join(str(v) for v in metric.values() if v is not None)
+    md = metric if isinstance(metric, dict) else {}
+    lg = _interpolate_grafana_legend_template(str(legend_format or "").strip(), md)
+    metric_blob = " ".join(str(v) for v in md.values() if v is not None)
     kw_cf = kw_raw.casefold()
     lg_cf = lg.casefold()
     mb_cf = metric_blob.casefold()
@@ -5602,14 +5665,16 @@ def _series_row_exact_keyword_id(keyword: str, legend_format: str, metric: Dict[
     if not kw_raw:
         return False
     kw_cf = kw_raw.casefold()
-    lg = str(legend_format or "").strip().casefold()
+    md = metric if isinstance(metric, dict) else {}
+    lg = _interpolate_grafana_legend_template(str(legend_format or "").strip(), md).casefold()
     if lg == kw_cf:
         return True
-    if not isinstance(metric, dict):
+    if not md:
         return False
     for mk in (
         "series",
         "name",
+        "project",
         "provider",
         "providerid",
         "provider_id",
@@ -5619,7 +5684,7 @@ def _series_row_exact_keyword_id(keyword: str, legend_format: str, metric: Dict[
         "label",
         "__series_id__",
     ):
-        v = metric.get(mk)
+        v = md.get(mk)
         if v is None:
             continue
         if str(v).strip().casefold() == kw_cf:
