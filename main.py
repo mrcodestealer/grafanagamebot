@@ -147,6 +147,9 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁用「非空弱 mentions + 正文 @_user_N」/mo（与 Platform 同群时必须 **0**，否则会 @ Platform 仍落到 Game）
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
+    # 1=sole mention 的 open_id 落在 peer，但正文仅有 @_user_N、无 <at user_id>，且 mention.name 命中 SUBSTRINGS 时把 primary 纠正为本 bot（默认关；子串要独特）
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK": "0",
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS": "",
     # 本仓库 = Grafana **Game** Bot：解析到明确 ou_/cli_ @ 目标时须与本 bot 的 **任一** canonical id 相交才跑 /mo
     "MONITORING_CANONICAL_BOT_OPEN_ID": "ou_1830c6697311e779471888a420233eed",
     # 同一 Game 应用在飞书里可能出现的其它 open_id（HTTP mentions 仍可能带旧 ou_）
@@ -679,6 +682,20 @@ _GAME_EMBEDDED_CANONICAL_IDS: Tuple[str, ...] = (
     "ou_a51dad55e46f665d740b85c5ae22f940",
 )
 
+# grafanaplatformbot canonical open_ids — systemd 误套 Platform 模板时用于纠正本进程的 LARK_/MONITORING_CANONICAL_*。
+_PLATFORM_BOT_OPEN_IDS_EMBEDDED_SET: Set[str] = {
+    "ou_0bfd185231d6beb669425fdf8f13e9df",
+    "ou_ee1af664e18d9c2d25e0ab6fded66388",
+    "ou_04878d0cdae2ca774e1d4a1716fa9ac3",
+}
+
+if MONITORING_PEER_BOT_OPEN_ID_SET and MONITORING_PEER_BOT_OPEN_ID_SET <= set(_GAME_EMBEDDED_CANONICAL_IDS):
+    logger.warning(
+        "MONITORING_PEER_BOT_OPEN_IDS=%s looks like Game bot ids — peer must list Platform bot ou_; "
+        "routing will mis-handle @Platform vs @Game until fixed.",
+        sorted(MONITORING_PEER_BOT_OPEN_ID_SET),
+    )
+
 _lark_oid_cfg = _cfg_str("LARK_BOT_OPEN_ID", "").strip()
 if not _lark_oid_cfg or _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
     LARK_BOT_OPEN_ID = "ou_1830c6697311e779471888a420233eed"
@@ -689,6 +706,14 @@ if not _lark_oid_cfg or _lark_oid_cfg in MONITORING_PEER_BOT_OPEN_ID_SET:
         )
 else:
     LARK_BOT_OPEN_ID = _lark_oid_cfg
+
+if (LARK_BOT_OPEN_ID or "").strip() in _PLATFORM_BOT_OPEN_IDS_EMBEDDED_SET:
+    logger.warning(
+        "LARK_BOT_OPEN_ID=%r is a Platform bot open_id on grafanagamebot — likely swapped with Platform "
+        "deployment template; using embedded Game bot open_id",
+        LARK_BOT_OPEN_ID,
+    )
+    LARK_BOT_OPEN_ID = "ou_1830c6697311e779471888a420233eed"
 
 MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
@@ -702,6 +727,18 @@ MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW = _lark_env_truthy_or_default(
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW",
     default=False,
 )
+MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK = _lark_env_truthy_or_default(
+    "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK",
+    default=False,
+)
+MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS: Tuple[str, ...] = tuple(
+    p.strip()
+    for p in re.split(
+        r"[|,]",
+        _cfg_str("MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS", "").strip(),
+    )
+    if p.strip()
+)
 
 _cfg_canon_primary = _cfg_str("MONITORING_CANONICAL_BOT_OPEN_ID", "").strip()
 if not _cfg_canon_primary or _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_SET:
@@ -713,6 +750,14 @@ if not _cfg_canon_primary or _cfg_canon_primary in MONITORING_PEER_BOT_OPEN_ID_S
         )
 else:
     MONITORING_CANONICAL_BOT_OPEN_ID = _cfg_canon_primary
+
+if (MONITORING_CANONICAL_BOT_OPEN_ID or "").strip() in _PLATFORM_BOT_OPEN_IDS_EMBEDDED_SET:
+    logger.warning(
+        "MONITORING_CANONICAL_BOT_OPEN_ID=%r is a Platform bot open_id on grafanagamebot — likely swapped "
+        "with Platform template; using embedded Game canonical",
+        MONITORING_CANONICAL_BOT_OPEN_ID,
+    )
+    MONITORING_CANONICAL_BOT_OPEN_ID = "ou_1830c6697311e779471888a420233eed"
 
 _extra_canon_cfg = {
     p.strip()
@@ -1585,6 +1630,16 @@ def _lark_ordered_strong_ids_from_at_tags(blob: str) -> List[str]:
     return ordered
 
 
+def _lark_im_message_has_visible_strong_at_html(msg: Optional[Dict[str, Any]]) -> bool:
+    """True when IM body blobs include ``<at …>`` carrying a strong ``ou_``/``cli_`` id."""
+    if not isinstance(msg, dict):
+        return False
+    for blob in _lark_im_content_blobs_for_at_parse(msg):
+        if _lark_ordered_strong_ids_from_at_tags(blob):
+            return True
+    return False
+
+
 def _lark_primary_strong_at_from_im_message(
     msg: Optional[Dict[str, Any]],
     mentions_list: Optional[List[Any]] = None,
@@ -2217,6 +2272,40 @@ def _monitoring_at_bot_requirement_satisfied(
     if post_at_ordered:
         # Mobile post: trust document-order @ in body over mentions[] order (often lists both bots).
         primary = post_at_ordered[0]
+
+    # Plain ``@_user_N`` text often has no ``<at user_id=…>``; Feishu may put the peer ``open_id`` on the sole
+    # mention row while ``name`` still matches the bot the user picked — optional substring match (off by default).
+    if (
+        MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK
+        and MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS
+        and primary
+        and primary in MONITORING_PEER_BOT_OPEN_ID_SET
+        and _lark_raw_text_has_feishu_at_placeholder(raw_text)
+        and len(mentions_list) == 1
+        and isinstance(mentions_list[0], dict)
+        and isinstance(msg, dict)
+        and not _lark_im_message_has_visible_strong_at_html(msg)
+    ):
+        nm = str(mentions_list[0].get("name") or mentions_list[0].get("Name") or "").strip()
+        matched_sub = ""
+        for sub in MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS:
+            ss = sub.strip()
+            if ss and ss.casefold() in nm.casefold():
+                matched_sub = ss
+                break
+        if matched_sub:
+            eff = (_lark_effective_bot_open_id() or "").strip()
+            if eff and eff in canon_ids:
+                logger.info(
+                    "monitoring: primary retarget peer=%r → self=%r mention.name=%r matched=%r "
+                    "(MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK)",
+                    primary,
+                    eff,
+                    nm,
+                    matched_sub,
+                )
+                primary = eff
+
     app = str(APP_ID or "").strip()
     row_app_id_is_self = bool(app and _lark_mentions_any_row_matches_app(mentions_list, app))
     # Never auto-trigger on «sole mention open_id ∈ peer + @_user_N + /mo|/m|/c»: same payload when user
