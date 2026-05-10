@@ -47,6 +47,7 @@ _CFG: Dict[str, Any] = {
     # --- Online Number 仪表盘：仅下列 7 个面板（标题须与 Grafana 面板标题完全一致）---
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_9280": "Egame Online Number",
+    # 非空则只监控匹配该关键词的单条/多条序列；空字符串且 MONITORING_PER_SERIES_ANALYSIS=1 时每条图例单独告警
     "MONITORING_9280_SERIES_KEYWORD": "",
     "GRAFANA_PANEL_TITLE_DEPOSIT": "OTG Online Number",
     "MONITORING_DEPOSIT_SERIES_KEYWORD": "",
@@ -74,8 +75,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
     # /mo 与告警正文里的 time/value 表只展示「最新 N 行」（DROP/SPIKE 仍基于窗口内完整 merged 序列）
     "MONITORING_TABLE_TAIL_ROWS": "5",
-    # 1=各面板的 MONITORING_*_SERIES_KEYWORD 为空时，不按时间戳合并所有游戏曲线；每条 series 单独算 DROP/SPIKE 与表格（适合一图多游戏）
-    "MONITORING_PER_SERIES_ANALYSIS": "0",
+    # 1=KEYWORD 为空时每条 Grafana 序列单独算 DROP/SPIKE（Game 看板多游戏同框）；0=合并为一条 merged 序列（旧行为）
+    "MONITORING_PER_SERIES_ANALYSIS": "1",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
@@ -561,7 +562,7 @@ MONITORING_DROP_LAST_MERGED_MINUTES = max(
 MONITORING_TABLE_TAIL_ROWS = max(1, min(99, _cfg_int("MONITORING_TABLE_TAIL_ROWS", 5)))
 MONITORING_PER_SERIES_ANALYSIS = _lark_env_truthy_or_default(
     "MONITORING_PER_SERIES_ANALYSIS",
-    default=False,
+    default=True,
 )
 MONITORING_SIMPLE_ALERT_TEXT = _lark_env_truthy("MONITORING_SIMPLE_ALERT_TEXT")
 MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS = _lark_env_truthy(
@@ -5571,7 +5572,7 @@ def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dic
     Purely **numeric** keywords (e.g. ``3201``, ``1492288``) use **token-boundary** matching so
     ``3201`` does **not** match ``13201`` / ``32012`` when those appear in legend or label text —
     substring-only matching caused bogus baselines (e.g. ~6096) vs Grafana's selected series (~21k).
-    Non-numeric keywords keep substring behavior (e.g. ``9280 + Push``).
+    Non-numeric keywords keep substring behavior (legend / label substring).
     """
     kw_raw = (keyword or "").strip()
     if not kw_raw:
@@ -5723,66 +5724,6 @@ def _merge_result_rows_max_per_ts(rows: List[List[Tuple[float, float]]]) -> List
             prev = by_ts.get(ts)
             if prev is None or v > prev:
                 by_ts[ts] = v
-    return sorted(by_ts.items(), key=lambda x: x[0])
-
-
-def _merge_9280_push_points(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
-    """
-    Pick points for ``9280 + Push``.
-
-    Substring keyword matching also hits ``9280 + Push - 7Days`` / ``9280 + Push...``; summing those
-    with the highlighted series (~81k) yielded bogus totals (~238k). Prefer **exact** legend equality
-    first; fall back to fuzzy match only if nothing matches exactly.
-    """
-    kw = (MONITORING_9280_SERIES_KEYWORD or "9280 + Push").strip()
-    kw_cf = kw.casefold()
-
-    exact_rows: List[List[Tuple[float, float]]] = []
-    for s in payload.get("series") or []:
-        lg = str(s.get("legendFormat") or "").strip()
-        if lg.casefold() != kw_cf:
-            continue
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        for r in pdata.get("result") or []:
-            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
-            if pts:
-                exact_rows.append(pts)
-
-    if exact_rows:
-        if len(exact_rows) == 1:
-            by_one: Dict[float, float] = {}
-            for ts, val in exact_rows[0]:
-                try:
-                    v = float(val)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(v):
-                    continue
-                by_one[float(ts)] = v
-            return sorted(by_one.items(), key=lambda x: x[0])
-        return _merge_result_rows_max_per_ts(exact_rows)
-
-    by_ts: Dict[float, float] = {}
-    for s in payload.get("series") or []:
-        lg = str(s.get("legendFormat") or "")
-        prom = s.get("prometheus") or {}
-        pdata = prom.get("data") or {}
-        for r in pdata.get("result") or []:
-            metric = r.get("metric") or {}
-            if kw and not _keyword_matches_series_labels(kw, lg, metric if isinstance(metric, dict) else {}):
-                continue
-            for pair in r.get("values") or []:
-                if len(pair) < 2:
-                    continue
-                try:
-                    ts = float(pair[0])
-                    val = float(pair[1])
-                except (TypeError, ValueError):
-                    continue
-                by_ts[ts] = by_ts.get(ts, 0.0) + val
-    if not by_ts:
-        return []
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
@@ -6085,18 +6026,15 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    pts = _merge_9280_push_points(payload)
-    pts = _snap_series_to_monitoring_minutes(pts, how="max")
-    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
-    a = _http_drop_spike_analysis(
-        pts,
+    """Egame Online Number — same rules as other keyword panels (per-series when configured)."""
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_9280_SERIES_KEYWORD,
         MONITORING_9280_ALERT_PCT,
         MONITORING_9280_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
+        snap_how="max",
+        apply_baseline_filter=False,
     )
-    a["point_count"] = len(pts)
-    a["merged_points"] = [[t, v] for t, v in pts]
-    return a
 
 
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
