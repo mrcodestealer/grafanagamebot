@@ -85,14 +85,14 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
-    # kiosk=tv 在部分 Grafana+无头环境下主区空白；默认不附带 kiosk（需旧行为可设 tv）
-    "GRAFANA_SCREENSHOT_KIOSK": "",
+    # kiosk=tv 去掉顶栏、DOM 更简单；若无头截图主区空白可改回 ""
+    "GRAFANA_SCREENSHOT_KIOSK": "tv",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
-    # 1=尝试点 Grafana 时间栏「Refresh」触发拉数；找不到按钮则整页 reload 一次
-    "GRAFANA_SCREENSHOT_REFRESH": "1",
-    # Refresh 后等 Spinner（过小易半加载，过大拖慢）
-    "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": 900,
+    # 0=不点 Refresh（page.goto(dashboard) 已带时间范围，避免找不到按钮时 page.reload 二次全页加载）
+    "GRAFANA_SCREENSHOT_REFRESH": "0",
+    # Refresh 后等 Spinner；0=不等待（配合 REFRESH=0）；有 Refresh 时可酌情调大
+    "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": "0",
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
     # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-15m / now）；0 则用 Prometheus 窗口的绝对毫秒时间戳
@@ -105,23 +105,22 @@ _CFG: Dict[str, Any] = {
     "MONITORING_TIME_BUCKET_TZ": "",
     # 1=进程内常驻 Playwright Chromium（启动时预热 Grafana；/monitoring 与告警截图复用，不必每次冷启动）
     "GRAFANA_PERSISTENT_BROWSER": "1",
-    # 常驻浏览器在空闲时点击 Refresh 的间隔（秒），保持会话与图表较新
-    "GRAFANA_PERSISTENT_BROWSER_IDLE_REFRESH_SECONDS": "120",
+    # 常驻浏览器空闲 Refresh 间隔（秒）；REFRESH=0 时该调用为 no-op，仅控制队列轮询节奏
+    "GRAFANA_PERSISTENT_BROWSER_IDLE_REFRESH_SECONDS": "45",
     # 单次截图任务在 keeper 队列中的最长等待（秒）
     "GRAFANA_PERSISTENT_BROWSER_JOB_TIMEOUT_SECONDS": "180",
     # 常驻浏览器每次截图前：不清空全部 cookie，只追加/覆盖新登录（减轻 SPA 主区闪空白）
     "GRAFANA_PERSISTENT_BROWSER_SOFT_COOKIE": "1",
-    # 按快门前几毫秒：置顶滚动 + 等字体 + rAF，缓解 headless「已 ready 但 PNG 仍空壳」
-    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "350",
+    # 按快门前等待毫秒数；面板已 ready 后可设 0 省固定延迟（空白时再调回 200–350）
+    "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "0",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
-    # 等 #reactRoot 出现图表 DOM；过小易超时后多走 reload，整体更慢
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 4500,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 2000,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
     "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 70,
-    "GRAFANA_SCREENSHOT_SETTLE_MS": 120,
-    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 4500,
+    "GRAFANA_SCREENSHOT_SETTLE_MS": 0,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 2000,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
@@ -130,8 +129,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 7,
     # 全面板加载等待预算（毫秒）；仅当能数到面板头时跑满；Scenes 见下一项
     "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 7500,
-    # Panel header 选择器匹配数为 0（Scenes 等）时，最多再等这么久即放行，避免空转 7.5s
-    "GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS": 1400,
+    # Scenes 布局 panel roots=0 时额外等待上限（毫秒）
+    "GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS": 400,
     # Set via environment (systemd Environment=) — do not commit real secrets.
     "GRAFANA_USER": "om_duty",
     "GRAFANA_PASSWORD": "5tgb%TGB094",
@@ -496,7 +495,7 @@ GRAFANA_SCREENSHOT_POPULATE_MAX_MS = max(
     1500, min(90_000, _cfg_int("GRAFANA_SCREENSHOT_POPULATE_MAX_MS", 4500))
 )
 GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS = max(
-    400, min(30_000, _cfg_int("GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS", 1600))
+    0, min(30_000, _cfg_int("GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS", 1600))
 )
 GRAFANA_SCREENSHOT_MIN_GRID_ITEMS = max(
     0, min(200, _cfg_int("GRAFANA_SCREENSHOT_MIN_GRID_ITEMS", 0))
@@ -4528,7 +4527,7 @@ def _grafana_click_dashboard_refresh(
         if spinner_budget_ms is not None
         else int(GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS)
     )
-    spin_cap = max(600, min(25_000, spin_cap))
+    spin_cap = max(0, min(25_000, spin_cap))
     # Exact \"Refresh dashboard\" first; avoid broad ``aria-label*=\"Refresh\"`` (interval picker).
     locators: List[Any] = [
         page.locator('button[aria-label="Refresh dashboard"]').first,
@@ -5105,18 +5104,29 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
             pass
 
 
-def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms: int) -> bytes:
+def _grafana_playwright_render_dashboard_and_png(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    *,
+    skip_nav_and_refresh: bool = False,
+) -> bytes:
     """
     Navigate ``page`` to dashboard ``url`` and return a PNG after the same wait/stabilize path
     as ephemeral screenshots (shared with :class:`GrafanaPlaywrightKeeper`).
     Caller must have injected Grafana cookies (and optional boot-warm root ``/``) beforehand.
+
+    ``skip_nav_and_refresh=True`` (persistent keeper jobs): ``goto`` already loads the target range —
+    skip Dock + Refresh + second Dock to avoid redundant work and reload fallbacks.
+    Blank-chart recovery paths below still run Refresh/Dock when needed.
     """
     page.goto(url, wait_until="load", timeout=timeout_ms)
     page.wait_for_timeout(120)
-    _grafana_playwright_dock_nav_only(page, timeout_ms)
-    _grafana_click_dashboard_refresh(page, timeout_ms)
-    # Refresh 有时会重新弹出 mega-menu；再收一次侧栏
-    _grafana_playwright_dock_nav_only(page, timeout_ms)
+    if not skip_nav_and_refresh:
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
+        _grafana_click_dashboard_refresh(page, timeout_ms)
+        # Refresh 有时会重新弹出 mega-menu；再收一次侧栏
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_expand_collapsed_dashboard_rows(page)
     _grafana_wait_dashboard_ready(page, timeout_ms)
     _grafana_wait_dashboard_body_populated(page, int(GRAFANA_SCREENSHOT_POPULATE_MAX_MS))
@@ -5170,7 +5180,8 @@ def _grafana_playwright_render_dashboard_and_png(page: Any, url: str, timeout_ms
     if GRAFANA_SCREENSHOT_SETTLE_MS > 0:
         page.wait_for_timeout(int(GRAFANA_SCREENSHOT_SETTLE_MS))
     _grafana_close_open_menus(page)
-    _grafana_playwright_dock_nav_only(page, timeout_ms)
+    if not skip_nav_and_refresh:
+        _grafana_playwright_dock_nav_only(page, timeout_ms)
     _grafana_playwright_pre_screenshot_paint_flush(page)
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
@@ -5310,7 +5321,12 @@ class GrafanaPlaywrightKeeper:
                     else:
                         context.clear_cookies()
                         context.add_cookies(ck)
-                    box["png"] = _grafana_playwright_render_dashboard_and_png(page, jurl, max(5000, jto))
+                    box["png"] = _grafana_playwright_render_dashboard_and_png(
+                        page,
+                        jurl,
+                        max(5000, jto),
+                        skip_nav_and_refresh=True,
+                    )
                 except Exception as ex:
                     box["err"] = ex
                 finally:
