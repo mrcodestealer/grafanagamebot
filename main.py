@@ -74,6 +74,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DROP_LAST_MERGED_MINUTES": "1",
     # /mo 与告警正文里的 time/value 表只展示「最新 N 行」（DROP/SPIKE 仍基于窗口内完整 merged 序列）
     "MONITORING_TABLE_TAIL_ROWS": "5",
+    # 1=各面板的 MONITORING_*_SERIES_KEYWORD 为空时，不按时间戳合并所有游戏曲线；每条 series 单独算 DROP/SPIKE 与表格（适合一图多游戏）
+    "MONITORING_PER_SERIES_ANALYSIS": "0",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
     "GRAFANA_SCREENSHOT_WIDTH": 1400,
@@ -557,6 +559,10 @@ MONITORING_DROP_LAST_MERGED_MINUTES = max(
     0, min(60, _cfg_int("MONITORING_DROP_LAST_MERGED_MINUTES", 1))
 )
 MONITORING_TABLE_TAIL_ROWS = max(1, min(99, _cfg_int("MONITORING_TABLE_TAIL_ROWS", 5)))
+MONITORING_PER_SERIES_ANALYSIS = _lark_env_truthy_or_default(
+    "MONITORING_PER_SERIES_ANALYSIS",
+    default=False,
+)
 MONITORING_SIMPLE_ALERT_TEXT = _lark_env_truthy("MONITORING_SIMPLE_ALERT_TEXT")
 MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS = _lark_env_truthy(
     "MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS"
@@ -5495,6 +5501,69 @@ def _merge_http_timeseries_points(payload: Dict[str, Any]) -> List[Tuple[float, 
     return sorted(by_ts.items(), key=lambda x: x[0])
 
 
+def _series_group_key(legend_format: str, metric: Dict[str, Any]) -> str:
+    """Stable key to merge duplicate Prometheus rows that belong to the same Grafana series."""
+    lg = str(legend_format or "").strip()
+    md = metric if isinstance(metric, dict) else {}
+    if lg:
+        return f"leg:{lg.casefold()}"
+    fp = "|".join(f"{k}={v}" for k, v in sorted(md.items()))
+    return f"m:{fp}" if fp else "empty"
+
+
+def _series_row_display_label(legend_format: str, metric: Dict[str, Any]) -> str:
+    lg = str(legend_format or "").strip()
+    if lg:
+        return lg
+    md = metric if isinstance(metric, dict) else {}
+    lbl = str(md.get("series") or md.get("name") or "").strip()
+    if lbl:
+        return lbl
+    bits = [f"{k}={v}" for k, v in sorted(md.items()) if str(v).strip()]
+    return ", ".join(bits[:6]) or "series"
+
+
+def _group_per_series_points_from_payload(
+    payload: Dict[str, Any],
+) -> List[Tuple[str, List[Tuple[float, float]]]]:
+    """
+    One merged point series per distinct Grafana legend / metric row (duplicate rows → max per timestamp).
+    Used when ``MONITORING_PER_SERIES_ANALYSIS`` is on and no keyword merges everything.
+    """
+    buckets: Dict[str, Tuple[str, List[List[Tuple[float, float]]]]] = {}
+    for s in payload.get("series") or []:
+        lg = str(s.get("legendFormat") or "")
+        prom = s.get("prometheus") or {}
+        pdata = prom.get("data") or {}
+        for r in pdata.get("result") or []:
+            metric = r.get("metric") if isinstance(r.get("metric"), dict) else {}
+            pts = _prometheus_result_value_pairs(r if isinstance(r, dict) else {})
+            if not pts:
+                continue
+            gk = _series_group_key(lg, metric)
+            disp = _series_row_display_label(lg, metric)
+            if gk not in buckets:
+                buckets[gk] = (disp, [])
+            buckets[gk][1].append(pts)
+
+    out: List[Tuple[str, List[Tuple[float, float]]]] = []
+    for gk in sorted(buckets.keys()):
+        disp, rows = buckets[gk]
+        if len(rows) == 1:
+            merged = rows[0]
+        else:
+            merged = _merge_result_rows_max_per_ts(rows)
+        out.append((disp, merged))
+    return out
+
+
+def _analysis_aggregate_hit_alert(analysis: Dict[str, Any]) -> bool:
+    ps = analysis.get("per_series")
+    if isinstance(ps, list) and ps:
+        return any(bool(x.get("hit_alert")) for x in ps if isinstance(x, dict))
+    return bool(analysis.get("hit_alert"))
+
+
 def _keyword_matches_series_labels(keyword: str, legend_format: str, metric: Dict[str, Any]) -> bool:
     """
     Match a panel ``keyword`` to a Prometheus-like series row.
@@ -6031,49 +6100,126 @@ def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _analysis_for_deposit_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    pts = _merge_deposit_points(payload)
-    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
-    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
-    a = _http_drop_spike_analysis(
-        pts,
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_DEPOSIT_SERIES_KEYWORD,
         MONITORING_DEPOSIT_ALERT_PCT,
         MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
+        snap_how="sum",
+        apply_baseline_filter=False,
     )
-    a["point_count"] = len(pts)
-    a["merged_points"] = [[t, v] for t, v in pts]
-    return a
 
 
 def _analysis_for_withdraw_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    pts = _merge_withdraw_points(payload)
-    pts = _snap_series_to_monitoring_minutes(pts, how="sum")
-    pts = _trim_trailing_minute_buckets(pts, MONITORING_DROP_LAST_MERGED_MINUTES)
-    a = _http_drop_spike_analysis(
-        pts,
+    return _analysis_for_keyword_payload(
+        payload,
+        MONITORING_WITHDRAW_SERIES_KEYWORD,
         MONITORING_WITHDRAW_ALERT_PCT,
         MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT,
-        MONITORING_ALERT_WINDOW_SECONDS,
+        snap_how="sum",
+        apply_baseline_filter=False,
     )
-    a["point_count"] = len(pts)
-    a["merged_points"] = [[t, v] for t, v in pts]
-    return a
 
 
 def _analysis_for_keyword_payload(
-    payload: Dict[str, Any], keyword: str, fast_threshold_pct: float, continuous_threshold_pct: float
+    payload: Dict[str, Any],
+    keyword: str,
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    *,
+    snap_how: str = "max",
+    apply_baseline_filter: bool = True,
 ) -> Dict[str, Any]:
-    pts = _merge_series_points_by_keyword(payload, keyword)
-    # Drop ghost lows far below the typical level (e.g. ~4.5k vs median ~17k) before % rules.
-    pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
-    if len(pts_filtered) != len(pts):
-        logger.info(
-            "keyword baseline filter applied keyword=%r points=%s->%s",
-            keyword,
-            len(pts),
-            len(pts_filtered),
+    kw = (keyword or "").strip()
+    use_per_series = bool(MONITORING_PER_SERIES_ANALYSIS) and not kw
+
+    def _points_through_pipeline(
+        pts_in: List[Tuple[float, float]],
+        *,
+        series_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        pts_work = list(pts_in)
+        if apply_baseline_filter:
+            pts_f = _filter_low_outlier_points(pts_work, ratio_to_median=0.28)
+            if len(pts_f) != len(pts_work):
+                logger.info(
+                    "keyword baseline filter applied keyword=%r label=%r points=%s->%s",
+                    keyword,
+                    (series_label or ""),
+                    len(pts_work),
+                    len(pts_f),
+                )
+            pts_work = pts_f
+        pts_work = _snap_series_to_monitoring_minutes(pts_work, how=snap_how)
+        pts_work = _trim_trailing_minute_buckets(pts_work, MONITORING_DROP_LAST_MERGED_MINUTES)
+        a = _http_drop_spike_analysis(
+            pts_work,
+            fast_threshold_pct,
+            continuous_threshold_pct,
+            MONITORING_ALERT_WINDOW_SECONDS,
         )
-    pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how="max")
+        a["point_count"] = len(pts_work)
+        a["merged_points"] = [[t, v] for t, v in pts_work]
+        if series_label is not None:
+            a["series_label"] = series_label
+        return a
+
+    if use_per_series:
+        grouped = _group_per_series_points_from_payload(payload)
+        if not grouped:
+            sample_labels: List[str] = []
+            for s in payload.get("series") or []:
+                prom = s.get("prometheus") if isinstance(s.get("prometheus"), dict) else {}
+                pdata = prom.get("data") if isinstance(prom.get("data"), dict) else {}
+                for r in pdata.get("result") or []:
+                    metric = r.get("metric") if isinstance(r.get("metric"), dict) else {}
+                    lbl = str(metric.get("series") or metric.get("name") or "").strip()
+                    if not lbl:
+                        lbl = " ".join(str(v) for v in metric.values() if str(v).strip()).strip()
+                    if lbl and lbl not in sample_labels:
+                        sample_labels.append(lbl)
+                    if len(sample_labels) >= 20:
+                        break
+                if len(sample_labels) >= 20:
+                    break
+            logger.info(
+                "per-series analysis: no points keyword=%r sample_series=%s",
+                keyword,
+                sample_labels[:20],
+            )
+            empty = _points_through_pipeline([])
+            empty["hit_alert"] = False
+            empty["per_series"] = []
+            return empty
+
+        subs: List[Dict[str, Any]] = []
+        any_hit = False
+        for lbl, pts in grouped:
+            sub = _points_through_pipeline(pts, series_label=lbl)
+            subs.append(sub)
+            any_hit = any_hit or bool(sub.get("hit_alert"))
+        return {
+            "hit_alert": any_hit,
+            "per_series": subs,
+            "point_count": sum(int(s.get("point_count") or 0) for s in subs),
+            "merged_points": subs[0]["merged_points"] if len(subs) == 1 else [],
+            "fast_threshold_pct": fast_threshold_pct,
+            "continuous_threshold_pct": continuous_threshold_pct,
+            "window_seconds": MONITORING_ALERT_WINDOW_SECONDS,
+        }
+
+    pts = _merge_series_points_by_keyword(payload, keyword)
+    pts_filtered = pts
+    if apply_baseline_filter:
+        pts_filtered = _filter_low_outlier_points(pts, ratio_to_median=0.28)
+        if len(pts_filtered) != len(pts):
+            logger.info(
+                "keyword baseline filter applied keyword=%r points=%s->%s",
+                keyword,
+                len(pts),
+                len(pts_filtered),
+            )
+    pts_filtered = _snap_series_to_monitoring_minutes(pts_filtered, how=snap_how)
     pts_filtered = _trim_trailing_minute_buckets(pts_filtered, MONITORING_DROP_LAST_MERGED_MINUTES)
     a = _http_drop_spike_analysis(
         pts_filtered,
@@ -6084,7 +6230,7 @@ def _analysis_for_keyword_payload(
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
     if not pts:
-        sample_labels: List[str] = []
+        sample_labels = []
         for s in payload.get("series") or []:
             prom = s.get("prometheus") if isinstance(s.get("prometheus"), dict) else {}
             pdata = prom.get("data") if isinstance(prom.get("data"), dict) else {}
@@ -6282,6 +6428,80 @@ def _format_trigger_fallback_line(
     return None
 
 
+def _format_alert_reason_chunks_for_analysis(
+    graph_label: str,
+    default_series_disp: str,
+    analysis: Dict[str, Any],
+    fast_threshold_pct: float,
+    continuous_threshold_pct: float,
+    window_seconds: int,
+) -> List[str]:
+    """Build one or more alert markdown chunks (per-game lines when ``per_series`` is set)."""
+    chunks: List[str] = []
+    per = analysis.get("per_series")
+    if isinstance(per, list) and per:
+        for sub in per:
+            if not isinstance(sub, dict):
+                continue
+            s_one = str(sub.get("series_label") or "series")
+            reasons = _format_trigger_lines(
+                graph_label,
+                s_one,
+                sub,
+                fast_threshold_pct,
+                continuous_threshold_pct,
+                window_seconds,
+            )
+            if not reasons:
+                fb = _format_trigger_fallback_line(
+                    graph_label,
+                    s_one,
+                    sub,
+                    fast_threshold_pct,
+                    continuous_threshold_pct,
+                    window_seconds,
+                )
+                if fb:
+                    reasons.append(fb)
+            if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(sub.get("hit_alert"))):
+                reasons = [_format_simple_series_alert_block(graph_label, s_one, sub)]
+            elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
+                reasons.append(
+                    _format_alert_series_table_footer(graph_label, s_one, sub)
+                )
+            if reasons:
+                chunks.append("\n\n".join(reasons))
+        return chunks
+
+    s_disp = (default_series_disp or "").strip() or "all series merged"
+    reasons2 = _format_trigger_lines(
+        graph_label,
+        s_disp,
+        analysis,
+        fast_threshold_pct,
+        continuous_threshold_pct,
+        window_seconds,
+    )
+    if not reasons2:
+        fb2 = _format_trigger_fallback_line(
+            graph_label,
+            s_disp,
+            analysis,
+            fast_threshold_pct,
+            continuous_threshold_pct,
+            window_seconds,
+        )
+        if fb2:
+            reasons2.append(fb2)
+    if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or _analysis_aggregate_hit_alert(analysis)):
+        reasons2 = [_format_simple_series_alert_block(graph_label, s_disp, analysis)]
+    elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
+        reasons2.append(_format_alert_series_table_footer(graph_label, s_disp, analysis))
+    if reasons2:
+        chunks.append("\n\n".join(reasons2))
+    return chunks
+
+
 def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     """
     Alert-only concise content:
@@ -6316,7 +6536,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
                 )
                 if fb:
                     reasons.append(fb)
-            if MONITORING_SIMPLE_ALERT_TEXT and (reasons or bool(a_http.get("hit_alert"))):
+            if MONITORING_SIMPLE_ALERT_TEXT and (reasons or _analysis_aggregate_hit_alert(a_http)):
                 reasons = [
                     _format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "all series merged", a_http)
                 ]
@@ -6371,32 +6591,15 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
         else:
             continue
-        s_disp = (s_lbl or "").strip() or "all series merged"
-        reasons2 = _format_trigger_lines(
+        for chunk in _format_alert_reason_chunks_for_analysis(
             g_lbl,
-            s_disp,
+            s_lbl,
             a2,
             fast2,
             cont2,
             MONITORING_ALERT_WINDOW_SECONDS,
-        )
-        if not reasons2:
-            fb2 = _format_trigger_fallback_line(
-                g_lbl,
-                s_disp,
-                a2,
-                fast2,
-                cont2,
-                MONITORING_ALERT_WINDOW_SECONDS,
-            )
-            if fb2:
-                reasons2.append(fb2)
-        if MONITORING_SIMPLE_ALERT_TEXT and (reasons2 or bool(a2.get("hit_alert"))):
-            reasons2 = [_format_simple_series_alert_block(g_lbl, s_disp, a2)]
-        elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
-            reasons2.append(_format_alert_series_table_footer(g_lbl, s_disp, a2))
-        if reasons2:
-            reason_blocks.append("\n\n".join(reasons2))
+        ):
+            reason_blocks.append(chunk)
     if not reason_blocks:
         lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
@@ -6410,8 +6613,8 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     _mute_purge_expired()
     if MONITORING_HTTP_PRIMARY_ENABLE:
-        if not _monitoring_alert_channel_muted("http") and bool(
-            _http_analysis_for_payload(payload).get("hit_alert")
+        if not _monitoring_alert_channel_muted("http") and _analysis_aggregate_hit_alert(
+            _http_analysis_for_payload(payload)
         ):
             return True
     for ex in payload.get("extraPanels") or []:
@@ -6421,17 +6624,21 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if _monitoring_alert_channel_muted(k):
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if k == "9280_push" and bool(_analysis_for_9280_payload(p2).get("hit_alert")):
+        if k == "9280_push" and _analysis_aggregate_hit_alert(_analysis_for_9280_payload(p2)):
             return True
-        if k == "deposit" and bool(_analysis_for_deposit_payload(p2).get("hit_alert")):
+        if k == "deposit" and _analysis_aggregate_hit_alert(_analysis_for_deposit_payload(p2)):
             return True
-        if k == "withdraw" and bool(_analysis_for_withdraw_payload(p2).get("hit_alert")):
+        if k == "withdraw" and _analysis_aggregate_hit_alert(_analysis_for_withdraw_payload(p2)):
             return True
-        if k == "provider_jili" and bool(_analysis_for_provider_jili_payload(p2).get("hit_alert")):
+        if k == "provider_jili" and _analysis_aggregate_hit_alert(_analysis_for_provider_jili_payload(p2)):
             return True
-        if k == "provider_general" and bool(_analysis_for_provider_general_payload(p2).get("hit_alert")):
+        if k == "provider_general" and _analysis_aggregate_hit_alert(
+            _analysis_for_provider_general_payload(p2)
+        ):
             return True
-        if k == "provider_inhouse" and bool(_analysis_for_provider_inhouse_payload(p2).get("hit_alert")):
+        if k == "provider_inhouse" and _analysis_aggregate_hit_alert(
+            _analysis_for_provider_inhouse_payload(p2)
+        ):
             return True
     return False
 
@@ -6556,21 +6763,42 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             extra_footer = _format_extra_analysis_lines(title, a2)
         else:
             continue
-        pts2 = a2.get("merged_points") or []
-        lines.append("")
-        series_disp = (series or "").strip() or "all series merged"
-        lines.append(f"[{title}] series: {series_disp}")
-        if pts2:
-            tail2 = pts2[-max_rows:]
-            rows2: List[str] = ["time           value"]
-            for pair in tail2:
-                rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-            lines.append("```text")
-            lines.extend(rows2)
-            lines.append("```")
+        per_rows = a2.get("per_series")
+        if isinstance(per_rows, list) and per_rows:
+            for sub in per_rows:
+                if not isinstance(sub, dict):
+                    continue
+                series_disp = str(sub.get("series_label") or "series")
+                pts2 = sub.get("merged_points") or []
+                lines.append("")
+                lines.append(f"[{title}] series: {series_disp}")
+                if pts2:
+                    tail2 = pts2[-max_rows:]
+                    rows2 = ["time           value"]
+                    for pair in tail2:
+                        rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                    lines.append("```text")
+                    lines.extend(rows2)
+                    lines.append("```")
+                else:
+                    lines.append(f"(no points matched for {series_disp})")
+                lines.extend(_format_extra_analysis_lines(title, sub))
         else:
-            lines.append(f"(no points matched for {series_disp})")
-        lines.extend(extra_footer)
+            pts2 = a2.get("merged_points") or []
+            lines.append("")
+            series_disp = (series or "").strip() or "all series merged"
+            lines.append(f"[{title}] series: {series_disp}")
+            if pts2:
+                tail2 = pts2[-max_rows:]
+                rows2 = ["time           value"]
+                for pair in tail2:
+                    rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+                lines.append("```text")
+                lines.extend(rows2)
+                lines.append("```")
+            else:
+                lines.append(f"(no points matched for {series_disp})")
+            lines.extend(extra_footer)
 
     if MONITORING_HTTP_PRIMARY_ENABLE:
         for s in payload.get("series") or []:
