@@ -48,8 +48,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
     "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
-    "MONITORING_9280_SERIES_KEYWORD": "",
-    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "",
+    "MONITORING_EGAME_ONLINE_SERIES_KEYWORD": "",
+    "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
     "GRAFANA_DASHBOARD_FROM": "now-30m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -423,13 +423,46 @@ GRAFANA_PANEL_TITLE_EGAME_ONLINE = _cfg_str(
 GRAFANA_PANEL_TITLE_EGAMES_BET = _cfg_str(
     "GRAFANA_PANEL_TITLE_EGAMES_BET", "Egames 下注Bet/min"
 )
-# ``extraPanels`` /mute 仍用 kind ``9280_push``、``provider_jili``；标题常量与之对应
-GRAFANA_PANEL_TITLE_9280 = GRAFANA_PANEL_TITLE_EGAME_ONLINE
-GRAFANA_PANEL_TITLE_PROVIDER_JILI = GRAFANA_PANEL_TITLE_EGAMES_BET
-MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "").strip()
-MONITORING_PROVIDER_JILI_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_JILI_SERIES_KEYWORD", ""
-).strip()
+# ``extraPanels[*].kind`` — /m 静音通道 id；须与 ``fetch_monitoring_payload`` 写入一致
+MONITORING_EXTRA_KIND_EGAME_ONLINE = "egame_online"
+MONITORING_EXTRA_KIND_EGAMES_BET = "egames_bet"
+# Deprecated ``kind`` strings (仍识别旧 payload / 旧静音键)
+_MONITORING_EXTRA_KIND_EGAME_ONLINE_LEGACY = "9280_push"
+_MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY = "provider_jili"
+
+
+def _extra_panel_logical_kind(kind: str) -> str:
+    """Normalize ``extraPanels`` ``kind`` to the current channel id (accepts legacy values)."""
+    k = (kind or "").strip()
+    if k == MONITORING_EXTRA_KIND_EGAME_ONLINE or k == _MONITORING_EXTRA_KIND_EGAME_ONLINE_LEGACY:
+        return MONITORING_EXTRA_KIND_EGAME_ONLINE
+    if k == MONITORING_EXTRA_KIND_EGAMES_BET or k == _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY:
+        return MONITORING_EXTRA_KIND_EGAMES_BET
+    return k
+
+
+def _monitoring_extra_channel_muted(raw_kind: str) -> bool:
+    """True if this extra panel's alerts are muted (new or legacy mute key)."""
+    lg = _extra_panel_logical_kind(raw_kind)
+    if lg == MONITORING_EXTRA_KIND_EGAME_ONLINE:
+        return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_EGAME_ONLINE) or _monitoring_alert_channel_muted(
+            _MONITORING_EXTRA_KIND_EGAME_ONLINE_LEGACY
+        )
+    if lg == MONITORING_EXTRA_KIND_EGAMES_BET:
+        return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_EGAMES_BET) or _monitoring_alert_channel_muted(
+            _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY
+        )
+    return _monitoring_alert_channel_muted(raw_kind)
+
+
+MONITORING_EGAME_ONLINE_SERIES_KEYWORD = (
+    _cfg_str("MONITORING_EGAME_ONLINE_SERIES_KEYWORD", "").strip()
+    or _cfg_str("MONITORING_9280_SERIES_KEYWORD", "").strip()
+)
+MONITORING_EGAMES_BET_SERIES_KEYWORD = (
+    _cfg_str("MONITORING_EGAMES_BET_SERIES_KEYWORD", "").strip()
+    or _cfg_str("MONITORING_PROVIDER_JILI_SERIES_KEYWORD", "").strip()
+)
 # Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-6h")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
@@ -510,10 +543,6 @@ MONITORING_GAME_ALERT_CONTINUOUS_PCT = _cfg_float("MONITORING_GAME_ALERT_CONTINU
 MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT = _cfg_float(
     "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 20.0
 )
-MONITORING_9280_ALERT_PCT = MONITORING_EGAME_FAST_ALERT_PCT
-MONITORING_9280_CONTINUOUS_ALERT_PCT = MONITORING_GAME_ALERT_CONTINUOUS_PCT
-MONITORING_PROVIDER_JILI_ALERT_PCT = MONITORING_EGAMES_BET_FAST_ALERT_PCT
-MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = MONITORING_GAME_ALERT_CONTINUOUS_PCT
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 180))
 # 1=在 /mo 与告警中包含主面板（LiveSlots）；0 时主面板表与 JSON 端点可关闭
 MONITORING_HTTP_PRIMARY_ENABLE = _lark_env_truthy_or_default(
@@ -3231,7 +3260,7 @@ def fetch_monitoring_payload(
             start_unix=w_start,
             end_unix=w_end,
         )
-        extra.append({"kind": "9280_push", "payload": p_eg})
+        extra.append({"kind": MONITORING_EXTRA_KIND_EGAME_ONLINE, "payload": p_eg})
     except Exception:
         logger.exception("fetch Egame Online Number panel failed (optional monitor)")
     try:
@@ -3241,7 +3270,7 @@ def fetch_monitoring_payload(
             start_unix=w_start,
             end_unix=w_end,
         )
-        extra.append({"kind": "provider_jili", "payload": p_bet})
+        extra.append({"kind": MONITORING_EXTRA_KIND_EGAMES_BET, "payload": p_bet})
     except Exception:
         logger.exception("fetch Egames 下注Bet/min panel failed (optional monitor)")
     if extra:
@@ -3603,8 +3632,8 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
     """(channel_id, display_label) for /m mute; ``http`` = LiveSlots primary payload."""
     return [
         ("http", GRAFANA_PANEL_TITLE),
-        ("9280_push", GRAFANA_PANEL_TITLE_EGAME_ONLINE),
-        ("provider_jili", GRAFANA_PANEL_TITLE_EGAMES_BET),
+        (MONITORING_EXTRA_KIND_EGAME_ONLINE, GRAFANA_PANEL_TITLE_EGAME_ONLINE),
+        (MONITORING_EXTRA_KIND_EGAMES_BET, GRAFANA_PANEL_TITLE_EGAMES_BET),
     ]
 
 
@@ -6069,13 +6098,13 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return a
 
 
-def _analysis_for_9280_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _analysis_for_egame_online_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Egame Online Number — same rules as other keyword panels (per-series when configured)."""
     return _analysis_for_keyword_payload(
         payload,
-        MONITORING_9280_SERIES_KEYWORD,
-        MONITORING_9280_ALERT_PCT,
-        MONITORING_9280_CONTINUOUS_ALERT_PCT,
+        MONITORING_EGAME_ONLINE_SERIES_KEYWORD,
+        MONITORING_EGAME_FAST_ALERT_PCT,
+        MONITORING_GAME_ALERT_CONTINUOUS_PCT,
         snap_how="max",
         apply_baseline_filter=False,
     )
@@ -6241,12 +6270,12 @@ def _analysis_for_keyword_payload(
     return a
 
 
-def _analysis_for_provider_jili_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _analysis_for_egames_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _analysis_for_keyword_payload(
         payload,
-        MONITORING_PROVIDER_JILI_SERIES_KEYWORD,
-        MONITORING_PROVIDER_JILI_ALERT_PCT,
-        MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT,
+        MONITORING_EGAMES_BET_SERIES_KEYWORD,
+        MONITORING_EGAMES_BET_FAST_ALERT_PCT,
+        MONITORING_GAME_ALERT_CONTINUOUS_PCT,
     )
 
 
@@ -6546,23 +6575,24 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
         if not isinstance(ex, dict):
             continue
         kind = (ex.get("kind") or "")
-        if _monitoring_alert_channel_muted(kind):
+        logical = _extra_panel_logical_kind(kind)
+        if logical not in (MONITORING_EXTRA_KIND_EGAME_ONLINE, MONITORING_EXTRA_KIND_EGAMES_BET):
+            continue
+        if _monitoring_extra_channel_muted(kind):
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if kind == "9280_push":
-            g_lbl = GRAFANA_PANEL_TITLE_9280
-            s_lbl = MONITORING_9280_SERIES_KEYWORD
-            a2 = _analysis_for_9280_payload(p2)
-            fast2 = MONITORING_9280_ALERT_PCT
-            cont2 = MONITORING_9280_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_jili":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
-            s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
-            a2 = _analysis_for_provider_jili_payload(p2)
-            fast2 = MONITORING_PROVIDER_JILI_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT
+        if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE:
+            g_lbl = GRAFANA_PANEL_TITLE_EGAME_ONLINE
+            s_lbl = MONITORING_EGAME_ONLINE_SERIES_KEYWORD
+            a2 = _analysis_for_egame_online_payload(p2)
+            fast2 = MONITORING_EGAME_FAST_ALERT_PCT
+            cont2 = MONITORING_GAME_ALERT_CONTINUOUS_PCT
         else:
-            continue
+            g_lbl = GRAFANA_PANEL_TITLE_EGAMES_BET
+            s_lbl = MONITORING_EGAMES_BET_SERIES_KEYWORD
+            a2 = _analysis_for_egames_bet_payload(p2)
+            fast2 = MONITORING_EGAMES_BET_FAST_ALERT_PCT
+            cont2 = MONITORING_GAME_ALERT_CONTINUOUS_PCT
         for chunk in _format_alert_reason_chunks_for_analysis(
             g_lbl,
             s_lbl,
@@ -6592,12 +6622,19 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         if not isinstance(ex, dict):
             continue
         k = (ex.get("kind") or "")
-        if _monitoring_alert_channel_muted(k):
+        logical = _extra_panel_logical_kind(k)
+        if logical not in (MONITORING_EXTRA_KIND_EGAME_ONLINE, MONITORING_EXTRA_KIND_EGAMES_BET):
+            continue
+        if _monitoring_extra_channel_muted(k):
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if k == "9280_push" and _analysis_aggregate_hit_alert(_analysis_for_9280_payload(p2)):
+        if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE and _analysis_aggregate_hit_alert(
+            _analysis_for_egame_online_payload(p2)
+        ):
             return True
-        if k == "provider_jili" and _analysis_aggregate_hit_alert(_analysis_for_provider_jili_payload(p2)):
+        if logical == MONITORING_EXTRA_KIND_EGAMES_BET and _analysis_aggregate_hit_alert(
+            _analysis_for_egames_bet_payload(p2)
+        ):
             return True
     return False
 
@@ -6723,17 +6760,18 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
             continue
         k = (ex.get("kind") or "")
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if k == "9280_push":
+        logical = _extra_panel_logical_kind(k)
+        if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE:
             append_analyzed_panel(
-                GRAFANA_PANEL_TITLE_9280,
-                MONITORING_9280_SERIES_KEYWORD,
-                _analysis_for_9280_payload(p2),
+                GRAFANA_PANEL_TITLE_EGAME_ONLINE,
+                MONITORING_EGAME_ONLINE_SERIES_KEYWORD,
+                _analysis_for_egame_online_payload(p2),
             )
-        elif k == "provider_jili":
+        elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
             append_analyzed_panel(
-                GRAFANA_PANEL_TITLE_PROVIDER_JILI,
-                MONITORING_PROVIDER_JILI_SERIES_KEYWORD,
-                _analysis_for_provider_jili_payload(p2),
+                GRAFANA_PANEL_TITLE_EGAMES_BET,
+                MONITORING_EGAMES_BET_SERIES_KEYWORD,
+                _analysis_for_egames_bet_payload(p2),
             )
 
     if include_target_mention and _monitoring_payload_hit_alert(payload):
