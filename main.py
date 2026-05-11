@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-grafanagamebot — Lark + Grafana「Online Number」仪表盘（7 面板）、默认端口 **5088**。
+grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_TITLE``）、默认端口 **5088**。
 
 - **配置**：文件顶部 ``_CFG``；可用环境变量覆盖同名键。
 - **HTTP**：``LARK_EVENT_MODE=http`` 时 ``POST /webhook/event``；可选 ``ws`` 长连接（见 ``LARK_EVENT_MODE``）。
@@ -44,21 +44,12 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_BASE_URL": "https://grafana.client8.me",
     "GRAFANA_DASHBOARD_PATH": "/d/fe70d4bd-4729-471f-9ede-e981ad277963/online-number",
     "GRAFANA_DASHBOARD_UID": "fe70d4bd-4729-471f-9ede-e981ad277963",
-    # --- Online Number 仪表盘：仅下列 7 个面板（标题须与 Grafana 面板标题完全一致）---
+    # --- 判警涉及 3 个面板（标题须与 Grafana 完全一致）---
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
-    "GRAFANA_PANEL_TITLE_9280": "Egame Online Number",
-    # 非空则只监控匹配该关键词的单条/多条序列；空字符串且 MONITORING_PER_SERIES_ANALYSIS=1 时每条图例单独告警
+    "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
+    "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
     "MONITORING_9280_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_DEPOSIT": "OTG Online Number",
-    "MONITORING_DEPOSIT_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_WITHDRAW": "Liveslot 下注Bet/min",
-    "MONITORING_WITHDRAW_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_PROVIDER_JILI": "Egames 下注Bet/min",
     "MONITORING_PROVIDER_JILI_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL": "OTG 下注Bet/min",
-    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD": "",
-    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE": "OTG 派彩/min",
-    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD": "",
     "GRAFANA_DASHBOARD_FROM": "now-30m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -75,7 +66,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_DROP_LAST_MERGED_MINUTES": "0",
     # /mo 与告警正文里的 time/value 表只展示「最新 N 行」（DROP/SPIKE 仍基于窗口内完整 merged 序列）
     "MONITORING_TABLE_TAIL_ROWS": "5",
-    # 1=KEYWORD 为空时每条 Grafana 序列单独算 DROP/SPIKE（Game 看板多游戏同框）；0=合并为一条 merged 序列（旧行为）
+    # 1=KEYWORD 为空时每条 Grafana 序列单独算 DROP/SPIKE（多序列同框）；0=合并为一条 merged 序列
     "MONITORING_PER_SERIES_ANALYSIS": "1",
     # 无头截图（Playwright）：0=关；1=文字后发 PNG（需 ``pip install playwright`` + ``playwright install chromium``）
     "GRAFANA_SCREENSHOT_ENABLE": "1",
@@ -195,29 +186,12 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_SDK_DEBUG": "0",
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
-    "MONITORING_HTTP_DROP_ALERT_PCT": 15,
-    "MONITORING_HTTP_CONTINUOUS_ALERT_PCT": 15,
-    # 0=本 Game 看板无 HTTP「请求总数/1m」聚合：不拉该面板，不出现 ``no http-labeled series`` 等行；1=保留旧行为
-    "MONITORING_HTTP_PRIMARY_ENABLE": "0",
-    "MONITORING_9280_ENABLE": "1",
-    "MONITORING_9280_ALERT_PCT": 15,
-    "MONITORING_9280_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_DEPOSIT_ENABLE": "1",
-    "MONITORING_DEPOSIT_ALERT_PCT": 15,
-    "MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_WITHDRAW_ENABLE": "1",
-    "MONITORING_WITHDRAW_ALERT_PCT": 15,
-    "MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_JILI_ENABLE": "1",
-    "MONITORING_PROVIDER_JILI_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_GENERAL_ENABLE": "1",
-    "MONITORING_PROVIDER_GENERAL_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_INHOUSE_ENABLE": "1",
-    "MONITORING_PROVIDER_INHOUSE_ALERT_PCT": 15,
-    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT": 15,
-    "MONITORING_ALERT_WINDOW_SECONDS": 120,
+    # Fast = 约 3 分钟内最大跌/涨；LiveSlots 仅判「跌」快阈值；连续单调段跌/涨共用 CONTINUOUS。
+    "MONITORING_ALERT_WINDOW_SECONDS": 180,
+    "MONITORING_EGAME_FAST_ALERT_PCT": 15,
+    "MONITORING_EGAMES_BET_FAST_ALERT_PCT": 15,
+    "MONITORING_GAME_ALERT_CONTINUOUS_PCT": 30,
+    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT": 20,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
     # 1=/mo hides extra-panel ``within Xm drop/spike`` footer lines; tables only.
@@ -443,31 +417,18 @@ GRAFANA_DASHBOARD_UID = _cfg_str(
     "GRAFANA_DASHBOARD_UID", "fe70d4bd-4729-471f-9ede-e981ad277963"
 )
 GRAFANA_PANEL_TITLE = _cfg_str("GRAFANA_PANEL_TITLE", "LiveSlots Online Number")
-GRAFANA_PANEL_TITLE_9280 = _cfg_str("GRAFANA_PANEL_TITLE_9280", "Egame Online Number")
+GRAFANA_PANEL_TITLE_EGAME_ONLINE = _cfg_str(
+    "GRAFANA_PANEL_TITLE_EGAME_ONLINE", "Egame Online Number"
+)
+GRAFANA_PANEL_TITLE_EGAMES_BET = _cfg_str(
+    "GRAFANA_PANEL_TITLE_EGAMES_BET", "Egames 下注Bet/min"
+)
+# ``extraPanels`` /mute 仍用 kind ``9280_push``、``provider_jili``；标题常量与之对应
+GRAFANA_PANEL_TITLE_9280 = GRAFANA_PANEL_TITLE_EGAME_ONLINE
+GRAFANA_PANEL_TITLE_PROVIDER_JILI = GRAFANA_PANEL_TITLE_EGAMES_BET
 MONITORING_9280_SERIES_KEYWORD = _cfg_str("MONITORING_9280_SERIES_KEYWORD", "").strip()
-GRAFANA_PANEL_TITLE_DEPOSIT = _cfg_str("GRAFANA_PANEL_TITLE_DEPOSIT", "OTG Online Number")
-MONITORING_DEPOSIT_SERIES_KEYWORD = _cfg_str("MONITORING_DEPOSIT_SERIES_KEYWORD", "").strip()
-GRAFANA_PANEL_TITLE_WITHDRAW = _cfg_str(
-    "GRAFANA_PANEL_TITLE_WITHDRAW", "Liveslot 下注Bet/min"
-)
-MONITORING_WITHDRAW_SERIES_KEYWORD = _cfg_str("MONITORING_WITHDRAW_SERIES_KEYWORD", "").strip()
-GRAFANA_PANEL_TITLE_PROVIDER_JILI = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_JILI", "Egames 下注Bet/min"
-)
 MONITORING_PROVIDER_JILI_SERIES_KEYWORD = _cfg_str(
     "MONITORING_PROVIDER_JILI_SERIES_KEYWORD", ""
-).strip()
-GRAFANA_PANEL_TITLE_PROVIDER_GENERAL = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_GENERAL", "OTG 下注Bet/min"
-)
-MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD", ""
-).strip()
-GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE = _cfg_str(
-    "GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE", "OTG 派彩/min"
-)
-MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD = _cfg_str(
-    "MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD", ""
 ).strip()
 # Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-6h")
@@ -543,31 +504,21 @@ MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
 ).strip()
-MONITORING_HTTP_DROP_ALERT_PCT = _cfg_float("MONITORING_HTTP_DROP_ALERT_PCT", 10.0)
-MONITORING_9280_ALERT_PCT = _cfg_float("MONITORING_9280_ALERT_PCT", 15.0)
-MONITORING_HTTP_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_HTTP_CONTINUOUS_ALERT_PCT", 20.0)
+MONITORING_EGAME_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAME_FAST_ALERT_PCT", 15.0)
+MONITORING_EGAMES_BET_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAMES_BET_FAST_ALERT_PCT", 15.0)
+MONITORING_GAME_ALERT_CONTINUOUS_PCT = _cfg_float("MONITORING_GAME_ALERT_CONTINUOUS_PCT", 30.0)
+MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT = _cfg_float(
+    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 20.0
+)
+MONITORING_9280_ALERT_PCT = MONITORING_EGAME_FAST_ALERT_PCT
+MONITORING_9280_CONTINUOUS_ALERT_PCT = MONITORING_GAME_ALERT_CONTINUOUS_PCT
+MONITORING_PROVIDER_JILI_ALERT_PCT = MONITORING_EGAMES_BET_FAST_ALERT_PCT
+MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = MONITORING_GAME_ALERT_CONTINUOUS_PCT
+MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 180))
+# 1=在 /mo 与告警中包含主面板（LiveSlots）；0 时主面板表与 JSON 端点可关闭
 MONITORING_HTTP_PRIMARY_ENABLE = _lark_env_truthy_or_default(
-    "MONITORING_HTTP_PRIMARY_ENABLE",
-    default=False,
+    "MONITORING_HTTP_PRIMARY_ENABLE", default=True
 )
-MONITORING_9280_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_9280_CONTINUOUS_ALERT_PCT", 25.0)
-MONITORING_DEPOSIT_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_ALERT_PCT", 60.0)
-MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT", 80.0)
-MONITORING_WITHDRAW_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_ALERT_PCT", 60.0)
-MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT = _cfg_float("MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT", 80.0)
-MONITORING_PROVIDER_JILI_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_JILI_ALERT_PCT", 15.0)
-MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_PROVIDER_GENERAL_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_GENERAL_ALERT_PCT", 15.0)
-MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_PROVIDER_INHOUSE_ALERT_PCT = _cfg_float("MONITORING_PROVIDER_INHOUSE_ALERT_PCT", 15.0)
-MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT = _cfg_float(
-    "MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT", 15.0
-)
-MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 120))
 MONITORING_DROP_LAST_MERGED_MINUTES = max(
     0, min(60, _cfg_int("MONITORING_DROP_LAST_MERGED_MINUTES", 0))
 )
@@ -3183,7 +3134,7 @@ def fetch_request_total_1m_series(
     end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Same data as Grafana panel「请求总数/1m」via Prometheus ``query_range`` (Grafana proxy).
+    Primary monitoring panel (default title ``LiveSlots Online Number``) via Prometheus ``query_range``.
 
     Default window (unless ``start_unix``/``end_unix`` passed, or watchdog overrides):
 
@@ -3271,92 +3222,30 @@ def fetch_monitoring_payload(
                 w_start,
                 w_end,
             )
-    if MONITORING_HTTP_PRIMARY_ENABLE:
-        primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
-    else:
-        primary = {
-            "panelTitle": GRAFANA_PANEL_TITLE,
-            "dashboardUid": GRAFANA_DASHBOARD_UID,
-            "window": {
-                "startUnix": 0,
-                "endUnix": 0,
-                "stepSeconds": GRAFANA_QUERY_STEP,
-            },
-            "series": [],
-        }
+    primary = fetch_request_total_1m_series(session=sess, start_unix=w_start, end_unix=w_end)
     extra: List[Dict[str, Any]] = []
-    if _lark_env_truthy("MONITORING_9280_ENABLE"):
-        try:
-            p9280 = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_9280,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "9280_push", "payload": p9280})
-        except Exception:
-            logger.exception("fetch 9280 panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
-        try:
-            pd = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_DEPOSIT,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "deposit", "payload": pd})
-        except Exception:
-            logger.exception("fetch deposit panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
-        try:
-            pw = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_WITHDRAW,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "withdraw", "payload": pw})
-        except Exception:
-            logger.exception("fetch withdraw panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
-        try:
-            ppj = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_PROVIDER_JILI,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "provider_jili", "payload": ppj})
-        except Exception:
-            logger.exception("fetch provider JILI panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
-        try:
-            ppg = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_PROVIDER_GENERAL,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "provider_general", "payload": ppg})
-        except Exception:
-            logger.exception("fetch provider GENERAL panel failed (optional monitor)")
-    if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
-        try:
-            ppi = _fetch_panel_series_by_title(
-                GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE,
-                session=sess,
-                start_unix=w_start,
-                end_unix=w_end,
-            )
-            extra.append({"kind": "provider_inhouse", "payload": ppi})
-        except Exception:
-            logger.exception("fetch provider INHOUSE panel failed (optional monitor)")
+    try:
+        p_eg = _fetch_panel_series_by_title(
+            GRAFANA_PANEL_TITLE_EGAME_ONLINE,
+            session=sess,
+            start_unix=w_start,
+            end_unix=w_end,
+        )
+        extra.append({"kind": "9280_push", "payload": p_eg})
+    except Exception:
+        logger.exception("fetch Egame Online Number panel failed (optional monitor)")
+    try:
+        p_bet = _fetch_panel_series_by_title(
+            GRAFANA_PANEL_TITLE_EGAMES_BET,
+            session=sess,
+            start_unix=w_start,
+            end_unix=w_end,
+        )
+        extra.append({"kind": "provider_jili", "payload": p_bet})
+    except Exception:
+        logger.exception("fetch Egames 下注Bet/min panel failed (optional monitor)")
     if extra:
         primary["extraPanels"] = extra
-        if not MONITORING_HTTP_PRIMARY_ENABLE:
-            w0 = (extra[0].get("payload") or {}).get("window") or {}
-            if int(w0.get("startUnix") or 0) > 0 and int(w0.get("endUnix") or 0) > 0:
-                primary["window"] = dict(w0)
     return primary
 
 
@@ -3711,25 +3600,12 @@ _MUTE_DURATION_CHOICES: List[Tuple[str, int]] = [
 
 
 def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
-    """
-    (channel_id, display_label) for enabled monitors. channel_id matches extraPanels ``kind`` or ``http``.
-    """
-    out: List[Tuple[str, str]] = []
-    if MONITORING_HTTP_PRIMARY_ENABLE:
-        out.append(("http", GRAFANA_PANEL_TITLE))
-    if _lark_env_truthy("MONITORING_9280_ENABLE"):
-        out.append(("9280_push", GRAFANA_PANEL_TITLE_9280))
-    if _lark_env_truthy("MONITORING_DEPOSIT_ENABLE"):
-        out.append(("deposit", GRAFANA_PANEL_TITLE_DEPOSIT))
-    if _lark_env_truthy("MONITORING_WITHDRAW_ENABLE"):
-        out.append(("withdraw", GRAFANA_PANEL_TITLE_WITHDRAW))
-    if _lark_env_truthy("MONITORING_PROVIDER_JILI_ENABLE"):
-        out.append(("provider_jili", GRAFANA_PANEL_TITLE_PROVIDER_JILI))
-    if _lark_env_truthy("MONITORING_PROVIDER_GENERAL_ENABLE"):
-        out.append(("provider_general", GRAFANA_PANEL_TITLE_PROVIDER_GENERAL))
-    if _lark_env_truthy("MONITORING_PROVIDER_INHOUSE_ENABLE"):
-        out.append(("provider_inhouse", GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE))
-    return out
+    """(channel_id, display_label) for /m mute; ``http`` = LiveSlots primary payload."""
+    return [
+        ("http", GRAFANA_PANEL_TITLE),
+        ("9280_push", GRAFANA_PANEL_TITLE_EGAME_ONLINE),
+        ("provider_jili", GRAFANA_PANEL_TITLE_EGAMES_BET),
+    ]
 
 
 def _monitoring_mutable_channel_ids() -> Set[str]:
@@ -6020,16 +5896,25 @@ def _http_drop_spike_analysis(
     fast_threshold_pct: float,
     continuous_threshold_pct: float,
     window_seconds: int = 120,
+    *,
+    fast_drop_threshold_pct: Optional[float] = None,
+    fast_spike_threshold_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Alert rules:
-    1) within ``window_seconds`` (default 2 minutes), drop/spike >= ``fast_threshold_pct``
+    1) within ``window_seconds``, window drop vs ``fast_drop_threshold_pct`` (spike vs ``fast_spike_threshold_pct``)
     2) continuous monotonic run drop/spike >= ``continuous_threshold_pct``
+
+    When ``fast_drop_threshold_pct`` / ``fast_spike_threshold_pct`` are omitted, both use ``fast_threshold_pct``.
     """
+    fd = float(fast_drop_threshold_pct) if fast_drop_threshold_pct is not None else float(fast_threshold_pct)
+    fs = float(fast_spike_threshold_pct) if fast_spike_threshold_pct is not None else float(fast_threshold_pct)
     out: Dict[str, Any] = {
         "pointCount": len(points),
         "hit_alert": False,
         "fast_threshold_pct": fast_threshold_pct,
+        "fast_drop_threshold_pct": fd,
+        "fast_spike_threshold_pct": fs,
         "continuous_threshold_pct": continuous_threshold_pct,
         "window_seconds": int(window_seconds),
         "consecutive_max_drop": None,
@@ -6044,7 +5929,7 @@ def _http_drop_spike_analysis(
     ts = [p[0] for p in points]
     L = len(points)
 
-    # Convert "within 2 minutes" to bucket span using median step.
+    # Convert window_seconds to bucket span using median step.
     if L >= 2:
         diffs = [max(1.0, ts[i + 1] - ts[i]) for i in range(L - 1)]
         diffs.sort()
@@ -6110,22 +5995,74 @@ def _http_drop_spike_analysis(
                 best_w_spike = cand_s
     out["window_max_drop"] = best_w_drop
     out["window_max_spike"] = best_w_spike
-    if best_w_drop is not None and float(best_w_drop.get("pct") or 0.0) >= float(fast_threshold_pct):
+    if best_w_drop is not None and float(best_w_drop.get("pct") or 0.0) >= fd:
         out["hit_alert"] = True
-    if best_w_spike is not None and float(best_w_spike.get("pct") or 0.0) >= float(fast_threshold_pct):
+    if best_w_spike is not None and float(best_w_spike.get("pct") or 0.0) >= fs:
         out["hit_alert"] = True
     return out
 
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    LiveSlots Online Number: per-series when ``MONITORING_PER_SERIES_ANALYSIS``; fast **drop** only
+    (``MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT``); fast spike threshold ``inf`` (no spike-by-window alert).
+    """
+    cont = MONITORING_GAME_ALERT_CONTINUOUS_PCT
+    fd = MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT
+    fs_fast = float("inf")
+
+    def _one_series(pts_in: List[Tuple[float, float]], *, label: Optional[str] = None) -> Dict[str, Any]:
+        pts2 = _snap_series_to_monitoring_minutes(pts_in, how="max")
+        pts2 = _trim_trailing_minute_buckets(pts2, _analysis_drop_n())
+        a = _http_drop_spike_analysis(
+            pts2,
+            fd,
+            cont,
+            MONITORING_ALERT_WINDOW_SECONDS,
+            fast_drop_threshold_pct=fd,
+            fast_spike_threshold_pct=fs_fast,
+        )
+        a["point_count"] = len(pts2)
+        a["merged_points"] = [[t, v] for t, v in pts2]
+        if label is not None:
+            a["series_label"] = label
+        return a
+
+    if MONITORING_PER_SERIES_ANALYSIS:
+        grouped = _group_per_series_points_from_payload(payload)
+        if not grouped:
+            empty = _one_series([], label=None)
+            empty["hit_alert"] = False
+            empty["per_series"] = []
+            return empty
+        subs: List[Dict[str, Any]] = []
+        any_hit = False
+        for lbl, pts in grouped:
+            sub = _one_series(pts, label=lbl)
+            subs.append(sub)
+            any_hit = any_hit or bool(sub.get("hit_alert"))
+        return {
+            "hit_alert": any_hit,
+            "per_series": subs,
+            "point_count": sum(int(s.get("point_count") or 0) for s in subs),
+            "merged_points": subs[0]["merged_points"] if len(subs) == 1 else [],
+            "fast_threshold_pct": fd,
+            "fast_drop_threshold_pct": fd,
+            "fast_spike_threshold_pct": fs_fast,
+            "continuous_threshold_pct": cont,
+            "window_seconds": MONITORING_ALERT_WINDOW_SECONDS,
+        }
+
     pts = _merge_http_timeseries_points(payload)
     pts = _snap_series_to_monitoring_minutes(pts, how="sum")
     pts = _trim_trailing_minute_buckets(pts, _analysis_drop_n())
     a = _http_drop_spike_analysis(
         pts,
-        MONITORING_HTTP_DROP_ALERT_PCT,
-        MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
+        fd,
+        cont,
         MONITORING_ALERT_WINDOW_SECONDS,
+        fast_drop_threshold_pct=fd,
+        fast_spike_threshold_pct=fs_fast,
     )
     a["point_count"] = len(pts)
     a["merged_points"] = [[t, v] for t, v in pts]
@@ -6174,6 +6111,8 @@ def _analysis_for_keyword_payload(
     *,
     snap_how: str = "max",
     apply_baseline_filter: bool = True,
+    fast_drop_threshold_pct: Optional[float] = None,
+    fast_spike_threshold_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     kw = (keyword or "").strip()
     use_per_series = bool(MONITORING_PER_SERIES_ANALYSIS) and not kw
@@ -6202,6 +6141,8 @@ def _analysis_for_keyword_payload(
             fast_threshold_pct,
             continuous_threshold_pct,
             MONITORING_ALERT_WINDOW_SECONDS,
+            fast_drop_threshold_pct=fast_drop_threshold_pct,
+            fast_spike_threshold_pct=fast_spike_threshold_pct,
         )
         a["point_count"] = len(pts_work)
         a["merged_points"] = [[t, v] for t, v in pts_work]
@@ -6271,6 +6212,8 @@ def _analysis_for_keyword_payload(
         fast_threshold_pct,
         continuous_threshold_pct,
         MONITORING_ALERT_WINDOW_SECONDS,
+        fast_drop_threshold_pct=fast_drop_threshold_pct,
+        fast_spike_threshold_pct=fast_spike_threshold_pct,
     )
     a["point_count"] = len(pts_filtered)
     a["merged_points"] = [[t, v] for t, v in pts_filtered]
@@ -6328,13 +6271,22 @@ def _analysis_for_provider_inhouse_payload(payload: Dict[str, Any]) -> Dict[str,
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
     if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
         return []
-    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_9280_ALERT_PCT)
-    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_9280_CONTINUOUS_ALERT_PCT)
+    fd = float(analysis.get("fast_drop_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
+    fs = float(analysis.get("fast_spike_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
+    cont_thr = float(
+        analysis.get("continuous_threshold_pct") or MONITORING_GAME_ALERT_CONTINUOUS_PCT
+    )
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    win_m = max(1, win_sec // 60)
+    if math.isfinite(fs) and abs(fd - fs) < 1e-9:
+        rule_fast = f"drop/spike > {fd:g}% within {win_m}m"
+    elif math.isfinite(fs):
+        rule_fast = f"drop > {fd:g}% or spike > {fs:g}% within {win_m}m"
+    else:
+        rule_fast = f"drop > {fd:g}% within {win_m}m (spike fast off)"
     lines: List[str] = [
         "",
-        f"[{section_label}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
-        f"or continuous drop/spike > {cont_thr:g}%",
+        f"[{section_label}] alert when {rule_fast} or continuous drop/spike > {cont_thr:g}%",
     ]
     wd = analysis.get("window_max_drop")
     ws = analysis.get("window_max_spike")
@@ -6363,6 +6315,8 @@ def _format_trigger_lines(
     cd = analysis.get("consecutive_max_drop")
     cs = analysis.get("consecutive_max_spike")
     win_m = max(1, int(round(float(window_seconds) / 60.0)))
+    ft_drop = float(analysis.get("fast_drop_threshold_pct", fast_threshold_pct))
+    ft_spike = float(analysis.get("fast_spike_threshold_pct", fast_threshold_pct))
 
     def _pct_text(v: Any) -> str:
         try:
@@ -6383,10 +6337,10 @@ def _format_trigger_lines(
         )
 
     fast_hits: List[str] = []
-    if isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= float(fast_threshold_pct):
-        fast_hits.append(_event_text(wd, "DROP", fast_threshold_pct))
-    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= float(fast_threshold_pct):
-        fast_hits.append(_event_text(ws, "SPIKE", fast_threshold_pct))
+    if isinstance(wd, dict) and float(wd.get("pct") or 0.0) >= ft_drop:
+        fast_hits.append(_event_text(wd, "DROP", ft_drop))
+    if isinstance(ws, dict) and float(ws.get("pct") or 0.0) >= ft_spike and math.isfinite(ft_spike):
+        fast_hits.append(_event_text(ws, "SPIKE", ft_spike))
 
     cont_hits: List[str] = []
     if isinstance(cd, dict) and float(cd.get("pct") or 0.0) >= float(continuous_threshold_pct):
@@ -6466,6 +6420,14 @@ def _format_trigger_fallback_line(
     """
     win_m = max(1, int(round(float(window_seconds) / 60.0)))
     if bool(analysis.get("hit_alert")):
+        fd = float(analysis.get("fast_drop_threshold_pct", fast_threshold_pct))
+        fs = float(analysis.get("fast_spike_threshold_pct", fast_threshold_pct))
+        if math.isfinite(fs) and abs(fd - fs) > 1e-9:
+            return (
+                f"[{graph_label}] {series_label} alert triggered "
+                f"(rules: drop>{fd:g}% or spike>{fs:g}% within {win_m}m win, "
+                f"or continuous >{continuous_threshold_pct:g}%)"
+            )
         return (
             f"[{graph_label}] {series_label} alert triggered "
             f"(rules: >{fast_threshold_pct:g}% within {win_m}m or continuous >{continuous_threshold_pct:g}%)"
@@ -6565,42 +6527,21 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
     _mute_purge_expired()
     lines: List[str] = [
         "[ALERT] Monitoring thresholds exceeded",
-        "Fast = sharpest move within ~2 minutes; Continuous = longest steady climb or drop.",
+        "Fast = sharpest move within ~3 minutes; Continuous = longest steady climb or drop.",
         "",
     ]
     reason_blocks: List[str] = []
-    if MONITORING_HTTP_PRIMARY_ENABLE:
+    if MONITORING_HTTP_PRIMARY_ENABLE and not _monitoring_alert_channel_muted("http"):
         a_http = _http_analysis_for_payload(payload)
-        if not _monitoring_alert_channel_muted("http"):
-            reasons = _format_trigger_lines(
-                GRAFANA_PANEL_TITLE,
-                "all series merged",
-                a_http,
-                MONITORING_HTTP_DROP_ALERT_PCT,
-                MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
-                MONITORING_ALERT_WINDOW_SECONDS,
-            )
-            if not reasons:
-                fb = _format_trigger_fallback_line(
-                    GRAFANA_PANEL_TITLE,
-                    "all series merged",
-                    a_http,
-                    MONITORING_HTTP_DROP_ALERT_PCT,
-                    MONITORING_HTTP_CONTINUOUS_ALERT_PCT,
-                    MONITORING_ALERT_WINDOW_SECONDS,
-                )
-                if fb:
-                    reasons.append(fb)
-            if MONITORING_SIMPLE_ALERT_TEXT and (reasons or _analysis_aggregate_hit_alert(a_http)):
-                reasons = [
-                    _format_simple_series_alert_block(GRAFANA_PANEL_TITLE, "all series merged", a_http)
-                ]
-            elif reasons and not MONITORING_SIMPLE_ALERT_TEXT:
-                reasons.append(
-                    _format_alert_series_table_footer(GRAFANA_PANEL_TITLE, "all series merged", a_http)
-                )
-            if reasons:
-                reason_blocks.append("\n\n".join(reasons))
+        for chunk in _format_alert_reason_chunks_for_analysis(
+            GRAFANA_PANEL_TITLE,
+            "",
+            a_http,
+            MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT,
+            MONITORING_GAME_ALERT_CONTINUOUS_PCT,
+            MONITORING_ALERT_WINDOW_SECONDS,
+        ):
+            reason_blocks.append(chunk)
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -6614,36 +6555,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             a2 = _analysis_for_9280_payload(p2)
             fast2 = MONITORING_9280_ALERT_PCT
             cont2 = MONITORING_9280_CONTINUOUS_ALERT_PCT
-        elif kind == "deposit":
-            g_lbl = GRAFANA_PANEL_TITLE_DEPOSIT
-            s_lbl = MONITORING_DEPOSIT_SERIES_KEYWORD
-            a2 = _analysis_for_deposit_payload(p2)
-            fast2 = MONITORING_DEPOSIT_ALERT_PCT
-            cont2 = MONITORING_DEPOSIT_CONTINUOUS_ALERT_PCT
-        elif kind == "withdraw":
-            g_lbl = GRAFANA_PANEL_TITLE_WITHDRAW
-            s_lbl = MONITORING_WITHDRAW_SERIES_KEYWORD
-            a2 = _analysis_for_withdraw_payload(p2)
-            fast2 = MONITORING_WITHDRAW_ALERT_PCT
-            cont2 = MONITORING_WITHDRAW_CONTINUOUS_ALERT_PCT
         elif kind == "provider_jili":
             g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_JILI
             s_lbl = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
             a2 = _analysis_for_provider_jili_payload(p2)
             fast2 = MONITORING_PROVIDER_JILI_ALERT_PCT
             cont2 = MONITORING_PROVIDER_JILI_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_general":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
-            s_lbl = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
-            a2 = _analysis_for_provider_general_payload(p2)
-            fast2 = MONITORING_PROVIDER_GENERAL_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_GENERAL_CONTINUOUS_ALERT_PCT
-        elif kind == "provider_inhouse":
-            g_lbl = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
-            s_lbl = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
-            a2 = _analysis_for_provider_inhouse_payload(p2)
-            fast2 = MONITORING_PROVIDER_INHOUSE_ALERT_PCT
-            cont2 = MONITORING_PROVIDER_INHOUSE_CONTINUOUS_ALERT_PCT
         else:
             continue
         for chunk in _format_alert_reason_chunks_for_analysis(
@@ -6665,11 +6582,12 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
 
 def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     _mute_purge_expired()
-    if MONITORING_HTTP_PRIMARY_ENABLE:
-        if not _monitoring_alert_channel_muted("http") and _analysis_aggregate_hit_alert(
-            _http_analysis_for_payload(payload)
-        ):
-            return True
+    if (
+        MONITORING_HTTP_PRIMARY_ENABLE
+        and not _monitoring_alert_channel_muted("http")
+        and _analysis_aggregate_hit_alert(_http_analysis_for_payload(payload))
+    ):
+        return True
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -6679,19 +6597,7 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         if k == "9280_push" and _analysis_aggregate_hit_alert(_analysis_for_9280_payload(p2)):
             return True
-        if k == "deposit" and _analysis_aggregate_hit_alert(_analysis_for_deposit_payload(p2)):
-            return True
-        if k == "withdraw" and _analysis_aggregate_hit_alert(_analysis_for_withdraw_payload(p2)):
-            return True
         if k == "provider_jili" and _analysis_aggregate_hit_alert(_analysis_for_provider_jili_payload(p2)):
-            return True
-        if k == "provider_general" and _analysis_aggregate_hit_alert(
-            _analysis_for_provider_general_payload(p2)
-        ):
-            return True
-        if k == "provider_inhouse" and _analysis_aggregate_hit_alert(
-            _analysis_for_provider_inhouse_payload(p2)
-        ):
             return True
     return False
 
@@ -6722,13 +6628,22 @@ def _format_http_analysis_lines(
     Threshold line matches product copy; @mention is still driven by ``hit_alert`` (mean windows).
     """
     sec = (section_label or GRAFANA_PANEL_TITLE or "panel").strip() or "panel"
-    fast_thr = float(analysis.get("fast_threshold_pct") or MONITORING_HTTP_DROP_ALERT_PCT)
-    cont_thr = float(analysis.get("continuous_threshold_pct") or MONITORING_HTTP_CONTINUOUS_ALERT_PCT)
+    fd = float(analysis.get("fast_drop_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
+    fs = float(analysis.get("fast_spike_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
+    cont_thr = float(
+        analysis.get("continuous_threshold_pct") or MONITORING_GAME_ALERT_CONTINUOUS_PCT
+    )
     win_sec = int(analysis.get("window_seconds") or MONITORING_ALERT_WINDOW_SECONDS)
+    win_m = max(1, win_sec // 60)
+    if math.isfinite(fs) and abs(fd - fs) < 1e-9:
+        rule_fast = f"drop/spike > {fd:g}% within {win_m}m"
+    elif math.isfinite(fs):
+        rule_fast = f"drop > {fd:g}% or spike > {fs:g}% within {win_m}m"
+    else:
+        rule_fast = f"drop > {fd:g}% within {win_m}m (spike fast off)"
     lines: List[str] = [
         "",
-        f"[{sec}] alert when drop/spike > {fast_thr:g}% within {win_sec//60} minutes "
-        f"or continuous drop/spike > {cont_thr:g}%",
+        f"[{sec}] alert when {rule_fast} or continuous drop/spike > {cont_thr:g}%",
     ]
 
     wd = analysis.get("window_max_drop")
@@ -6747,7 +6662,7 @@ def _format_http_analysis_lines(
 
 def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention: bool = True) -> str:
     """
-    Lark-friendly compact layout: ``[panel] graph`` + short ``Dashboard: …/d/{uid}`` + HTTP table + footer.
+    Lark-friendly compact layout: ``[panel] graph`` + short ``Dashboard: …/d/{uid}`` + panel tables + rules.
 
     When the caller prepends ``_format_alert_trigger_reply`` (already contains ``<at>``), pass
     ``include_target_mention=False`` to avoid duplicate mentions.
@@ -6755,67 +6670,14 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
     max_rows = MONITORING_TABLE_TAIL_ROWS
     uid = str(payload.get("dashboardUid") or GRAFANA_DASHBOARD_UID)
     base = str(GRAFANA_BASE_URL).rstrip("/")
-    http_ex = (
-        _http_analysis_for_payload(payload) if MONITORING_HTTP_PRIMARY_ENABLE else {}
-    )
+    http_ex = _http_analysis_for_payload(payload) if MONITORING_HTTP_PRIMARY_ENABLE else {}
 
     lines: List[str] = [
         f"[{payload.get('panelTitle')}] graph",
         f"Dashboard: {base}/d/{uid}",
     ]
-    # Show optional monitored series first so they are not truncated away by long HTTP tables.
-    for ex in payload.get("extraPanels") or []:
-        if not isinstance(ex, dict):
-            continue
-        k = (ex.get("kind") or "")
-        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if k == "9280_push":
-            a2 = _analysis_for_9280_payload(p2)
-            title = GRAFANA_PANEL_TITLE_9280
-            series = MONITORING_9280_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "deposit":
-            a2 = _analysis_for_deposit_payload(p2)
-            title = GRAFANA_PANEL_TITLE_DEPOSIT
-            series = MONITORING_DEPOSIT_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "withdraw":
-            a2 = _analysis_for_withdraw_payload(p2)
-            title = GRAFANA_PANEL_TITLE_WITHDRAW
-            series = MONITORING_WITHDRAW_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "provider_jili":
-            a2 = _analysis_for_provider_jili_payload(p2)
-            title = GRAFANA_PANEL_TITLE_PROVIDER_JILI
-            series = MONITORING_PROVIDER_JILI_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "provider_general":
-            a2 = _analysis_for_provider_general_payload(p2)
-            title = GRAFANA_PANEL_TITLE_PROVIDER_GENERAL
-            series = MONITORING_PROVIDER_GENERAL_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "provider_inhouse":
-            a2 = _analysis_for_provider_inhouse_payload(p2)
-            title = GRAFANA_PANEL_TITLE_PROVIDER_INHOUSE
-            series = MONITORING_PROVIDER_INHOUSE_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "games_jili":
-            a2 = _analysis_for_games_jili_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_JILI
-            series = MONITORING_GAMES_JILI_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "games_general":
-            a2 = _analysis_for_games_general_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_GENERAL
-            series = MONITORING_GAMES_GENERAL_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        elif k == "games_inhouse":
-            a2 = _analysis_for_games_inhouse_payload(p2)
-            title = GRAFANA_PANEL_TITLE_GAMES_INHOUSE
-            series = MONITORING_GAMES_INHOUSE_SERIES_KEYWORD
-            extra_footer = _format_extra_analysis_lines(title, a2)
-        else:
-            continue
+
+    def append_analyzed_panel(title: str, series_keyword: str, a2: Dict[str, Any]) -> None:
         per_rows = a2.get("per_series")
         if isinstance(per_rows, list) and per_rows:
             for sub in per_rows:
@@ -6836,59 +6698,46 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
                 else:
                     lines.append(f"(no points matched for {series_disp})")
                 lines.extend(_format_extra_analysis_lines(title, sub))
+            return
+        pts2 = a2.get("merged_points") or []
+        lines.append("")
+        series_disp = (series_keyword or "").strip() or "all series merged"
+        lines.append(f"[{title}] series: {series_disp}")
+        if pts2:
+            tail2 = pts2[-max_rows:]
+            rows2 = ["time           value"]
+            for pair in tail2:
+                rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
+            lines.append("```text")
+            lines.extend(rows2)
+            lines.append("```")
         else:
-            pts2 = a2.get("merged_points") or []
-            lines.append("")
-            series_disp = (series or "").strip() or "all series merged"
-            lines.append(f"[{title}] series: {series_disp}")
-            if pts2:
-                tail2 = pts2[-max_rows:]
-                rows2 = ["time           value"]
-                for pair in tail2:
-                    rows2.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-                lines.append("```text")
-                lines.extend(rows2)
-                lines.append("```")
-            else:
-                lines.append(f"(no points matched for {series_disp})")
-            lines.extend(extra_footer)
+            lines.append(f"(no points matched for {series_disp})")
+        lines.extend(_format_extra_analysis_lines(title, a2))
 
     if MONITORING_HTTP_PRIMARY_ENABLE:
-        for s in payload.get("series") or []:
-            prom = s.get("prometheus") or {}
-            pdata = prom.get("data") or {}
-            results = pdata.get("result") or []
-            ref = s.get("refId") or "?"
-            if not results:
-                lines.append(f"- [{ref}] no data")
-                continue
-            http_results = [
-                r for r in results[:24] if _metric_series_is_http_leg(r.get("metric") or {})
-            ]
-            if not http_results:
-                lines.append(f"- [{ref}] no http-labeled series (skipped {len(results)} rows)")
-                continue
-            for r in http_results[:6]:
-                m = r.get("metric") or {}
-                legend = _compact_http_legend(m, str(ref))
-                vals = r.get("values") or []
-                if not vals:
-                    lines.append(f"[{ref}] {legend}: (empty)")
-                    continue
-                lines.append("")
-                lines.append(f"[{ref}] {legend}")
-                tail = vals[-max_rows:]
-                rows = ["time           value"]
-                for pair in tail:
-                    rows.append(f"{_fmt_ts_short(pair[0]):<13}  {_fmt_num(pair[1]):>12}")
-                lines.append("```text")
-                lines.extend(rows)
-                lines.append("```")
+        append_analyzed_panel(GRAFANA_PANEL_TITLE, "", http_ex)
+
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        k = (ex.get("kind") or "")
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        if k == "9280_push":
+            append_analyzed_panel(
+                GRAFANA_PANEL_TITLE_9280,
+                MONITORING_9280_SERIES_KEYWORD,
+                _analysis_for_9280_payload(p2),
+            )
+        elif k == "provider_jili":
+            append_analyzed_panel(
+                GRAFANA_PANEL_TITLE_PROVIDER_JILI,
+                MONITORING_PROVIDER_JILI_SERIES_KEYWORD,
+                _analysis_for_provider_jili_payload(p2),
+            )
 
     if include_target_mention and _monitoring_payload_hit_alert(payload):
         _append_monitoring_alert_target_user_mention(lines)
-    if MONITORING_HTTP_PRIMARY_ENABLE:
-        lines.extend(_format_http_analysis_lines(http_ex, section_label=GRAFANA_PANEL_TITLE))
 
     return "\n".join(lines)
 
@@ -8277,11 +8126,13 @@ def grafana_ping():
 
 @app.route("/metrics/request-total-1m", methods=["GET"])
 def metrics_request_total_1m():
-    """Last 10 minutes of「请求总数/1m」panel (1-minute step). Poll every 1m from cron or Lark."""
+    """Primary Grafana panel series (default LiveSlots Online Number, 1-minute step). Poll from cron or Lark."""
     try:
         if not MONITORING_HTTP_PRIMARY_ENABLE:
             return jsonify(
-                {"error": "MONITORING_HTTP_PRIMARY_ENABLE=0 — HTTP primary panel disabled on this bot"}
+                {
+                    "error": "MONITORING_HTTP_PRIMARY_ENABLE=0 — primary panel (LiveSlots) disabled on this bot"
+                }
             ), 404
         data = fetch_request_total_1m_series()
         data["httpAnalysis"] = _http_analysis_for_payload(data)
