@@ -204,9 +204,11 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_DROP_LAST_MERGED_MINUTES": "0",
     # 对齐判窗时：最后一桶（floor(now)−END_OFFSET 分钟）距现在至少该秒数才跑分析，替代「多丢一桶」等 Prometheus scrape
     "MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS": "90",
-    # Watchdog：Prometheus 判窗对齐到整分钟，相对「当前分钟起点」向回偏移（分钟）。例：6 与 1 → 12:46:xx 只评 12:40:00..12:45:00
-    "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "6",
-    "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "1",
+    # Watchdog：Prometheus 判窗对齐到整分钟，相对「当前分钟起点」向回偏移（分钟）。例：7 与 2 → 12:46:xx 只评 12:39:00..12:44:00（5 分钟窗，末桶更旧以减少 Pushgateway 迟到回填假跌）
+    "MONITORING_WATCH_EVAL_START_OFFSET_MINUTES": "7",
+    "MONITORING_WATCH_EVAL_END_OFFSET_MINUTES": "2",
+    # 首次越阈后冻结判窗、等待该秒数再拉同一窗口复核；0=立即告警（关闭确认）。缓解「当分钟 sum 随后被 Prometheus 回填修正」导致的误报
+    "MONITORING_WATCH_CONFIRM_SECONDS": "60",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
     # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
@@ -388,6 +390,7 @@ _monitoring_chat_send_in_progress: set = set()
 _monitoring_card_action_event_ids: set = set()
 _monitoring_watch_last_alert_at: float = 0.0
 _monitoring_watch_started: bool = False
+_monitoring_watch_pending_confirm: Optional[Tuple[int, int, float]] = None
 _lark_bot_open_id_resolve_lock = threading.Lock()
 # None = not requested yet; "" = bot/v3/info failed or no APP_ID/SECRET
 _lark_bot_open_id_api_cache: Optional[str] = None
@@ -556,6 +559,9 @@ MONITORING_WATCH_DROP_LAST_MERGED_MINUTES = max(
 )
 MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS = max(
     0.0, _cfg_float("MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS", 90.0)
+)
+MONITORING_WATCH_CONFIRM_SECONDS = max(
+    0.0, _cfg_float("MONITORING_WATCH_CONFIRM_SECONDS", 60.0)
 )
 _tls_analysis_drop = threading.local()
 
@@ -3218,12 +3224,12 @@ def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
 def _monitoring_watch_eval_window_unix(now: Optional[float] = None) -> Tuple[int, int]:
     """
     Minute-aligned Prometheus window for **watchdog only** (exclude current incomplete minute by default).
-    Defaults: start = floor_to_minute(now) − 6m, end = floor_to_minute(now) − 1m
-    (e.g. at 12:46:30 → 12:40:00 .. 12:45:00 unix, inclusive for query_range with step 60).
+    Defaults: start = floor_to_minute(now) − 7m, end = floor_to_minute(now) − 2m
+    (e.g. at 12:46:30 → 12:39:00 .. 12:44:00 unix, inclusive for query_range with step 60).
     """
     t = time.time() if now is None else float(now)
-    end_off = max(0, _cfg_int("MONITORING_WATCH_EVAL_END_OFFSET_MINUTES", 1))
-    start_off = max(end_off + 1, _cfg_int("MONITORING_WATCH_EVAL_START_OFFSET_MINUTES", 6))
+    end_off = max(0, _cfg_int("MONITORING_WATCH_EVAL_END_OFFSET_MINUTES", 2))
+    start_off = max(end_off + 1, _cfg_int("MONITORING_WATCH_EVAL_START_OFFSET_MINUTES", 7))
     t_floor = int(t // 60) * 60
     end_unix = t_floor - end_off * 60
     start_unix = t_floor - start_off * 60
@@ -3234,6 +3240,8 @@ def fetch_monitoring_payload(
     session: Optional[requests.Session] = None,
     *,
     for_watchdog: bool = False,
+    start_unix: Optional[int] = None,
+    end_unix: Optional[int] = None,
 ) -> Dict[str, Any]:
     sess = session or grafana_login_session()
     w_start: Optional[int] = None
@@ -3243,6 +3251,13 @@ def fetch_monitoring_payload(
             logger.info(
                 "fetch_monitoring_payload watchdog eval uses **report** window "
                 "(MONITORING_WATCH_MATCH_REPORT_WINDOW=1; same lookback/lag as /monitoring)"
+            )
+        elif start_unix is not None and end_unix is not None:
+            w_start, w_end = int(start_unix), int(end_unix)
+            logger.info(
+                "fetch_monitoring_payload watchdog eval **frozen** window unix %s..%s (confirm re-query)",
+                w_start,
+                w_end,
             )
         else:
             w_start, w_end = _monitoring_watch_eval_window_unix()
@@ -6892,9 +6907,11 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
 
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
-    global _monitoring_watch_last_alert_at
+    global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
     sec = max(15.0, _cfg_float("MONITORING_WATCH_INTERVAL_SECONDS", 20.0))
     cool = max(0.0, _cfg_float("MONITORING_WATCH_ALERT_COOLDOWN_SECONDS", 300.0))
+    confirm_s = MONITORING_WATCH_CONFIRM_SECONDS
+    match_rp = _lark_env_truthy("MONITORING_WATCH_MATCH_REPORT_WINDOW")
     qs, qe = _monitoring_watch_daily_quiet_tod_bounds()
     if qs < 0:
         q_note = "daily_quiet=disabled"
@@ -6906,9 +6923,12 @@ def _monitoring_watchdog_loop() -> None:
             f"(end time exclusive; no fetch/alert)"
         )
     logger.info(
-        "monitoring watchdog started interval=%.0fs cooldown=%.0fs alert_chat=%r target_user=%r %s",
+        "monitoring watchdog started interval=%.0fs cooldown=%.0fs confirm=%.0fs match_report_window=%s "
+        "alert_chat=%r target_user=%r %s",
         sec,
         cool,
+        confirm_s,
+        match_rp,
         bool((MONITORING_ALERT_CHAT_ID or "").strip()),
         bool((TARGET_USER_OPEN_ID or "").strip()),
         q_note,
@@ -6922,15 +6942,113 @@ def _monitoring_watchdog_loop() -> None:
                 continue
 
             if _monitoring_watch_in_daily_quiet_local():
+                _monitoring_watch_pending_confirm = None
                 logger.debug(
                     "monitoring watchdog: skip — daily quiet window (MONITORING_WATCH_QUIET_WINDOW_ENABLE=0 to disable)"
                 )
                 time.sleep(sec)
                 continue
 
+            pc = _monitoring_watch_pending_confirm
+            if pc is not None and confirm_s > 0 and not match_rp:
+                ps, pe, deadline = pc
+                now_m = time.monotonic()
+                if now_m < deadline:
+                    time.sleep(min(sec, max(1.0, deadline - now_m)))
+                    continue
+                _tls_analysis_drop.watchdog = True
+                try:
+                    min_age_c = MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS
+                    if min_age_c > 0:
+                        age_c = time.time() - float(pe)
+                        if age_c < min_age_c:
+                            logger.debug(
+                                "monitoring watchdog: skip confirm fetch — bucket end=%s age=%.1fs < min=%.1fs",
+                                pe,
+                                age_c,
+                                min_age_c,
+                            )
+                            time.sleep(sec)
+                            continue
+                    sess_c = grafana_login_session()
+                    payload_c = fetch_monitoring_payload(
+                        session=sess_c,
+                        for_watchdog=True,
+                        start_unix=ps,
+                        end_unix=pe,
+                    )
+                except Exception:
+                    logger.exception("monitoring watchdog confirm fetch failed")
+                    time.sleep(sec)
+                    continue
+                finally:
+                    _tls_analysis_drop.watchdog = False
+
+                _monitoring_watch_pending_confirm = None
+                if not _monitoring_payload_hit_alert(payload_c):
+                    logger.info(
+                        "monitoring watchdog: pending alert CLEARED — false alert avoided "
+                        "(frozen window unix %s..%s)",
+                        ps,
+                        pe,
+                    )
+                    time.sleep(sec)
+                    continue
+
+                now_m = time.monotonic()
+                with _monitoring_reply_dispatch_lock:
+                    prev = _monitoring_watch_last_alert_at
+                    if cool > 0 and prev > 0 and (now_m - prev) < cool:
+                        logger.info(
+                            "monitoring watchdog alert skipped by cooldown after confirm (%.0fs left)",
+                            cool - (now_m - prev),
+                        )
+                        time.sleep(sec)
+                        continue
+                    _monitoring_watch_last_alert_at = now_m
+
+                reply = _format_alert_trigger_reply(payload_c)
+                pre_key: Optional[str] = None
+                if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                    try:
+                        pre_key = _lark_upload_png_image_key(_grafana_watchdog_alert_screenshot_png(sess_c))
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot failed")
+
+                used_card, embedded = _lark_send_monitoring_user_message(
+                    "chat_id",
+                    alert_chat,
+                    reply,
+                    pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+                )
+                logger.info(
+                    "monitoring watchdog alert sent (after confirm) chat_prefix=%s... card=%s embedded_png=%s",
+                    alert_chat[:16],
+                    used_card,
+                    embedded,
+                )
+
+                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and not embedded:
+                    if pre_key:
+                        try:
+                            _lark_send_image_message("chat_id", alert_chat, pre_key)
+                            logger.info("monitoring watchdog screenshot sent via pre_key")
+                        except Exception:
+                            logger.exception("monitoring watchdog pre_key image send failed")
+                    else:
+                        try:
+                            png = _grafana_watchdog_alert_screenshot_png(sess_c)
+                            key = _lark_upload_png_image_key(png)
+                            _lark_send_image_message("chat_id", alert_chat, key)
+                            logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
+                        except Exception:
+                            logger.exception("monitoring watchdog screenshot send failed")
+                time.sleep(sec)
+                continue
+
             _tls_analysis_drop.watchdog = True
             try:
-                if not _lark_env_truthy("MONITORING_WATCH_MATCH_REPORT_WINDOW"):
+                if not match_rp:
                     min_age = MONITORING_WATCH_MIN_LAST_BUCKET_AGE_SECONDS
                     if min_age > 0:
                         _, w_end = _monitoring_watch_eval_window_unix()
@@ -6961,10 +7079,25 @@ def _monitoring_watchdog_loop() -> None:
                         )
                         time.sleep(sec)
                         continue
+
+                if confirm_s > 0 and not match_rp:
+                    w_s, w_e = _monitoring_watch_eval_window_unix()
+                    _monitoring_watch_pending_confirm = (w_s, w_e, time.monotonic() + confirm_s)
+                    logger.info(
+                        "monitoring watchdog: threshold breach pending confirm in %.0fs "
+                        "(frozen window unix %s..%s)",
+                        confirm_s,
+                        w_s,
+                        w_e,
+                    )
+                    time.sleep(sec)
+                    continue
+
+                with _monitoring_reply_dispatch_lock:
                     _monitoring_watch_last_alert_at = now_m
 
                 reply = _format_alert_trigger_reply(payload)
-                pre_key: Optional[str] = None
+                pre_key = None
                 if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
                         pre_key = _lark_upload_png_image_key(_grafana_watchdog_alert_screenshot_png(sess))
