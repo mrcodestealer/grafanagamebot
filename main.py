@@ -44,12 +44,15 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_BASE_URL": "https://grafana.client8.me",
     "GRAFANA_DASHBOARD_PATH": "/d/fe70d4bd-4729-471f-9ede-e981ad277963/online-number",
     "GRAFANA_DASHBOARD_UID": "fe70d4bd-4729-471f-9ede-e981ad277963",
-    # --- 判警涉及 3 个面板（标题须与 Grafana 完全一致）---
+    # --- 判警涉及 4 个面板（标题须与 Grafana 完全一致）---
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
     "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslot 下注Bet/min",
     "MONITORING_EGAME_ONLINE_SERIES_KEYWORD": "",
     "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
+    # 逗号/空格分隔；仅分析图例名包含下列子串的序列（空=该面板全部序列）
+    "MONITORING_EGAMES_BET_SERIES_INCLUDE": "EcallTW,Sinonet",
     "GRAFANA_DASHBOARD_FROM": "now-30m",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
@@ -186,12 +189,17 @@ _CFG: Dict[str, Any] = {
     "LARK_WS_SDK_DEBUG": "0",
     "LARK_WEBHOOK_WSGI_LOG": "0",
     "LARK_WEBHOOK_TIMING_LOG": "0",
-    # Fast = 约 3 分钟内最大跌/涨；LiveSlots 仅判「跌」快阈值；连续单调段跌/涨共用 CONTINUOUS。
+    # Fast = 约 3 分钟内最大跌/涨（各面板可单独设 drop/spike %）；连续单调段默认关闭（inf）。
     "MONITORING_ALERT_WINDOW_SECONDS": 180,
-    "MONITORING_EGAME_FAST_ALERT_PCT": 15,
-    "MONITORING_EGAMES_BET_FAST_ALERT_PCT": 15,
+    "MONITORING_EGAME_FAST_DROP_ALERT_PCT": 25,
+    "MONITORING_EGAME_FAST_SPIKE_ALERT_PCT": 25,
+    "MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT": 25,
+    "MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT": 25,
+    "MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT": 25,
+    "MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT": 25,
+    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT": 25,
+    "MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT": 50,
     "MONITORING_GAME_ALERT_CONTINUOUS_PCT": 30,
-    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT": 20,
     # 1=alert text skips Fast/Continuous SPIKE/DROP lines; only a short time/value tail (Grafana-like).
     "MONITORING_SIMPLE_ALERT_TEXT": "0",
     # 1=/mo hides extra-panel ``within Xm drop/spike`` footer lines; tables only.
@@ -426,12 +434,17 @@ GRAFANA_PANEL_TITLE_EGAME_ONLINE = _cfg_str(
 GRAFANA_PANEL_TITLE_EGAMES_BET = _cfg_str(
     "GRAFANA_PANEL_TITLE_EGAMES_BET", "Egames 下注Bet/min"
 )
+GRAFANA_PANEL_TITLE_LIVESLOT_BET = _cfg_str(
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET", "Liveslot 下注Bet/min"
+)
 # ``extraPanels[*].kind`` — /m 静音通道 id；须与 ``fetch_monitoring_payload`` 写入一致
 MONITORING_EXTRA_KIND_EGAME_ONLINE = "egame_online"
 MONITORING_EXTRA_KIND_EGAMES_BET = "egames_bet"
+MONITORING_EXTRA_KIND_LIVESLOT_BET = "liveslot_bet"
 # Deprecated ``kind`` strings (仍识别旧 payload / 旧静音键)
 _MONITORING_EXTRA_KIND_EGAME_ONLINE_LEGACY = "9280_push"
 _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY = "provider_jili"
+_MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY = "withdraw"
 
 
 def _extra_panel_logical_kind(kind: str) -> str:
@@ -441,6 +454,8 @@ def _extra_panel_logical_kind(kind: str) -> str:
         return MONITORING_EXTRA_KIND_EGAME_ONLINE
     if k == MONITORING_EXTRA_KIND_EGAMES_BET or k == _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY:
         return MONITORING_EXTRA_KIND_EGAMES_BET
+    if k == MONITORING_EXTRA_KIND_LIVESLOT_BET or k == _MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY:
+        return MONITORING_EXTRA_KIND_LIVESLOT_BET
     return k
 
 
@@ -455,6 +470,10 @@ def _monitoring_extra_channel_muted(raw_kind: str) -> bool:
         return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_EGAMES_BET) or _monitoring_alert_channel_muted(
             _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY
         )
+    if lg == MONITORING_EXTRA_KIND_LIVESLOT_BET:
+        return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_LIVESLOT_BET) or _monitoring_alert_channel_muted(
+            _MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY
+        )
     return _monitoring_alert_channel_muted(raw_kind)
 
 
@@ -466,6 +485,9 @@ MONITORING_EGAMES_BET_SERIES_KEYWORD = (
     _cfg_str("MONITORING_EGAMES_BET_SERIES_KEYWORD", "").strip()
     or _cfg_str("MONITORING_PROVIDER_JILI_SERIES_KEYWORD", "").strip()
 )
+MONITORING_EGAMES_BET_SERIES_INCLUDE = _cfg_str(
+    "MONITORING_EGAMES_BET_SERIES_INCLUDE", "EcallTW,Sinonet"
+).strip()
 # Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
 GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-6h")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
@@ -540,11 +562,34 @@ MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
 ).strip()
-MONITORING_EGAME_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAME_FAST_ALERT_PCT", 15.0)
-MONITORING_EGAMES_BET_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAMES_BET_FAST_ALERT_PCT", 15.0)
+MONITORING_EGAME_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAME_FAST_ALERT_PCT", 25.0)
+MONITORING_EGAMES_BET_FAST_ALERT_PCT = _cfg_float("MONITORING_EGAMES_BET_FAST_ALERT_PCT", 25.0)
 MONITORING_GAME_ALERT_CONTINUOUS_PCT = _cfg_float("MONITORING_GAME_ALERT_CONTINUOUS_PCT", 30.0)
+# Fast-only panels use ``inf`` for continuous so only drop/spike % below apply.
+MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT = float("inf")
+MONITORING_EGAME_FAST_DROP_ALERT_PCT = _cfg_float(
+    "MONITORING_EGAME_FAST_DROP_ALERT_PCT", MONITORING_EGAME_FAST_ALERT_PCT
+)
+MONITORING_EGAME_FAST_SPIKE_ALERT_PCT = _cfg_float(
+    "MONITORING_EGAME_FAST_SPIKE_ALERT_PCT", MONITORING_EGAME_FAST_ALERT_PCT
+)
+MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT = _cfg_float(
+    "MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT", MONITORING_EGAMES_BET_FAST_ALERT_PCT
+)
+MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT = _cfg_float(
+    "MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT", MONITORING_EGAMES_BET_FAST_ALERT_PCT
+)
+MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT = _cfg_float(
+    "MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT", 25.0
+)
+MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT = _cfg_float(
+    "MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT", 25.0
+)
 MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT = _cfg_float(
-    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 20.0
+    "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 25.0
+)
+MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT = _cfg_float(
+    "MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT", 50.0
 )
 MONITORING_ALERT_WINDOW_SECONDS = max(60, _cfg_int("MONITORING_ALERT_WINDOW_SECONDS", 180))
 # 1=在 /mo 与告警中包含主面板（LiveSlots）；0 时主面板表与 JSON 端点可关闭
@@ -3288,6 +3333,16 @@ def fetch_monitoring_payload(
         extra.append({"kind": MONITORING_EXTRA_KIND_EGAMES_BET, "payload": p_bet})
     except Exception:
         logger.exception("fetch Egames 下注Bet/min panel failed (optional monitor)")
+    try:
+        p_ls = _fetch_panel_series_by_title(
+            GRAFANA_PANEL_TITLE_LIVESLOT_BET,
+            session=sess,
+            start_unix=w_start,
+            end_unix=w_end,
+        )
+        extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_BET, "payload": p_ls})
+    except Exception:
+        logger.exception("fetch Liveslot 下注Bet/min panel failed (optional monitor)")
     if extra:
         primary["extraPanels"] = extra
     return primary
@@ -3649,6 +3704,7 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
         ("http", GRAFANA_PANEL_TITLE),
         (MONITORING_EXTRA_KIND_EGAME_ONLINE, GRAFANA_PANEL_TITLE_EGAME_ONLINE),
         (MONITORING_EXTRA_KIND_EGAMES_BET, GRAFANA_PANEL_TITLE_EGAMES_BET),
+        (MONITORING_EXTRA_KIND_LIVESLOT_BET, GRAFANA_PANEL_TITLE_LIVESLOT_BET),
     ]
 
 
@@ -5548,6 +5604,23 @@ def _series_row_display_label(legend_format: str, metric: Dict[str, Any]) -> str
     return compact or lg or "series"
 
 
+def _parse_monitoring_series_keywords(raw: str) -> List[str]:
+    """Split ``EcallTW,Sinonet`` / space-separated include list for per-series filtering."""
+    out: List[str] = []
+    for part in re.split(r"[,;\s]+", (raw or "").strip()):
+        p = part.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _series_label_matches_keywords(label: str, keywords: List[str]) -> bool:
+    if not keywords:
+        return True
+    lb = (label or "").casefold()
+    return any(kw.casefold() in lb for kw in keywords)
+
+
 def _group_per_series_points_from_payload(
     payload: Dict[str, Any],
 ) -> List[Tuple[str, List[Tuple[float, float]]]]:
@@ -6048,12 +6121,12 @@ def _http_drop_spike_analysis(
 
 def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    LiveSlots Online Number: per-series when ``MONITORING_PER_SERIES_ANALYSIS``; fast **drop** only
-    (``MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT``); fast spike threshold ``inf`` (no spike-by-window alert).
+    LiveSlots Online Number: per-series when ``MONITORING_PER_SERIES_ANALYSIS``;
+    fast drop ``MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT`` / spike ``MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT``.
     """
-    cont = MONITORING_GAME_ALERT_CONTINUOUS_PCT
+    cont = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
     fd = MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT
-    fs_fast = float("inf")
+    fs_fast = MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT
 
     def _one_series(pts_in: List[Tuple[float, float]], *, label: Optional[str] = None) -> Dict[str, Any]:
         pts2 = _snap_series_to_monitoring_minutes(pts_in, how="max")
@@ -6114,14 +6187,16 @@ def _http_analysis_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _analysis_for_egame_online_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Egame Online Number — same rules as other keyword panels (per-series when configured)."""
+    """Egame Online Number — every series; fast drop/spike 25% (defaults)."""
     return _analysis_for_keyword_payload(
         payload,
         MONITORING_EGAME_ONLINE_SERIES_KEYWORD,
-        MONITORING_EGAME_FAST_ALERT_PCT,
-        MONITORING_GAME_ALERT_CONTINUOUS_PCT,
+        MONITORING_EGAME_FAST_DROP_ALERT_PCT,
+        MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
         snap_how="max",
         apply_baseline_filter=False,
+        fast_drop_threshold_pct=MONITORING_EGAME_FAST_DROP_ALERT_PCT,
+        fast_spike_threshold_pct=MONITORING_EGAME_FAST_SPIKE_ALERT_PCT,
     )
 
 
@@ -6157,9 +6232,11 @@ def _analysis_for_keyword_payload(
     apply_baseline_filter: bool = True,
     fast_drop_threshold_pct: Optional[float] = None,
     fast_spike_threshold_pct: Optional[float] = None,
+    series_include_keywords: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     kw = (keyword or "").strip()
     use_per_series = bool(MONITORING_PER_SERIES_ANALYSIS) and not kw
+    include_kws = list(series_include_keywords or [])
 
     def _points_through_pipeline(
         pts_in: List[Tuple[float, float]],
@@ -6196,6 +6273,12 @@ def _analysis_for_keyword_payload(
 
     if use_per_series:
         grouped = _group_per_series_points_from_payload(payload)
+        if include_kws:
+            grouped = [
+                (lbl, pts)
+                for lbl, pts in grouped
+                if _series_label_matches_keywords(lbl, include_kws)
+            ]
         if not grouped:
             sample_labels: List[str] = []
             for s in payload.get("series") or []:
@@ -6286,11 +6369,31 @@ def _analysis_for_keyword_payload(
 
 
 def _analysis_for_egames_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    include_raw = MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD
+    include_kws = _parse_monitoring_series_keywords(include_raw)
     return _analysis_for_keyword_payload(
         payload,
-        MONITORING_EGAMES_BET_SERIES_KEYWORD,
-        MONITORING_EGAMES_BET_FAST_ALERT_PCT,
-        MONITORING_GAME_ALERT_CONTINUOUS_PCT,
+        "",
+        MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT,
+        MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+        snap_how="sum",
+        apply_baseline_filter=True,
+        fast_drop_threshold_pct=MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT,
+        fast_spike_threshold_pct=MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT,
+        series_include_keywords=include_kws or None,
+    )
+
+
+def _analysis_for_liveslot_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _analysis_for_keyword_payload(
+        payload,
+        "",
+        MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT,
+        MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+        snap_how="sum",
+        apply_baseline_filter=True,
+        fast_drop_threshold_pct=MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT,
+        fast_spike_threshold_pct=MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT,
     )
 
 
@@ -6582,7 +6685,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             "",
             a_http,
             MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT,
-            MONITORING_GAME_ALERT_CONTINUOUS_PCT,
+            MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
             MONITORING_ALERT_WINDOW_SECONDS,
         ):
             reason_blocks.append(chunk)
@@ -6591,7 +6694,11 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             continue
         kind = (ex.get("kind") or "")
         logical = _extra_panel_logical_kind(kind)
-        if logical not in (MONITORING_EXTRA_KIND_EGAME_ONLINE, MONITORING_EXTRA_KIND_EGAMES_BET):
+        if logical not in (
+            MONITORING_EXTRA_KIND_EGAME_ONLINE,
+            MONITORING_EXTRA_KIND_EGAMES_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_BET,
+        ):
             continue
         if _monitoring_extra_channel_muted(kind):
             continue
@@ -6600,14 +6707,20 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             g_lbl = GRAFANA_PANEL_TITLE_EGAME_ONLINE
             s_lbl = MONITORING_EGAME_ONLINE_SERIES_KEYWORD
             a2 = _analysis_for_egame_online_payload(p2)
-            fast2 = MONITORING_EGAME_FAST_ALERT_PCT
-            cont2 = MONITORING_GAME_ALERT_CONTINUOUS_PCT
-        else:
+            fast2 = MONITORING_EGAME_FAST_DROP_ALERT_PCT
+            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+        elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
             g_lbl = GRAFANA_PANEL_TITLE_EGAMES_BET
-            s_lbl = MONITORING_EGAMES_BET_SERIES_KEYWORD
+            s_lbl = MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD
             a2 = _analysis_for_egames_bet_payload(p2)
-            fast2 = MONITORING_EGAMES_BET_FAST_ALERT_PCT
-            cont2 = MONITORING_GAME_ALERT_CONTINUOUS_PCT
+            fast2 = MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT
+            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+        else:
+            g_lbl = GRAFANA_PANEL_TITLE_LIVESLOT_BET
+            s_lbl = ""
+            a2 = _analysis_for_liveslot_bet_payload(p2)
+            fast2 = MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT
+            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
         for chunk in _format_alert_reason_chunks_for_analysis(
             g_lbl,
             s_lbl,
@@ -6638,7 +6751,11 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             continue
         k = (ex.get("kind") or "")
         logical = _extra_panel_logical_kind(k)
-        if logical not in (MONITORING_EXTRA_KIND_EGAME_ONLINE, MONITORING_EXTRA_KIND_EGAMES_BET):
+        if logical not in (
+            MONITORING_EXTRA_KIND_EGAME_ONLINE,
+            MONITORING_EXTRA_KIND_EGAMES_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_BET,
+        ):
             continue
         if _monitoring_extra_channel_muted(k):
             continue
@@ -6649,6 +6766,10 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             return True
         if logical == MONITORING_EXTRA_KIND_EGAMES_BET and _analysis_aggregate_hit_alert(
             _analysis_for_egames_bet_payload(p2)
+        ):
+            return True
+        if logical == MONITORING_EXTRA_KIND_LIVESLOT_BET and _analysis_aggregate_hit_alert(
+            _analysis_for_liveslot_bet_payload(p2)
         ):
             return True
     return False
@@ -6785,8 +6906,14 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
         elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
             append_analyzed_panel(
                 GRAFANA_PANEL_TITLE_EGAMES_BET,
-                MONITORING_EGAMES_BET_SERIES_KEYWORD,
+                MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD,
                 _analysis_for_egames_bet_payload(p2),
+            )
+        elif logical == MONITORING_EXTRA_KIND_LIVESLOT_BET:
+            append_analyzed_panel(
+                GRAFANA_PANEL_TITLE_LIVESLOT_BET,
+                "",
+                _analysis_for_liveslot_bet_payload(p2),
             )
 
     if include_target_mention and _monitoring_payload_hit_alert(payload):
