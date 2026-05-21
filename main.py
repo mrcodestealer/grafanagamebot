@@ -208,6 +208,13 @@ _CFG: Dict[str, Any] = {
     # Liveslot 下注 / Liveslots-Spin-Bet：仅窗口内急跌（fast drop）≥50%；不告警上涨 spike、不告警 continuous
     "MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT": 50,
     "MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT": "inf",
+    # 只分析 Grafana 图例「total spins across all machines」；勿对全面板逐序列判警（易误报）
+    "MONITORING_LIVESLOT_BET_SERIES_INCLUDE": "total spins",
+    # 关闭 baseline 滤低点：滤掉中间低桶会把曲线接成假急跌
+    "MONITORING_LIVESLOT_BET_BASELINE_FILTER": "0",
+    # 急跌两端须 ≥ median×ratio 且绝对跌幅 ≥ MIN_ABS_DROP，否则视为误报
+    "MONITORING_LIVESLOT_BET_DROP_ENDPOINT_MIN_MEDIAN_RATIO": "0.35",
+    "MONITORING_LIVESLOT_BET_MIN_ABS_DROP": "500",
     "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT": 25,
     "MONITORING_LIVESLOTS_FAST_SPIKE_ALERT_PCT": 50,
     "MONITORING_GAME_ALERT_CONTINUOUS_PCT": 30,
@@ -610,6 +617,19 @@ MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT = _cfg_float(
 )
 MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT = _cfg_float(
     "MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT", float("inf")
+)
+MONITORING_LIVESLOT_BET_SERIES_INCLUDE = _cfg_str(
+    "MONITORING_LIVESLOT_BET_SERIES_INCLUDE", "total spins"
+)
+MONITORING_LIVESLOT_BET_BASELINE_FILTER = _lark_env_truthy_or_default(
+    "MONITORING_LIVESLOT_BET_BASELINE_FILTER", default=False
+)
+MONITORING_LIVESLOT_BET_DROP_ENDPOINT_MIN_MEDIAN_RATIO = max(
+    0.05,
+    min(1.0, _cfg_float("MONITORING_LIVESLOT_BET_DROP_ENDPOINT_MIN_MEDIAN_RATIO", 0.35)),
+)
+MONITORING_LIVESLOT_BET_MIN_ABS_DROP = max(
+    0.0, _cfg_float("MONITORING_LIVESLOT_BET_MIN_ABS_DROP", 500.0)
 )
 MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT = _cfg_float(
     "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 25.0
@@ -6612,18 +6632,112 @@ def _analysis_for_egames_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _merge_liveslot_bet_primary_series(payload: Dict[str, Any]) -> Tuple[List[Tuple[float, float]], str]:
+    """
+    One merged series for Liveslot 下注 — matches Grafana's aggregate line, not every hidden target.
+    """
+    include_raw = (MONITORING_LIVESLOT_BET_SERIES_INCLUDE or "").strip()
+    include_kws = _parse_monitoring_series_keywords(include_raw)
+    if include_kws:
+        grouped = [
+            (lbl, pts)
+            for lbl, pts in _group_per_series_points_from_payload(payload)
+            if _series_label_matches_keywords(lbl, include_kws)
+        ]
+        if len(grouped) == 1:
+            return grouped[0][1], grouped[0][0]
+        if len(grouped) > 1:
+            merged = _merge_result_rows_max_per_ts([pts for _, pts in grouped])
+            return merged, " | ".join(lbl for lbl, _ in grouped)
+    grouped_all = _group_per_series_points_from_payload(payload)
+    if not grouped_all:
+        pts = _merge_series_points_by_keyword(payload, include_raw or "total spins")
+        return pts, include_raw or "total spins"
+    best_lbl, best_pts = max(
+        grouped_all,
+        key=lambda item: (_median_positive_abs([v for _, v in item[1]]), len(item[1])),
+    )
+    return best_pts, best_lbl
+
+
+def _liveslot_bet_suppress_false_drop_alerts(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Drop false positives from baseline filtering, low-volume series, and scrape gaps.
+    Keeps only fast window DROP when both endpoints sit near the series' typical level.
+    """
+    pts_raw = analysis.get("merged_points") or []
+    vals_pos = [
+        float(p[1])
+        for p in pts_raw
+        if isinstance(p, (list, tuple)) and len(p) >= 2 and float(p[1]) > 0.0
+    ]
+    if len(vals_pos) < 4:
+        if analysis.get("hit_alert"):
+            analysis["hit_alert"] = False
+            analysis["false_alert_suppressed"] = "insufficient_points"
+        return analysis
+
+    med = _median_positive_abs(vals_pos)
+    min_ep = max(
+        MONITORING_LIVESLOT_BET_MIN_ABS_DROP * 0.05,
+        med * MONITORING_LIVESLOT_BET_DROP_ENDPOINT_MIN_MEDIAN_RATIO,
+    )
+    fd_thr = float(
+        analysis.get("fast_drop_threshold_pct") or MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT
+    )
+    wd = analysis.get("window_max_drop")
+    if not isinstance(wd, dict):
+        if analysis.get("hit_alert"):
+            analysis["hit_alert"] = False
+            analysis["false_alert_suppressed"] = "no_window_drop"
+        return analysis
+
+    pct = float(wd.get("pct") or 0.0)
+    fv = float(wd.get("from_val") or 0.0)
+    tv = float(wd.get("to_val") or 0.0)
+    if pct < fd_thr:
+        analysis["hit_alert"] = False
+        return analysis
+
+    abs_drop = fv - tv
+    if fv < min_ep or tv < min_ep or abs_drop < MONITORING_LIVESLOT_BET_MIN_ABS_DROP:
+        analysis["hit_alert"] = False
+        analysis["false_alert_suppressed"] = "drop_endpoints_or_magnitude"
+        logger.info(
+            "liveslot_bet: suppress false drop pct=%.1f from=%s to=%s median=%.0f min_ep=%.0f min_abs=%.0f",
+            pct,
+            fv,
+            tv,
+            med,
+            min_ep,
+            MONITORING_LIVESLOT_BET_MIN_ABS_DROP,
+        )
+    return analysis
+
+
 def _analysis_for_liveslot_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Liveslot 下注 / Liveslots-Spin-Bet: alert only on fast DROP (default ≥50% in ``MONITORING_ALERT_WINDOW_SECONDS``)."""
-    return _analysis_for_keyword_payload(
-        payload,
-        "",
+    """
+    Liveslot 下注 / Liveslots-Spin-Bet: single aggregate series, fast DROP only (default ≥50% / ~3m).
+    Avoids per-series + baseline-filter false alerts.
+    """
+    pts_in, series_lbl = _merge_liveslot_bet_primary_series(payload)
+    pts_work = list(pts_in)
+    if MONITORING_LIVESLOT_BET_BASELINE_FILTER:
+        pts_work = _filter_low_outlier_points(pts_work, ratio_to_median=0.28)
+    pts_work = _snap_series_to_monitoring_minutes(pts_work, how="max")
+    pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
+    a = _http_drop_spike_analysis(
+        pts_work,
         MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT,
         MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
-        snap_how="sum",
-        apply_baseline_filter=True,
+        MONITORING_ALERT_WINDOW_SECONDS,
         fast_drop_threshold_pct=MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT,
         fast_spike_threshold_pct=MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT,
     )
+    a["point_count"] = len(pts_work)
+    a["merged_points"] = [[t, v] for t, v in pts_work]
+    a["series_label"] = series_lbl
+    return _liveslot_bet_suppress_false_drop_alerts(a)
 
 
 def _analysis_for_provider_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
