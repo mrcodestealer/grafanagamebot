@@ -48,7 +48,9 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
     "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
-    "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslots-Spin-Bet",
+    # 与浏览器面板标题一致（HTML: Liveslot 下注Bet/min）；API 模型里可能仍是 Liveslots-Spin-Bet，见 _find_panel 别名
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslot 下注Bet/min",
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET_ALIASES": "Liveslot 下注Bet/min Liveslots-Spin-Bet",
     "MONITORING_EGAME_ONLINE_SERIES_KEYWORD": "",
     "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
     # 逗号/空格分隔；仅分析图例名包含下列子串的序列（空=该面板全部序列）
@@ -444,7 +446,20 @@ GRAFANA_PANEL_TITLE_EGAMES_BET = _cfg_str(
     "GRAFANA_PANEL_TITLE_EGAMES_BET", "Egames 下注Bet/min"
 )
 GRAFANA_PANEL_TITLE_LIVESLOT_BET = _cfg_str(
-    "GRAFANA_PANEL_TITLE_LIVESLOT_BET", "Liveslots-Spin-Bet"
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET", "Liveslot 下注Bet/min"
+)
+_LIVESLOT_BET_PANEL_TITLES: Tuple[str, ...] = tuple(
+    dict.fromkeys(
+        t.strip()
+        for t in re.split(
+            r"[\s,;|]+",
+            _cfg_str(
+                "GRAFANA_PANEL_TITLE_LIVESLOT_BET_ALIASES",
+                "Liveslot 下注Bet/min Liveslots-Spin-Bet",
+            ).strip(),
+        )
+        if t.strip()
+    )
 )
 # ``extraPanels[*].kind`` — /m 静音通道 id；须与 ``fetch_monitoring_payload`` 写入一致
 MONITORING_EXTRA_KIND_EGAME_ONLINE = "egame_online"
@@ -3002,21 +3017,40 @@ def _find_panel(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any
     if not want:
         return None
     panels = list(_walk_panels(dashboard.get("panels")))
-    for p in panels:
-        if (p.get("title") or "").strip() == want:
-            return p
-    want_cf = want.casefold()
-    for p in panels:
-        if (p.get("title") or "").strip().casefold() == want_cf:
-            return p
-    # Legacy config titles that no longer match Grafana UI (e.g. Liveslot 下注Bet/min → Liveslots-Spin-Bet).
-    if "liveslot" in want_cf and "bet" in want_cf:
+    titles_to_try: List[str] = [want]
+    liveslot_alias_cf = {t.casefold() for t in _LIVESLOT_BET_PANEL_TITLES}
+    if want.casefold() in liveslot_alias_cf:
+        for alt in _LIVESLOT_BET_PANEL_TITLES:
+            if alt not in titles_to_try:
+                titles_to_try.append(alt)
+
+    for cand in titles_to_try:
         for p in panels:
-            t = (p.get("title") or "").strip()
-            tl = t.casefold()
-            if "liveslot" in tl and ("bet" in tl or "spin" in tl):
-                logger.info('panel title fallback: requested %r → using %r', want, t)
+            if (p.get("title") or "").strip() == cand:
+                if cand != want:
+                    logger.info('panel matched exact title %r (requested %r)', cand, want)
                 return p
+        want_cf = cand.casefold()
+        for p in panels:
+            if (p.get("title") or "").strip().casefold() == want_cf:
+                if cand != want:
+                    logger.info('panel matched title %r (requested %r)', cand, want)
+                return p
+
+    # Legacy fuzzy: liveslot + bet/spin in title
+    for cand in titles_to_try:
+        want_cf = cand.casefold()
+        if "liveslot" in want_cf and ("bet" in want_cf or "spin" in want_cf):
+            for p in panels:
+                t = (p.get("title") or "").strip()
+                tl = t.casefold()
+                if "liveslot" in tl and ("bet" in tl or "spin" in tl):
+                    logger.info(
+                        'panel title fallback: requested %r → using %r',
+                        cand,
+                        t,
+                    )
+                    return p
     return None
 
 
