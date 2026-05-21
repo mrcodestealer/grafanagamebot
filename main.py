@@ -143,6 +143,10 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER": "1",
     # 0=禁用「非空弱 mentions + 正文 @_user_N」/mo（与 Platform 同群时必须 **0**，否则会 @ Platform 仍落到 Game）
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
+    # 1=日志打印 primary @ / mentions / explicit_ids 解析（排查 @ 错 Platform）
+    "MONITORING_LOG_PRIMARY_AT": "1",
+    # 1=/mo 被 @ 门控拒绝时给用户发一句英文说明（避免静默忽略）
+    "MONITORING_AT_GATE_USER_FEEDBACK": "1",
     # 1=sole mention 的 open_id 落在 peer，但正文仅有 @_user_N、无 <at user_id>，且 mention.name 命中 SUBSTRINGS 时把 primary 纠正为本 bot（默认关；子串要独特）
     "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK": "0",
     "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS": "",
@@ -788,6 +792,8 @@ MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
 MONITORING_LOG_PRIMARY_AT = _lark_env_truthy("MONITORING_LOG_PRIMARY_AT")
+MONITORING_AT_GATE_USER_FEEDBACK = _lark_env_truthy("MONITORING_AT_GATE_USER_FEEDBACK")
+_monitoring_at_gate_tls = threading.local()
 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER",
     default=True,
@@ -2009,6 +2015,74 @@ def _lark_ordered_strong_open_ids_from_mentions_rows(mentions_list: List[Any]) -
     return out
 
 
+def _monitoring_at_gate_reason_set(msg: str) -> None:
+    _monitoring_at_gate_tls.reason = (msg or "").strip()
+
+
+def _monitoring_at_gate_reason_take() -> str:
+    r = getattr(_monitoring_at_gate_tls, "reason", "") or ""
+    _monitoring_at_gate_tls.reason = ""
+    return r
+
+
+def _monitoring_at_gate_reason_clear() -> None:
+    _monitoring_at_gate_tls.reason = ""
+
+
+def _monitoring_send_at_gate_feedback_worker(
+    chat_id: str, open_id: str, text: str, debounce_key: str
+) -> None:
+    try:
+        if (chat_id or "").strip():
+            _lark_send_text("chat_id", chat_id.strip(), text)
+        elif (open_id or "").strip():
+            _lark_send_text("open_id", open_id.strip(), text)
+    except Exception:
+        logger.exception("at-gate user feedback send failed")
+    finally:
+        if debounce_key:
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _monitoring_maybe_send_at_gate_feedback(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    raw_text: str,
+    chat_type: str,
+) -> None:
+    """When /mo was seen but @ gate rejected, tell the user why (not silent ignore)."""
+    if not MONITORING_AT_GATE_USER_FEEDBACK:
+        return
+    if not _text_has_monitoring_trigger(raw_text, clean):
+        return
+    reason = _monitoring_at_gate_reason_take()
+    if not reason:
+        ct = (chat_type or "").strip().lower()
+        if ct in ("group", "topic") and MONITORING_TRIGGER_REQUIRES_AT_BOT:
+            reason = (
+                "In group chats, @ **Grafana Game Bot** (not Platform Bot) then /mo. "
+                "Bare /mo without @ only works in private (PM) chat."
+            )
+        else:
+            reason = "Could not confirm this /mo was addressed to Grafana Game Bot."
+    tri = (MONITORING_TRIGGER or "/mo").strip()
+    text = f"{tri} skipped: {reason}"
+    debounce_key = f"{(chat_id or '').strip() or ('open:' + (open_id or '').strip())}\n__at_gate_fb__"
+    with _monitoring_reply_dispatch_lock:
+        if debounce_key in _monitoring_inflight_keys:
+            return
+        _monitoring_inflight_keys.add(debounce_key)
+    threading.Thread(
+        target=_monitoring_send_at_gate_feedback_worker,
+        args=(chat_id, open_id, text, debounce_key),
+        daemon=True,
+        name="at-gate-feedback",
+    ).start()
+
+
 def _monitoring_group_multi_bot_first_mention_gate(
     *,
     chat_type: str,
@@ -2046,6 +2120,9 @@ def _monitoring_group_multi_bot_first_mention_gate(
                 "monitoring: skip (group multi-bot) — primary %r is another bot / not canonical",
                 primary,
             )
+            _monitoring_at_gate_reason_set(
+                "Primary @ is not Game Bot in a group with two bots — @ Grafana Game Bot, then /mo."
+            )
         return ok
     first = bots_in_order[0]
     if first not in canon_ids:
@@ -2054,6 +2131,9 @@ def _monitoring_group_multi_bot_first_mention_gate(
             "order=%s (set MONITORING_PEER_BOT_OPEN_IDS on both bots)",
             first,
             bots_in_order,
+        )
+        _monitoring_at_gate_reason_set(
+            "Platform Bot is listed first in Feishu mentions — @ Grafana Game Bot **before** typing /mo."
         )
         return False
     return True
@@ -2341,6 +2421,7 @@ def _monitoring_at_bot_requirement_satisfied(
     When Lark delivers one payload to multiple apps, ``mentions[]`` may list **both** bots; we resolve the
     **primary** @ target from body ``<at>`` order (then mentions order) so only the addressed bot replies.
     """
+    _monitoring_at_gate_reason_clear()
     ct = (chat_type or "").strip().lower()
     if ct in ("p2p", "private"):
         logger.info("monitoring: @ gate bypass — %s chat (PM has no @ target)", ct or "p2p")
@@ -2366,6 +2447,19 @@ def _monitoring_at_bot_requirement_satisfied(
     if post_at_ordered:
         # Mobile post: trust document-order @ in body over mentions[] order (often lists both bots).
         primary = post_at_ordered[0]
+
+    app_dbg = str(APP_ID or "").strip()
+    if MONITORING_LOG_PRIMARY_AT:
+        logger.info(
+            "monitoring @-gate dbg chat_type=%r primary=%r explicit_ids=%s canon=%s "
+            "mentions_n=%s row_app_id_is_self=%s",
+            ct or None,
+            primary,
+            sorted(explicit_ids) if explicit_ids else [],
+            sorted(canon_ids) if canon_ids else [],
+            len(mentions_list),
+            bool(app_dbg and _lark_mentions_any_row_matches_app(mentions_list, app_dbg)),
+        )
 
     # Plain ``@_user_N`` text often has no ``<at user_id=…>``; Feishu may put the peer ``open_id`` on the sole
     # mention row while ``name`` still matches the bot the user picked — optional substring match (off by default).
@@ -2420,6 +2514,9 @@ def _monitoring_at_bot_requirement_satisfied(
             "monitoring: skip — body/post @ ids %s are peer-only (no canonical id in body for this app)",
             sorted(strong_body),
         )
+        _monitoring_at_gate_reason_set(
+            "Message body @ targets Platform bot only — pick Grafana Game Bot in the @ picker, then /mo."
+        )
         return False
 
     if canon_ids and primary and primary not in canon_ids:
@@ -2437,11 +2534,17 @@ def _monitoring_at_bot_requirement_satisfied(
                 primary,
                 sorted(canon_ids),
             )
+            _monitoring_at_gate_reason_set(
+                "Primary @ resolved to Grafana Platform Bot — @ **Grafana Game Bot** in the picker, then /mo."
+            )
         else:
             logger.info(
                 "monitoring: skip — primary @ target %r is not this bot (canonical=%s)",
                 primary,
                 sorted(canon_ids),
+            )
+            _monitoring_at_gate_reason_set(
+                f"Primary @ target is not Grafana Game Bot (got {primary!r}). @ Game Bot then /mo."
             )
         if not row_app_id_is_self:
             return False
@@ -2474,6 +2577,9 @@ def _monitoring_at_bot_requirement_satisfied(
                         "monitoring /mo: skip — multiple bot ids in explicit set %s without body primary @",
                         sorted(bot_like),
                     )
+                    _monitoring_at_gate_reason_set(
+                        "Both bots appear in @ metadata — @ Grafana Game Bot first, then /mo."
+                    )
                     return False
                 if strong_x & canon_ids:
                     logger.info(
@@ -2495,11 +2601,17 @@ def _monitoring_at_bot_requirement_satisfied(
                         "monitoring /mo: skip — explicit @ targets %s peer-only and body <at> confirms peer",
                         sorted(explicit_ids),
                     )
+                    _monitoring_at_gate_reason_set(
+                        "You @'d Platform Bot (body <at> confirms). @ Grafana Game Bot, then /mo."
+                    )
                     return False
                 logger.info(
                     "monitoring /mo: skip — explicit meta peer-only %s and body lacks "
                     "peer <at> confirmation; treating as peer-addressed (MONITORING_PEER_BOT_OPEN_IDS).",
                     sorted(explicit_ids),
+                )
+                _monitoring_at_gate_reason_set(
+                    "Feishu @ metadata points to Platform Bot — pick Grafana Game Bot in the @ list, then /mo."
                 )
                 return False
             else:
@@ -2509,6 +2621,7 @@ def _monitoring_at_bot_requirement_satisfied(
                     sorted(explicit_ids),
                     sorted(canon_ids),
                 )
+                _monitoring_at_gate_reason_set("This @ target is not Grafana Game Bot.")
                 return False
 
     distinct_bot_like = _lark_distinct_strong_bot_like_ids_in_mentions(
@@ -2520,6 +2633,9 @@ def _monitoring_at_bot_requirement_satisfied(
         logger.info(
             "monitoring /mo: skip — mentions encode multiple bots %s with no resolvable primary @",
             sorted(distinct_bot_like),
+        )
+        _monitoring_at_gate_reason_set(
+            "Both Game and Platform bots in mentions — @ Grafana Game Bot first, then /mo."
         )
         return False
 
@@ -2540,6 +2656,9 @@ def _monitoring_at_bot_requirement_satisfied(
             logger.info(
                 "monitoring /mo: skip — mentions include this bot but primary @ %r is not canonical",
                 primary,
+            )
+            _monitoring_at_gate_reason_set(
+                f"Mention maps to wrong bot (primary={primary!r}). @ Grafana Game Bot, then /mo."
             )
             return False
         return True
@@ -2578,6 +2697,9 @@ def _monitoring_at_bot_requirement_satisfied(
                     "monitoring /mo: skip — content <at> targets MONITORING_PEER_BOT_OPEN_IDS "
                     "(weak-nonempty path disabled for peer @)"
                 )
+                _monitoring_at_gate_reason_set(
+                    "Body @ points to Platform Bot. @ Grafana Game Bot (not Platform), then /mo."
+                )
             else:
                 logger.info(
                     "monitoring /mo: allowed via Feishu @_user_N + weak/non-conflicting mentions "
@@ -2585,6 +2707,10 @@ def _monitoring_at_bot_requirement_satisfied(
                     MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER,
                 )
                 return True
+        _monitoring_at_gate_reason_set(
+            "Ambiguous @ in a shared group — @ Grafana Game Bot explicitly, then /mo "
+            "(not Platform Bot)."
+        )
         return False
     if (
         (not mentions_list)
@@ -2597,6 +2723,9 @@ def _monitoring_at_bot_requirement_satisfied(
             "refuse @_user_N placeholder-only (wrong bot in same group)",
             sorted(explicit_ids),
         )
+        _monitoring_at_gate_reason_set(
+            "@ metadata does not match Game Bot — use the @ picker and choose Grafana Game Bot."
+        )
         return False
     if MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER and body_ph:
         logger.info(
@@ -2604,6 +2733,9 @@ def _monitoring_at_bot_requirement_satisfied(
             "(mentions list empty; MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER=1)"
         )
         return True
+    _monitoring_at_gate_reason_set(
+        "In group chats, @ Grafana Game Bot then /mo. Bare /mo without @ only works in private (PM) chat."
+    )
     return False
 
 
@@ -7826,6 +7958,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             bool((_lark_effective_bot_open_id() or "").strip()),
             mute_like,
         )
+        if _text_has_monitoring_trigger(raw_text, clean):
+            _monitoring_maybe_send_at_gate_feedback(
+                chat_id=chat_id,
+                open_id=open_id,
+                clean=clean,
+                raw_text=raw_text,
+                chat_type=im_chat_type,
+            )
         return
 
     body_key = _monitoring_dispatch_body_key(clean, raw_text, mentions)
