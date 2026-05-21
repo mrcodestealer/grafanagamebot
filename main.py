@@ -79,8 +79,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_FULL_PAGE": "1",
     # 截图前点 Grafana「Dock menu」收起左侧导航（Grafana 12 mega-menu）；0=跳过
     "GRAFANA_SCREENSHOT_DOCK_NAV": "1",
-    # kiosk=tv 去掉顶栏、DOM 更简单；若无头截图主区空白可改回 ""
-    "GRAFANA_SCREENSHOT_KIOSK": "tv",
+    # 空=与浏览器一致（保留顶栏、时间选择器、Refresh 1m）；tv=全屏 kiosk（与网站截图外观不同）
+    "GRAFANA_SCREENSHOT_KIOSK": "",
+    # 写入截图 URL 的 refresh=…（与 Grafana 右上角一致）；空=不写
+    "GRAFANA_SCREENSHOT_URL_REFRESH": "1m",
     # 截图前先打开站点根路径再进 dashboard，利于 session 与 SPA bootstrap
     "GRAFANA_SCREENSHOT_BOOT_WARM": "1",
     # 0=不点 Refresh（page.goto(dashboard) 已带时间范围，避免找不到按钮时 page.reload 二次全页加载）
@@ -109,12 +111,12 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_MS": "0",
     # 1=快门前再跑一轮整页滚动刷 canvas（更慢但更稳）
     "GRAFANA_SCREENSHOT_PRE_CAPTURE_RESCROLL": "0",
-    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 2000,
+    "GRAFANA_SCREENSHOT_POPULATE_MAX_MS": 12000,
     # 整页截图稳定：默认 1 轮即可；仍无法保证 Prometheus「No data」有曲线
     "GRAFANA_SCREENSHOT_STABILIZE_ROUNDS": 1,
     "GRAFANA_SCREENSHOT_SCROLL_PAUSE_MS": 70,
     "GRAFANA_SCREENSHOT_SETTLE_MS": 0,
-    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 2000,
+    "GRAFANA_SCREENSHOT_SPINNER_MAX_MS": 10000,
     # 至少等到 N 个 .react-grid-item（0=不等待；经典大屏可设 4–8；Scenes 布局可能为 0）
     "GRAFANA_SCREENSHOT_MIN_GRID_ITEMS": 0,
     # 截图前“全面板加载”门槛：已加载面板占比（含图或明确 No data）
@@ -122,7 +124,7 @@ _CFG: Dict[str, Any] = {
     # 截图前“全面板加载”最少面板数（防小屏/过滤时占比误判）
     "GRAFANA_SCREENSHOT_PANEL_READY_MIN": 7,
     # 全面板加载等待预算（毫秒）；仅当能数到面板头时跑满；Scenes 见下一项
-    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 7500,
+    "GRAFANA_SCREENSHOT_PANEL_READY_MAX_MS": 20000,
     # Scenes 布局 panel roots=0 时额外等待上限（毫秒）
     "GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS": 400,
     # Set via environment (systemd Environment=) — do not commit real secrets.
@@ -546,6 +548,7 @@ GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS = max(
     min(60_000, _cfg_int("GRAFANA_SCREENSHOT_PANEL_READY_ZERO_TOTAL_MAX_MS", 1400)),
 )
 GRAFANA_SCREENSHOT_KIOSK = _cfg_str("GRAFANA_SCREENSHOT_KIOSK", "").strip()
+GRAFANA_SCREENSHOT_URL_REFRESH = _cfg_str("GRAFANA_SCREENSHOT_URL_REFRESH", "1m").strip()
 GRAFANA_SCREENSHOT_RELATIVE_RANGE = _lark_env_truthy("GRAFANA_SCREENSHOT_RELATIVE_RANGE")
 # Screenshot URL ``timezone=`` (e.g. browser); none / - / off → omit parameter
 GRAFANA_SCREENSHOT_TIMEZONE = _cfg_str("GRAFANA_SCREENSHOT_TIMEZONE", "browser").strip()
@@ -5171,6 +5174,9 @@ def _grafana_build_screenshot_dashboard_url(
         tz = ""
     if tz:
         params.append(("timezone", tz))
+    url_refresh = _cfg_str("GRAFANA_SCREENSHOT_URL_REFRESH", "1m").strip()
+    if url_refresh.lower() not in ("none", "-", "off", "0", "false", "no", ""):
+        params.append(("refresh", url_refresh))
     k = (GRAFANA_SCREENSHOT_KIOSK or "").strip().lower()
     if k and k not in ("0", "false", "no", "off"):
         if k in ("1", "true", "yes", "on"):
