@@ -48,7 +48,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
     "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
-    "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslot 下注Bet/min",
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslots-Spin-Bet",
     "MONITORING_EGAME_ONLINE_SERIES_KEYWORD": "",
     "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
     # 逗号/空格分隔；仅分析图例名包含下列子串的序列（空=该面板全部序列）
@@ -435,7 +435,7 @@ GRAFANA_PANEL_TITLE_EGAMES_BET = _cfg_str(
     "GRAFANA_PANEL_TITLE_EGAMES_BET", "Egames 下注Bet/min"
 )
 GRAFANA_PANEL_TITLE_LIVESLOT_BET = _cfg_str(
-    "GRAFANA_PANEL_TITLE_LIVESLOT_BET", "Liveslot 下注Bet/min"
+    "GRAFANA_PANEL_TITLE_LIVESLOT_BET", "Liveslots-Spin-Bet"
 )
 # ``extraPanels[*].kind`` — /m 静音通道 id；须与 ``fetch_monitoring_payload`` 写入一致
 MONITORING_EXTRA_KIND_EGAME_ONLINE = "egame_online"
@@ -2834,9 +2834,25 @@ def _datasource_uid(ds: Any) -> Optional[str]:
 
 
 def _find_panel(dashboard: Dict[str, Any], title: str) -> Optional[Dict[str, Any]]:
-    for p in _walk_panels(dashboard.get("panels")):
-        if (p.get("title") or "").strip() == title.strip():
+    want = (title or "").strip()
+    if not want:
+        return None
+    panels = list(_walk_panels(dashboard.get("panels")))
+    for p in panels:
+        if (p.get("title") or "").strip() == want:
             return p
+    want_cf = want.casefold()
+    for p in panels:
+        if (p.get("title") or "").strip().casefold() == want_cf:
+            return p
+    # Legacy config titles that no longer match Grafana UI (e.g. Liveslot 下注Bet/min → Liveslots-Spin-Bet).
+    if "liveslot" in want_cf and "bet" in want_cf:
+        for p in panels:
+            t = (p.get("title") or "").strip()
+            tl = t.casefold()
+            if "liveslot" in tl and ("bet" in tl or "spin" in tl):
+                logger.info('panel title fallback: requested %r → using %r', want, t)
+                return p
     return None
 
 
@@ -3150,7 +3166,17 @@ def _fetch_panel_series_by_title(
     dash = _fetch_dashboard_model(sess, GRAFANA_DASHBOARD_UID)
     panel = _find_panel(dash, panel_title)
     if not panel:
-        raise ValueError(f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}')
+        known = sorted(
+            {
+                (p.get("title") or "").strip()
+                for p in _walk_panels(dash.get("panels"))
+                if (p.get("title") or "").strip()
+            }
+        )
+        raise ValueError(
+            f'Panel titled "{panel_title}" not found on dashboard {GRAFANA_DASHBOARD_UID}. '
+            f"Known titles: {known!r}"
+        )
 
     q_panel = _panel_query_model(sess, panel)
     panel_ds = _datasource_uid(q_panel.get("datasource")) or _datasource_uid(panel.get("datasource"))
@@ -3342,7 +3368,7 @@ def fetch_monitoring_payload(
         )
         extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_BET, "payload": p_ls})
     except Exception:
-        logger.exception("fetch Liveslot 下注Bet/min panel failed (optional monitor)")
+        logger.exception("fetch %s panel failed (optional monitor)", GRAFANA_PANEL_TITLE_LIVESLOT_BET)
     if extra:
         primary["extraPanels"] = extra
     return primary
