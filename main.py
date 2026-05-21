@@ -205,6 +205,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_EGAME_FAST_SPIKE_ALERT_PCT": 25,
     "MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT": 25,
     "MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT": 25,
+    # 0=临时关闭 Liveslot 下注监控与告警（/mo 不拉该面板）；恢复时设 1 或 MONITORING_LIVESLOT_BET_ENABLE=1
+    "MONITORING_LIVESLOT_BET_ENABLE": "0",
     # Liveslot 下注 / Liveslots-Spin-Bet：仅窗口内急跌（fast drop）≥50%；不告警上涨 spike、不告警 continuous
     "MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT": 50,
     "MONITORING_LIVESLOT_BET_FAST_SPIKE_ALERT_PCT": "inf",
@@ -503,6 +505,8 @@ def _monitoring_extra_channel_muted(raw_kind: str) -> bool:
             _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY
         )
     if lg == MONITORING_EXTRA_KIND_LIVESLOT_BET:
+        if not MONITORING_LIVESLOT_BET_ENABLE:
+            return True
         return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_LIVESLOT_BET) or _monitoring_alert_channel_muted(
             _MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY
         )
@@ -611,6 +615,9 @@ MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT = _cfg_float(
 )
 MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT = _cfg_float(
     "MONITORING_EGAMES_BET_FAST_SPIKE_ALERT_PCT", MONITORING_EGAMES_BET_FAST_ALERT_PCT
+)
+MONITORING_LIVESLOT_BET_ENABLE = _lark_env_truthy_or_default(
+    "MONITORING_LIVESLOT_BET_ENABLE", default=False
 )
 MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT = _cfg_float(
     "MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT", 50.0
@@ -3578,16 +3585,17 @@ def fetch_monitoring_payload(
         extra.append({"kind": MONITORING_EXTRA_KIND_EGAMES_BET, "payload": p_bet})
     except Exception:
         logger.exception("fetch Egames 下注Bet/min panel failed (optional monitor)")
-    try:
-        p_ls = _fetch_panel_series_by_title(
-            GRAFANA_PANEL_TITLE_LIVESLOT_BET,
-            session=sess,
-            start_unix=w_start,
-            end_unix=w_end,
-        )
-        extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_BET, "payload": p_ls})
-    except Exception:
-        logger.exception("fetch %s panel failed (optional monitor)", GRAFANA_PANEL_TITLE_LIVESLOT_BET)
+    if MONITORING_LIVESLOT_BET_ENABLE:
+        try:
+            p_ls = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_LIVESLOT_BET,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_BET, "payload": p_ls})
+        except Exception:
+            logger.exception("fetch %s panel failed (optional monitor)", GRAFANA_PANEL_TITLE_LIVESLOT_BET)
     if extra:
         primary["extraPanels"] = extra
     return primary
@@ -8867,6 +8875,10 @@ def run_monitoring_bot() -> None:
         )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower()
     mode = raw_mode if raw_mode else "http"
+    if not MONITORING_LIVESLOT_BET_ENABLE:
+        logger.info(
+            "Liveslot 下注Bet/min monitoring disabled (MONITORING_LIVESLOT_BET_ENABLE=0) — no fetch, no alerts"
+        )
     logger.info(
         "IM ingress config: LARK_EVENT_MODE=%s ENABLE_HTTP=%s "
         "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=%s listen=0.0.0.0:%s APP_ID=%s…",
