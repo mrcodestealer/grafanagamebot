@@ -167,8 +167,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_SEND_COALESCE_SECONDS": "12",
     # 同一会话(chat_id/open_id)在 N 秒内只允许一次用户可见发送（兜底拦截同秒双 envelope）；0=关闭
     "MONITORING_CHAT_COALESCE_SECONDS": "0",
-    # 1=且 LARK_EVENT_MODE=ws 时忽略 HTTP webhook 上的 im.message（避免与长连接重复处理）
-    "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
+    # 0=ws+HTTP 并存时也处理 webhook 上的 im.message（推荐；靠 message_id 去重）。1=ws 收到 DATA 后丢弃 HTTP IM（易导致 /mo 无回复）
+    "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "0",
     # 1=当配置 ws 模式但尚未收到任何 WS DATA 帧时，允许 HTTP IM 回退处理（避免 200 但无回复）
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
     # ws 模式：若超过该秒数未在 WS 上收到 im.message，则仍处理 HTTP webhook 上的 IM（避免有 DATA 帧但无 IM → /mo 被吞）
@@ -1025,6 +1025,9 @@ def _monitoring_end_chat_send(chat_key: str, success: bool) -> None:
 
 def _lark_skip_http_im_message_when_ws_mode() -> bool:
     if not _lark_env_truthy("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS"):
+        return False
+    # HTTP sidecar is listening — always accept IM on POST /webhook/event (dedupe prevents double reply).
+    if _cfg_str("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on"):
         return False
     if _cfg_str("LARK_EVENT_MODE", "http").strip().lower() != "ws":
         return False
@@ -8283,7 +8286,29 @@ def start_lark_ws_client_blocking() -> None:
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower() or "http"
+    last_im = float(_lark_ws_last_im_monotonic or 0.0)
+    ws_im_age: Optional[float] = None
+    if last_im > 0:
+        ws_im_age = round(time.monotonic() - last_im, 1)
+    return jsonify(
+        {
+            "ok": True,
+            "pid": os.getpid(),
+            "listen_port": _cfg_listen_port(),
+            "lark_event_mode": mode,
+            "enable_http": _cfg_str("ENABLE_HTTP", "1"),
+            "http_ignore_im_when_ws": _cfg_str("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS", "0"),
+            "app_id_prefix": ((APP_ID or "").strip()[:16] or None),
+            "bot_open_id_known": bool((_lark_effective_bot_open_id() or "").strip()),
+            "ws_saw_data_frame": bool(_lark_ws_saw_data_frame),
+            "ws_last_im_age_sec": ws_im_age,
+            "im_ingress_hint": (
+                "POST /webhook/event must receive im.message when LARK_EVENT_MODE=http, "
+                "or ws must log ws im.message.receive_v1 when LARK_EVENT_MODE=ws."
+            ),
+        }
+    )
 
 
 @app.route("/webhook/event", methods=["GET", "POST", "OPTIONS", "HEAD"], strict_slashes=False)
@@ -8546,6 +8571,21 @@ def run_monitoring_bot() -> None:
         )
     raw_mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower()
     mode = raw_mode if raw_mode else "http"
+    logger.info(
+        "IM ingress config: LARK_EVENT_MODE=%s ENABLE_HTTP=%s "
+        "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS=%s listen=0.0.0.0:%s APP_ID=%s…",
+        mode,
+        _cfg_str("ENABLE_HTTP", "1"),
+        _cfg_str("LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS", "0"),
+        port,
+        ((APP_ID or "").strip()[:16] or "?"),
+    )
+    if mode == "ws":
+        logger.warning(
+            "LARK_EVENT_MODE=ws — Feishu IM normally does **not** POST to /webhook/event; "
+            "you must see 'ws im.message.receive_v1' when users send /mo. "
+            "If you use Request URL in the developer console, set LARK_EVENT_MODE=http in systemd Environment=."
+        )
 
     def run_http() -> None:
         stack = _cfg_str("HTTP_SERVER", "flask").strip().lower()
