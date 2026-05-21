@@ -171,6 +171,8 @@ _CFG: Dict[str, Any] = {
     "LARK_HTTP_IGNORE_IM_WHEN_EVENT_MODE_WS": "1",
     # 1=当配置 ws 模式但尚未收到任何 WS DATA 帧时，允许 HTTP IM 回退处理（避免 200 但无回复）
     "LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA": "1",
+    # ws 模式：若超过该秒数未在 WS 上收到 im.message，则仍处理 HTTP webhook 上的 IM（避免有 DATA 帧但无 IM → /mo 被吞）
+    "LARK_HTTP_IM_WS_FALLBACK_GRACE_SECONDS": "120",
     # 1=监控摘要一条交互卡片（须保持 1 才有下方 MONITORING_MESSAGE_CARD_BUTTON_*「Resend screenshot」）
     "MONITORING_MESSAGE_CARD_ENABLE": "1",
     # /mo 路径：**先**发卡/字再截图（避免 Playwright 卡住导致长时间无回复）；截图单独一条。Watchdog 告警仍可先截再发。
@@ -415,6 +417,7 @@ _lark_open_api_domain_override: Optional[str] = None
 _lark_ws_transport_log_installed: bool = False
 _lark_ws_recv_method_log_installed: bool = False
 _lark_ws_saw_data_frame: bool = False
+_lark_ws_last_im_monotonic: float = 0.0
 # First N inbound protobuf frames logged at INFO (CONTROL vs DATA) without setting LARK_WS_LOG_FRAME_METHOD.
 _LARK_WS_BOOTSTRAP_FRAMES_DEFAULT = 16
 _lark_ws_bootstrap_frames_left: int = 0
@@ -1033,7 +1036,23 @@ def _lark_skip_http_im_message_when_ws_mode() -> bool:
             "(set LARK_HTTP_IM_FALLBACK_WHEN_WS_NO_DATA=0 to force skip)."
         )
         return False
+    grace = max(0.0, _cfg_float("LARK_HTTP_IM_WS_FALLBACK_GRACE_SECONDS", 120.0))
+    global _lark_ws_last_im_monotonic
+    last_im = float(_lark_ws_last_im_monotonic or 0.0)
+    if grace > 0 and (last_im <= 0.0 or (time.monotonic() - last_im) > grace):
+        logger.info(
+            "webhook: HTTP IM allowed in ws mode — no im.message on WS for %.0fs (grace=%.0fs); "
+            "Feishu may be POSTing IM to Request URL only",
+            (time.monotonic() - last_im) if last_im > 0 else -1.0,
+            grace,
+        )
+        return False
     return True
+
+
+def _lark_ws_mark_im_received() -> None:
+    global _lark_ws_last_im_monotonic
+    _lark_ws_last_im_monotonic = time.monotonic()
 
 
 def _lark_im_sender_debounce_token(sender: Dict[str, Any], open_id: str) -> str:
@@ -7784,12 +7803,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         mute_like = _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER) or _im_command_matches(
             clean or "", MONITORING_CANCELMUTE_TRIGGER
         )
-        logger.info(
-            "im.message no trigger raw=%r clean=%r mentions=%s mo/mute/cancel=%r/%r/%r require_at_bot_for_mo=%s "
-            "mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s mentions_other_ou_cli=%s bot_open_id_known=%s "
-            "mute_cancel_cmd=%s",
+        log_fn = logger.warning if _text_has_monitoring_trigger(raw_text, clean) else logger.info
+        log_fn(
+            "im.message no trigger raw=%r clean=%r chat_type=%r mentions=%s mo/mute/cancel=%r/%r/%r "
+            "require_at_bot_for_mo=%s mo_placeholder_cfg=%s mo_weak_nonempty_allow=%s body_has_@_user_N=%s "
+            "mentions_other_ou_cli=%s bot_open_id_known=%s mute_cancel_cmd=%s",
             (raw_text or "")[:160],
             (clean or "")[:160],
+            im_chat_type or None,
             len(mentions),
             MONITORING_TRIGGER,
             MONITORING_MUTE_TRIGGER,
@@ -7936,6 +7957,7 @@ def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
         payload = _lark_ws_sdk_event_to_dict(data)
         mid, mtype, chat = _ws_log_message_snip(payload)
         logger.info("ws im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
+        _lark_ws_mark_im_received()
         _process_im_message_event(payload)
     except Exception:
         logger.exception("WebSocket P2ImMessageReceiveV1 handler failed")
@@ -7951,6 +7973,7 @@ def _on_ws_im_message_p2_customized(ce: Any) -> None:
         data = _lark_ws_sdk_event_to_dict(ce)
         mid, mtype, chat = _ws_log_message_snip(data)
         logger.info("ws im.message %s mid=%r mtype=%r chat=%r", et, mid, mtype, chat)
+        _lark_ws_mark_im_received()
         _process_im_message_event(data)
     except Exception:
         logger.exception("WebSocket im.message customized handler failed")
@@ -8410,6 +8433,12 @@ def webhook_event():
 
     et = _lark_header_event_type(data)
     et_l = (et or "").lower()
+    logger.info(
+        "webhook POST event_type=%r schema=%r remote=%s",
+        et or None,
+        data.get("schema") if isinstance(data, dict) else None,
+        request.remote_addr,
+    )
     # Card interactions also require a fast 200; business logic should update the card asynchronously via Open API.
     if et_l.startswith("card.action"):
         try:
