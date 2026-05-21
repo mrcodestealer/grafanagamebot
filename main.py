@@ -234,7 +234,7 @@ _CFG: Dict[str, Any] = {
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     "JUNCHEN": "",
-    "MONITORING_ALERT_CHAT_ID": "",
+    "MONITORING_ALERT_CHAT_ID": "oc_9de3d63fc589df6feeb9b0bee9c45b72",
 }
 
 
@@ -2735,7 +2735,7 @@ def _lark_ack_only_event_type(het: str) -> bool:
     if not het:
         return False
     h = het.lower()
-    if h.startswith("meeting_room."):
+    if h.startswith("meeting_room.") or h.startswith("vc.meeting."):
         return True
     return False
 
@@ -8451,6 +8451,12 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
+    if _lark_env_truthy("MONITORING_WATCH_ENABLE") and not (MONITORING_ALERT_CHAT_ID or "").strip():
+        logger.error(
+            "MONITORING_WATCH_ENABLE=1 but MONITORING_ALERT_CHAT_ID is empty — "
+            "watchdog will never post auto-alerts to any Lark group; set the target group chat_id "
+            "(oc_… from im.message logs or Feishu open API)."
+        )
     port = _cfg_listen_port()
     if MONITORING_AT_MENTION_ENABLE or MONITORING_TRIGGER_REQUIRES_AT_BOT:
         _oid = _lark_effective_bot_open_id()
