@@ -89,7 +89,7 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": "0",
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
-    # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-15m / now）；0 则用 Prometheus 窗口的绝对毫秒时间戳
+    # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-30m / now，与 Grafana「Last 30 minutes」一致）；0 则用 Prometheus 绝对毫秒
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
     "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
@@ -226,7 +226,7 @@ _CFG: Dict[str, Any] = {
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
     # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
-    "MONITORING_WATCH_SCREENSHOT_FROM": "now-6h",
+    "MONITORING_WATCH_SCREENSHOT_FROM": "now-30m",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
     # 每日静默：该时段内不拉数、不判警（默认 23:59:00～次日 00:10:00 前一刻，跨午夜；本地机器时间）
@@ -495,8 +495,8 @@ MONITORING_EGAMES_BET_SERIES_KEYWORD = (
 MONITORING_EGAMES_BET_SERIES_INCLUDE = _cfg_str(
     "MONITORING_EGAMES_BET_SERIES_INCLUDE", "EcallTW,Sinonet"
 ).strip()
-# Browser URL time range for screenshots (default last 15 minutes, aligned with /monitoring tables).
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-6h")
+# Browser URL time range for screenshots (default last 30 minutes — match Grafana dashboard picker).
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-30m")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
@@ -5154,7 +5154,7 @@ def _grafana_build_screenshot_dashboard_url(
     rt_ov = (relative_to or "").strip()
     force_relative = bool(rf_ov or rt_ov)
     if GRAFANA_SCREENSHOT_RELATIVE_RANGE or force_relative:
-        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-15m").strip()
+        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-30m").strip()
         rt = rt_ov or (GRAFANA_DASHBOARD_TO or "now").strip()
         params.extend([("from", rf), ("to", rt)])
     else:
@@ -5661,11 +5661,11 @@ def _grafana_headless_screenshot_png(
 
 def _grafana_watchdog_alert_screenshot_png(session: requests.Session) -> bytes:
     """
-    Watchdog alert image: Grafana **browser** range ``now-15m`` … ``now`` (plus optional ``timezone``),
+    Watchdog alert image: Grafana **browser** range ``now-30m`` … ``now`` (plus optional ``timezone``),
     independent of the shorter Prometheus eval window on the payload.
     """
     su, eu = _monitoring_watch_eval_window_unix()
-    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-15m").strip() or "now-15m"
+    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-30m").strip() or "now-30m"
     rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
     tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
     return _grafana_headless_screenshot_png(
