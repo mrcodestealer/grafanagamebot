@@ -4,7 +4,7 @@ grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_
 
 - **配置**：文件顶部 ``_CFG``；可用环境变量覆盖同名键。
 - **HTTP**：``LARK_EVENT_MODE=http`` 时 ``POST /webhook/event``；可选 ``ws`` 长连接（见 ``LARK_EVENT_MODE``）。
-- **命令**：``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时须 @ **本**机器人再发 ``/mo``，**``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**（群内裸发 ``/m`` 不会触发）。与 **Platform 同群**时 **Game 与 Platform 均须** ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``（默认），并在 ``MONITORING_PEER_BOT_OPEN_IDS`` 填对方 ``open_id``；否则 explicit peer-only mentions + 正文 ``@_user_N`` 占位可能错误落到对方。**explicit meta peer-only** 且正文 **无** peer 的强 ``<at>`` 确认时 **直接 skip**，不再 fall through 到弱路径。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仍用于 **mentions 完全为空** 的兜底。**勿**再搞「单条 peer ``open_id`` + ``@_user_N`` 即强制触发本 bot」。mention 行带本应用 ``app_id`` 时走 ``row_app_id_is_self``。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。机器人回复为英文。
+- **命令**：``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时 **群聊**须 @ **本**机器人再发 ``/mo``；**私聊 p2p** 可直接发 ``/mo``（无 @）。**``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**（群内裸发 ``/m`` 不会触发）。与 **Platform 同群**时 **Game 与 Platform 均须** ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``（默认），并在 ``MONITORING_PEER_BOT_OPEN_IDS`` 填对方 ``open_id``；否则 explicit peer-only mentions + 正文 ``@_user_N`` 占位可能错误落到对方。**explicit meta peer-only** 且正文 **无** peer 的强 ``<at>`` 确认时 **直接 skip**，不再 fall through 到弱路径。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仍用于 **mentions 完全为空** 的兜底。**勿**再搞「单条 peer ``open_id`` + ``@_user_N`` 即强制触发本 bot」。mention 行带本应用 ``app_id`` 时走 ``row_app_id_is_self``。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。机器人回复为英文。
 
 依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）时截图嵌卡片内 — **一条消息**；embed=``0`` 则卡片 + 单独图片两条。``MONITORING_MESSAGE_CARD_BUTTON_ENABLE=1`` 时有 **Resend screenshot**。若 ``MONITORING_MESSAGE_CARD_ENABLE=0`` 则为纯文字 + 独立图。
@@ -2314,9 +2314,15 @@ def _monitoring_at_bot_requirement_satisfied(
     Same @-target rules as ``/mo`` when ``MONITORING_TRIGGER_REQUIRES_AT_BOT=1``.
     Used for ``/m`` / ``/c`` so mute commands in a shared group only hit the bot that was actually @'d.
 
+    **p2p / private**: no @ picker — explicit ``/mo`` (or ``/m`` / ``/c``) is always to this bot; skip @ gate.
+
     When Lark delivers one payload to multiple apps, ``mentions[]`` may list **both** bots; we resolve the
     **primary** @ target from body ``<at>`` order (then mentions order) so only the addressed bot replies.
     """
+    ct = (chat_type or "").strip().lower()
+    if ct in ("p2p", "private"):
+        logger.info("monitoring: @ gate bypass — %s chat (PM has no @ target)", ct or "p2p")
+        return True
     if isinstance(mentions, list):
         mentions_list = mentions
     elif isinstance(mentions, dict) and mentions:
@@ -2594,6 +2600,7 @@ def _text_should_run_monitoring(
 
     When ``MONITORING_TRIGGER_REQUIRES_AT_BOT`` is true, an explicit trigger (e.g. ``/mo``) runs only if
     :func:`_monitoring_at_bot_requirement_satisfied` passes (primary @, multi-bot order, explicit ids).
+    **p2p PM** is exempt — bare ``/mo`` in a private chat always targets this bot.
 
     ``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER``: when ``mentions`` is **empty**, body ``@_user_N`` may still
     trigger ``/mo`` if enabled.
@@ -7577,10 +7584,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mid = _lark_im_message_dedupe_id(msg)
     mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     chat_resolved = _lark_message_chat_id(msg)
+    im_chat_type_log = _lark_dict_pick_str(msg, "chat_type", "chatType") or ""
     logger.info(
-        "im.message mid=%r mtype=%r chat_prefix=%r",
+        "im.message mid=%r mtype=%r chat_type=%r chat_prefix=%r",
         mid or None,
         mtype or None,
+        im_chat_type_log or None,
         (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
     )
     logger.debug("im.message msg_keys=%s", list(msg.keys())[:24] if isinstance(msg, dict) else [])
@@ -7611,7 +7620,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mentions = _lark_collect_im_message_mentions(msg, event)
     clean = _lark_clean_command_text(raw_text, mentions)
     content_at_entity_ids = _lark_extract_at_entity_ids_from_im_message(msg, mentions_list=mentions)
-    im_chat_type = _lark_dict_pick_str(msg, "chat_type", "chatType") or ""
+    im_chat_type = im_chat_type_log
 
     chat_id = chat_resolved
     open_id = sender_open
