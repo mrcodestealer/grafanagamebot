@@ -44,13 +44,18 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_BASE_URL": "https://grafana.client8.me",
     "GRAFANA_DASHBOARD_PATH": "/d/fe70d4bd-4729-471f-9ede-e981ad277963/online-number",
     "GRAFANA_DASHBOARD_UID": "fe70d4bd-4729-471f-9ede-e981ad277963",
-    # --- 判警涉及 4 个面板（标题须与 Grafana 完全一致）---
+    # --- 判警涉及 5 个面板（标题须与 Grafana 完全一致）---
     "GRAFANA_PANEL_TITLE": "LiveSlots Online Number",
     "GRAFANA_PANEL_TITLE_EGAME_ONLINE": "Egame Online Number",
     "GRAFANA_PANEL_TITLE_EGAMES_BET": "Egames 下注Bet/min",
     # 与浏览器面板标题一致（HTML: Liveslot 下注Bet/min）；API 模型里可能仍是 Liveslots-Spin-Bet，见 _find_panel 别名
     "GRAFANA_PANEL_TITLE_LIVESLOT_BET": "Liveslot 下注Bet/min",
     "GRAFANA_PANEL_TITLE_LIVESLOT_BET_ALIASES": "Liveslot 下注Bet/min Liveslots-Spin-Bet",
+    # Liveslots-Spin-Bet 面板：仅监控 spin_count，值为 0 持续超过 2 分钟告警
+    "GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET": "Liveslots-Spin-Bet",
+    "MONITORING_LIVESLOT_SPIN_COUNT_ENABLE": "1",
+    "MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE": "spin_count",
+    "MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS": "120",
     "MONITORING_EGAME_ONLINE_SERIES_KEYWORD": "",
     "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
     # 逗号/空格分隔；仅分析图例名包含下列子串的序列（空=该面板全部序列）
@@ -471,10 +476,14 @@ _LIVESLOT_BET_PANEL_TITLES: Tuple[str, ...] = tuple(
         if t.strip()
     )
 )
+GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET = _cfg_str(
+    "GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET", "Liveslots-Spin-Bet"
+)
 # ``extraPanels[*].kind`` — /m 静音通道 id；须与 ``fetch_monitoring_payload`` 写入一致
 MONITORING_EXTRA_KIND_EGAME_ONLINE = "egame_online"
 MONITORING_EXTRA_KIND_EGAMES_BET = "egames_bet"
 MONITORING_EXTRA_KIND_LIVESLOT_BET = "liveslot_bet"
+MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT = "liveslot_spin_count"
 # Deprecated ``kind`` strings (仍识别旧 payload / 旧静音键)
 _MONITORING_EXTRA_KIND_EGAME_ONLINE_LEGACY = "9280_push"
 _MONITORING_EXTRA_KIND_EGAMES_BET_LEGACY = "provider_jili"
@@ -490,6 +499,8 @@ def _extra_panel_logical_kind(kind: str) -> str:
         return MONITORING_EXTRA_KIND_EGAMES_BET
     if k == MONITORING_EXTRA_KIND_LIVESLOT_BET or k == _MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY:
         return MONITORING_EXTRA_KIND_LIVESLOT_BET
+    if k == MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT:
+        return MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT
     return k
 
 
@@ -510,6 +521,10 @@ def _monitoring_extra_channel_muted(raw_kind: str) -> bool:
         return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_LIVESLOT_BET) or _monitoring_alert_channel_muted(
             _MONITORING_EXTRA_KIND_LIVESLOT_BET_LEGACY
         )
+    if lg == MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT:
+        if not MONITORING_LIVESLOT_SPIN_COUNT_ENABLE:
+            return True
+        return _monitoring_alert_channel_muted(MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT)
     return _monitoring_alert_channel_muted(raw_kind)
 
 
@@ -637,6 +652,15 @@ MONITORING_LIVESLOT_BET_DROP_ENDPOINT_MIN_MEDIAN_RATIO = max(
 )
 MONITORING_LIVESLOT_BET_MIN_ABS_DROP = max(
     0.0, _cfg_float("MONITORING_LIVESLOT_BET_MIN_ABS_DROP", 500.0)
+)
+MONITORING_LIVESLOT_SPIN_COUNT_ENABLE = _lark_env_truthy_or_default(
+    "MONITORING_LIVESLOT_SPIN_COUNT_ENABLE", default=True
+)
+MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE = _cfg_str(
+    "MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE", "spin_count"
+)
+MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS = max(
+    60, _cfg_int("MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS", 120)
 )
 MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT = _cfg_float(
     "MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT", 25.0
@@ -3596,6 +3620,19 @@ def fetch_monitoring_payload(
             extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_BET, "payload": p_ls})
         except Exception:
             logger.exception("fetch %s panel failed (optional monitor)", GRAFANA_PANEL_TITLE_LIVESLOT_BET)
+    if MONITORING_LIVESLOT_SPIN_COUNT_ENABLE:
+        try:
+            p_spin = _fetch_panel_series_by_title(
+                GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET,
+                session=sess,
+                start_unix=w_start,
+                end_unix=w_end,
+            )
+            extra.append({"kind": MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT, "payload": p_spin})
+        except Exception:
+            logger.exception(
+                "fetch %s panel failed (optional monitor)", GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET
+            )
     if extra:
         primary["extraPanels"] = extra
     return primary
@@ -3958,6 +3995,7 @@ def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
         (MONITORING_EXTRA_KIND_EGAME_ONLINE, GRAFANA_PANEL_TITLE_EGAME_ONLINE),
         (MONITORING_EXTRA_KIND_EGAMES_BET, GRAFANA_PANEL_TITLE_EGAMES_BET),
         (MONITORING_EXTRA_KIND_LIVESLOT_BET, GRAFANA_PANEL_TITLE_LIVESLOT_BET),
+        (MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT, GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET),
     ]
 
 
@@ -6748,6 +6786,78 @@ def _analysis_for_liveslot_bet_payload(payload: Dict[str, Any]) -> Dict[str, Any
     return _liveslot_bet_suppress_false_drop_alerts(a)
 
 
+def _is_zero_metric_value(v: float, *, eps: float = 1e-9) -> bool:
+    return math.isfinite(v) and abs(v) <= eps
+
+
+def _trailing_zero_run_on_minute_buckets(
+    points: List[Tuple[float, float]],
+) -> Dict[str, Any]:
+    """Trailing consecutive zero-valued minute buckets from the newest end."""
+    if not points:
+        return {"bucket_count": 0, "duration_seconds": 0.0}
+    run = 0
+    for _ts, val in reversed(points):
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            break
+        if not _is_zero_metric_value(v):
+            break
+        run += 1
+    if run <= 0:
+        return {"bucket_count": 0, "duration_seconds": 0.0}
+    from_ts = points[-run][0]
+    to_ts = points[-1][0]
+    step = max(1, int(GRAFANA_QUERY_STEP))
+    return {
+        "bucket_count": run,
+        "duration_seconds": float(run * step),
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+    }
+
+
+def _select_liveslot_spin_count_series(payload: Dict[str, Any]) -> Tuple[List[Tuple[float, float]], str]:
+    """Pick ``spin_count`` (or configured include keywords) from Liveslots-Spin-Bet panel."""
+    include_raw = (MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE or "spin_count").strip()
+    include_kws = _parse_monitoring_series_keywords(include_raw)
+    grouped = [
+        (lbl, pts)
+        for lbl, pts in _group_per_series_points_from_payload(payload)
+        if _series_label_matches_keywords(lbl, include_kws)
+    ]
+    if len(grouped) == 1:
+        return grouped[0][1], grouped[0][0]
+    if len(grouped) > 1:
+        merged = _merge_result_rows_max_per_ts([pts for _, pts in grouped])
+        return merged, " | ".join(lbl for lbl, _ in grouped)
+    pts = _merge_series_points_by_keyword(payload, include_raw or "spin_count")
+    return pts, include_raw or "spin_count"
+
+
+def _analysis_for_liveslot_spin_count_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Liveslots-Spin-Bet / spin_count: alert when value stays 0 longer than configured seconds (default >2m).
+    """
+    pts_in, series_lbl = _select_liveslot_spin_count_series(payload)
+    pts_work = _snap_series_to_monitoring_minutes(list(pts_in), how="max")
+    pts_work = _trim_trailing_minute_buckets(pts_work, _analysis_drop_n())
+    zero_run = _trailing_zero_run_on_minute_buckets(pts_work)
+    dur = float(zero_run.get("duration_seconds") or 0.0)
+    threshold = float(MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS)
+    hit = dur > threshold and int(zero_run.get("bucket_count") or 0) > 0
+    return {
+        "alert_type": "zero_duration",
+        "hit_alert": hit,
+        "zero_run": zero_run,
+        "zero_alert_seconds": threshold,
+        "point_count": len(pts_work),
+        "merged_points": [[t, v] for t, v in pts_work],
+        "series_label": series_lbl,
+    }
+
+
 def _analysis_for_provider_general_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _analysis_for_keyword_payload(
         payload,
@@ -6769,6 +6879,22 @@ def _analysis_for_provider_inhouse_payload(payload: Dict[str, Any]) -> Dict[str,
 def _format_extra_analysis_lines(section_label: str, analysis: Dict[str, Any]) -> List[str]:
     if MONITORING_MO_HIDE_EXTRA_DROP_SPIKE_STATS:
         return []
+    if analysis.get("alert_type") == "zero_duration":
+        thr = int(
+            analysis.get("zero_alert_seconds") or MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS
+        )
+        thr_m = max(1, (thr + 59) // 60)
+        lines: List[str] = [
+            "",
+            f"[{section_label}] alert when value = 0 for > {thr_m}m ({thr}s)",
+        ]
+        zr = analysis.get("zero_run") if isinstance(analysis.get("zero_run"), dict) else {}
+        if zr.get("bucket_count"):
+            lines.append(
+                f"current trailing zero run: {int(zr.get('bucket_count') or 0)}m "
+                f"({_fmt_ts_short(zr.get('from_ts'))} → {_fmt_ts_short(zr.get('to_ts'))})"
+            )
+        return lines
     fd = float(analysis.get("fast_drop_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
     fs = float(analysis.get("fast_spike_threshold_pct") or analysis.get("fast_threshold_pct") or 15.0)
     cont_thr = float(
@@ -6853,6 +6979,18 @@ def _format_trigger_lines(
         if cont_hits:
             block.append(f"Continuous: {' | '.join(cont_hits)}")
         out.append("\n".join(block))
+    if analysis.get("alert_type") == "zero_duration" and analysis.get("hit_alert"):
+        zr = analysis.get("zero_run") if isinstance(analysis.get("zero_run"), dict) else {}
+        dur_s = float(zr.get("duration_seconds") or 0.0)
+        dur_m = max(1, int(round(dur_s / 60.0)))
+        thr_s = int(
+            analysis.get("zero_alert_seconds") or MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS
+        )
+        out.append(
+            f"[{graph_label}] {series_label} ZERO — value 0 for {dur_m}m "
+            f"(>{thr_s}s rule) "
+            f"{_fmt_ts_short(zr.get('from_ts'))} → {_fmt_ts_short(zr.get('to_ts'))}"
+        )
     return out
 
 
@@ -7049,6 +7187,7 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             MONITORING_EXTRA_KIND_EGAME_ONLINE,
             MONITORING_EXTRA_KIND_EGAMES_BET,
             MONITORING_EXTRA_KIND_LIVESLOT_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT,
         ):
             continue
         if _monitoring_extra_channel_muted(kind):
@@ -7066,11 +7205,17 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             a2 = _analysis_for_egames_bet_payload(p2)
             fast2 = MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT
             cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
-        else:
+        elif logical == MONITORING_EXTRA_KIND_LIVESLOT_BET:
             g_lbl = GRAFANA_PANEL_TITLE_LIVESLOT_BET
             s_lbl = ""
             a2 = _analysis_for_liveslot_bet_payload(p2)
             fast2 = MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT
+            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+        else:
+            g_lbl = GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET
+            s_lbl = MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE
+            a2 = _analysis_for_liveslot_spin_count_payload(p2)
+            fast2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
             cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
         for chunk in _format_alert_reason_chunks_for_analysis(
             g_lbl,
@@ -7106,6 +7251,7 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             MONITORING_EXTRA_KIND_EGAME_ONLINE,
             MONITORING_EXTRA_KIND_EGAMES_BET,
             MONITORING_EXTRA_KIND_LIVESLOT_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT,
         ):
             continue
         if _monitoring_extra_channel_muted(k):
@@ -7121,6 +7267,10 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
             return True
         if logical == MONITORING_EXTRA_KIND_LIVESLOT_BET and _analysis_aggregate_hit_alert(
             _analysis_for_liveslot_bet_payload(p2)
+        ):
+            return True
+        if logical == MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT and _analysis_aggregate_hit_alert(
+            _analysis_for_liveslot_spin_count_payload(p2)
         ):
             return True
     return False
@@ -7265,6 +7415,12 @@ def _format_monitoring_reply(payload: Dict[str, Any], *, include_target_mention:
                 GRAFANA_PANEL_TITLE_LIVESLOT_BET,
                 "",
                 _analysis_for_liveslot_bet_payload(p2),
+            )
+        elif logical == MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT:
+            append_analyzed_panel(
+                GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET,
+                MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE,
+                _analysis_for_liveslot_spin_count_payload(p2),
             )
 
     if include_target_mention and _monitoring_payload_hit_alert(payload):
@@ -8878,6 +9034,17 @@ def run_monitoring_bot() -> None:
     if not MONITORING_LIVESLOT_BET_ENABLE:
         logger.info(
             "Liveslot 下注Bet/min monitoring disabled (MONITORING_LIVESLOT_BET_ENABLE=0) — no fetch, no alerts"
+        )
+    if not MONITORING_LIVESLOT_SPIN_COUNT_ENABLE:
+        logger.info(
+            "Liveslots-Spin-Bet spin_count monitoring disabled "
+            "(MONITORING_LIVESLOT_SPIN_COUNT_ENABLE=0) — no fetch, no alerts"
+        )
+    elif MONITORING_LIVESLOT_SPIN_COUNT_ENABLE:
+        logger.info(
+            "Liveslots-Spin-Bet spin_count zero alert: value=0 for >%ss triggers alert "
+            "(MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS)",
+            MONITORING_LIVESLOT_SPIN_COUNT_ZERO_ALERT_SECONDS,
         )
     logger.info(
         "IM ingress config: LARK_EVENT_MODE=%s ENABLE_HTTP=%s "
