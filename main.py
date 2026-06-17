@@ -60,7 +60,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_EGAMES_BET_SERIES_KEYWORD": "",
     # 逗号/空格分隔；仅分析图例名包含下列子串的序列（空=该面板全部序列）
     "MONITORING_EGAMES_BET_SERIES_INCLUDE": "EcallTW,Sinonet",
-    "GRAFANA_DASHBOARD_FROM": "now-30m",
+    "GRAFANA_DASHBOARD_FROM": "now-1h",
     "GRAFANA_DASHBOARD_TO": "now",
     "GRAFANA_QUERY_STEP": 60,
     "GRAFANA_QUERY_LOOKBACK_SECONDS": 900,
@@ -98,7 +98,8 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS": "0",
     # 1=点击折叠的 dashboard 行（如只显示 KPI 标题无图时）
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
-    # 截图 URL 用 GRAFANA_DASHBOARD_FROM/TO（默认 now-30m / now，与 Grafana「Last 30 minutes」一致）；0 则用 Prometheus 绝对毫秒
+    # 1=告警截图前在对应面板 Ctrl+点击图例，只保留触发告警的序列
+    "GRAFANA_SCREENSHOT_ALERT_LEGEND_CLICK_ENABLE": "1",
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
     "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
@@ -244,16 +245,22 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_CONFIRM_SECONDS": "60",
     # Watchdog 判警是否使用与 /monitoring 相同的拉数窗口（默认 0：窄窗口 eval；设为 1 则与报表一致，避免「报表有大波动但自动告警未扫到」）
     "MONITORING_WATCH_MATCH_REPORT_WINDOW": "0",
-    # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 15 分钟整页
-    "MONITORING_WATCH_SCREENSHOT_FROM": "now-30m",
+    # Watchdog 告警附带截图的 Grafana URL（相对时间）；与判窗数据窗口无关，默认最近 1 小时整页
+    "MONITORING_WATCH_SCREENSHOT_FROM": "now-1h",
     "MONITORING_WATCH_SCREENSHOT_TO": "now",
     "MONITORING_WATCH_SCREENSHOT_TIMEZONE": "browser",
-    # 每日静默：该时段内不拉数、不判警（默认 23:59:00～次日 00:10:00 前一刻，跨午夜；本地机器时间）
+    # 每日静默：该时段内不拉数、不判警（``MONITORING_TIME_BUCKET_TZ`` 或服务器本地时间）
+    # 窗口 1：19:59～20:15；窗口 2：00:00～00:15
     "MONITORING_WATCH_QUIET_WINDOW_ENABLE": "1",
-    "MONITORING_WATCH_QUIET_START_HOUR": "23",
+    "MONITORING_WATCH_QUIET_START_HOUR": "19",
     "MONITORING_WATCH_QUIET_START_MINUTE": "59",
-    "MONITORING_WATCH_QUIET_END_HOUR": "0",
-    "MONITORING_WATCH_QUIET_END_MINUTE": "10",
+    "MONITORING_WATCH_QUIET_END_HOUR": "20",
+    "MONITORING_WATCH_QUIET_END_MINUTE": "15",
+    "MONITORING_WATCH_QUIET2_ENABLE": "1",
+    "MONITORING_WATCH_QUIET2_START_HOUR": "0",
+    "MONITORING_WATCH_QUIET2_START_MINUTE": "0",
+    "MONITORING_WATCH_QUIET2_END_HOUR": "0",
+    "MONITORING_WATCH_QUIET2_END_MINUTE": "15",
     # Tag person / alert group — set via environment.
     "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
@@ -540,7 +547,7 @@ MONITORING_EGAMES_BET_SERIES_INCLUDE = _cfg_str(
     "MONITORING_EGAMES_BET_SERIES_INCLUDE", "EcallTW,Sinonet"
 ).strip()
 # Browser URL time range for screenshots (default last 30 minutes — match Grafana dashboard picker).
-GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-30m")
+GRAFANA_DASHBOARD_FROM = _cfg_str("GRAFANA_DASHBOARD_FROM", "now-1h")
 GRAFANA_DASHBOARD_TO = _cfg_str("GRAFANA_DASHBOARD_TO", "now")
 # Prometheus query_range step (seconds); 60 → up to 15 buckets in 15m when lookback=900
 GRAFANA_QUERY_STEP = _cfg_int("GRAFANA_QUERY_STEP", 60)
@@ -3509,37 +3516,74 @@ def fetch_request_total_1m_series(
     )
 
 
-def _monitoring_watch_daily_quiet_tod_bounds() -> Tuple[int, int]:
-    """
-    Local-time quiet window as (start_tod_seconds, end_tod_seconds) with **end exclusive**:
-    quiet when ``tod >= start`` OR ``tod < end`` (handles wrap past midnight).
-    Default: [23:59:00, 00:10:00) → about 11 minutes.
-    Returns ``(-1, -1)`` when ``MONITORING_WATCH_QUIET_WINDOW_ENABLE=0``.
-    """
-    if not _lark_env_truthy("MONITORING_WATCH_QUIET_WINDOW_ENABLE"):
-        return -1, -1
-    sh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_START_HOUR", 23)))
-    sm = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_START_MINUTE", 59)))
-    eh = max(0, min(23, _cfg_int("MONITORING_WATCH_QUIET_END_HOUR", 0)))
-    em = max(0, min(59, _cfg_int("MONITORING_WATCH_QUIET_END_MINUTE", 10)))
-    start_sec = sh * 3600 + sm * 60
-    end_sec = eh * 3600 + em * 60
-    return start_sec, end_sec
+def _monitoring_watch_quiet_tod_bounds_from_parts(
+    start_hour: int,
+    start_minute: int,
+    end_hour: int,
+    end_minute: int,
+) -> Tuple[int, int]:
+    sh = max(0, min(23, int(start_hour)))
+    sm = max(0, min(59, int(start_minute)))
+    eh = max(0, min(23, int(end_hour)))
+    em = max(0, min(59, int(end_minute)))
+    return sh * 3600 + sm * 60, eh * 3600 + em * 60
 
 
-def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
-    """True if current **local** time lies in the configured daily quiet window."""
-    start_sec, end_sec = _monitoring_watch_daily_quiet_tod_bounds()
-    if start_sec < 0:
-        return False
-    t = time.time() if now is None else float(now)
-    lt = time.localtime(t)
-    tod = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+def _monitoring_watch_tod_in_quiet_bounds(tod: int, start_sec: int, end_sec: int) -> bool:
     if start_sec < end_sec:
         return start_sec <= tod < end_sec
     if start_sec == end_sec:
         return False
     return tod >= start_sec or tod < end_sec
+
+
+def _monitoring_watch_daily_quiet_windows() -> List[Tuple[int, int]]:
+    """
+    Daily quiet windows as ``(start_tod_seconds, end_tod_seconds)`` with **end exclusive**.
+    Default: [19:59, 20:15) and [00:00, 00:15). Returns empty when master enable is off.
+    """
+    if not _lark_env_truthy("MONITORING_WATCH_QUIET_WINDOW_ENABLE"):
+        return []
+    windows: List[Tuple[int, int]] = [
+        _monitoring_watch_quiet_tod_bounds_from_parts(
+            _cfg_int("MONITORING_WATCH_QUIET_START_HOUR", 19),
+            _cfg_int("MONITORING_WATCH_QUIET_START_MINUTE", 59),
+            _cfg_int("MONITORING_WATCH_QUIET_END_HOUR", 20),
+            _cfg_int("MONITORING_WATCH_QUIET_END_MINUTE", 15),
+        )
+    ]
+    if _lark_env_truthy_or_default("MONITORING_WATCH_QUIET2_ENABLE", default=True):
+        windows.append(
+            _monitoring_watch_quiet_tod_bounds_from_parts(
+                _cfg_int("MONITORING_WATCH_QUIET2_START_HOUR", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_START_MINUTE", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_END_HOUR", 0),
+                _cfg_int("MONITORING_WATCH_QUIET2_END_MINUTE", 15),
+            )
+        )
+    return windows
+
+
+def _monitoring_watch_daily_quiet_tod_bounds() -> Tuple[int, int]:
+    """
+    First quiet window only (legacy helper). Prefer :func:`_monitoring_watch_daily_quiet_windows`.
+    Returns ``(-1, -1)`` when ``MONITORING_WATCH_QUIET_WINDOW_ENABLE=0``.
+    """
+    wins = _monitoring_watch_daily_quiet_windows()
+    if not wins:
+        return -1, -1
+    return wins[0]
+
+
+def _monitoring_watch_in_daily_quiet_local(now: Optional[float] = None) -> bool:
+    """True if current time lies in any configured daily quiet window."""
+    windows = _monitoring_watch_daily_quiet_windows()
+    if not windows:
+        return False
+    t = time.time() if now is None else float(now)
+    lt = _monitoring_calendar_dt(t)
+    tod = lt.hour * 3600 + lt.minute * 60 + lt.second
+    return any(_monitoring_watch_tod_in_quiet_bounds(tod, s, e) for s, e in windows)
 
 
 def _monitoring_watch_eval_window_unix(now: Optional[float] = None) -> Tuple[int, int]:
@@ -5258,7 +5302,7 @@ def _grafana_build_screenshot_dashboard_url(
     rt_ov = (relative_to or "").strip()
     force_relative = bool(rf_ov or rt_ov)
     if GRAFANA_SCREENSHOT_RELATIVE_RANGE or force_relative:
-        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-30m").strip()
+        rf = rf_ov or (GRAFANA_DASHBOARD_FROM or "now-1h").strip()
         rt = rt_ov or (GRAFANA_DASHBOARD_TO or "now").strip()
         params.extend([("from", rf), ("to", rt)])
     else:
@@ -5354,6 +5398,108 @@ def _grafana_persistent_browser_enabled() -> bool:
     return _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and _lark_env_truthy("GRAFANA_PERSISTENT_BROWSER")
 
 
+def _grafana_playwright_click_alert_series_legends(
+    page: Any,
+    targets: List[Dict[str, str]],
+) -> int:
+    """
+    On each alerting panel, Ctrl+click the legend row matching the alert series (Grafana isolate).
+    Returns count of successful isolations.
+    """
+    if not targets or not _lark_env_truthy("GRAFANA_SCREENSHOT_ALERT_LEGEND_CLICK_ENABLE"):
+        return 0
+    ok = 0
+    for tgt in targets:
+        panel_title = str(tgt.get("panel") or "").strip()
+        series_label = str(tgt.get("series") or "").strip()
+        if not panel_title or not series_label:
+            continue
+        try:
+            result = page.evaluate(
+                """([panelTitle, seriesNeedle]) => {
+                  const norm = (s) => (s || '').trim().toLowerCase();
+                  const pt = norm(panelTitle);
+                  const sn = norm(seriesNeedle);
+                  if (!pt || !sn) return 'missing';
+
+                  const panelRoots = document.querySelectorAll(
+                    '.react-grid-item, [data-testid="dashboard-panel"]'
+                  );
+                  let panelRoot = null;
+                  for (const root of panelRoots) {
+                    const titleEl = root.querySelector(
+                      '[data-testid="panel-title"], h2, [class*="panel-title"]'
+                    );
+                    const titleTxt = norm(
+                      titleEl && (titleEl.textContent || titleEl.getAttribute('title'))
+                    );
+                    if (titleTxt && (titleTxt === pt || titleTxt.includes(pt) || pt.includes(titleTxt))) {
+                      panelRoot = root;
+                      break;
+                    }
+                  }
+                  if (!panelRoot) return 'panel_not_found';
+
+                  try {
+                    panelRoot.scrollIntoView({ block: 'center', behavior: 'instant' });
+                  } catch (e) {}
+
+                  const items = panelRoot.querySelectorAll(
+                    '[data-testid="viz-legend-list-item"], [class*="LegendItem"], ' +
+                    '.uplot-legend .u-series, button[class*="legend"], div[class*="legendItem"]'
+                  );
+                  for (const item of items) {
+                    const txt = norm(item.textContent);
+                    if (!txt) continue;
+                    if (!(txt.includes(sn) || sn.includes(txt))) continue;
+                    const rect = item.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    const opts = {
+                      bubbles: true,
+                      cancelable: true,
+                      view: window,
+                      ctrlKey: true,
+                      metaKey: true,
+                      clientX: rect.left + Math.min(4, rect.width / 2),
+                      clientY: rect.top + Math.min(4, rect.height / 2),
+                    };
+                    item.dispatchEvent(new MouseEvent('mousedown', opts));
+                    item.dispatchEvent(new MouseEvent('mouseup', opts));
+                    item.dispatchEvent(new MouseEvent('click', opts));
+                    if (typeof item.click === 'function') {
+                      try { item.click(); } catch (e2) {}
+                    }
+                    return 'ok';
+                  }
+                  return 'legend_not_found';
+                }""",
+                [panel_title, series_label],
+            )
+            if result == "ok":
+                ok += 1
+                logger.info(
+                    "Grafana screenshot: isolated legend panel=%r series=%r",
+                    panel_title,
+                    series_label,
+                )
+            else:
+                logger.info(
+                    "Grafana screenshot: legend isolate %s panel=%r series=%r",
+                    result,
+                    panel_title,
+                    series_label,
+                )
+            page.wait_for_timeout(120)
+        except Exception as ex:
+            logger.info(
+                "Grafana screenshot: legend isolate failed panel=%r series=%r: %s",
+                panel_title,
+                series_label,
+                ex,
+            )
+    return ok
+
+
 def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
     """
     Headless Grafana 有时「面板 ready 统计够了」但 uPlot/canvas 尚未合成进位图；快门前强制置顶、
@@ -5406,6 +5552,7 @@ def _grafana_playwright_render_dashboard_and_png(
     timeout_ms: int,
     *,
     skip_nav_and_refresh: bool = False,
+    legend_targets: Optional[List[Dict[str, str]]] = None,
 ) -> bytes:
     """
     Navigate ``page`` to dashboard ``url`` and return a PNG after the same wait/stabilize path
@@ -5478,6 +5625,9 @@ def _grafana_playwright_render_dashboard_and_png(
     _grafana_close_open_menus(page)
     if not skip_nav_and_refresh:
         _grafana_playwright_dock_nav_only(page, timeout_ms)
+    if legend_targets:
+        _grafana_playwright_click_alert_series_legends(page, legend_targets)
+        page.wait_for_timeout(180)
     _grafana_playwright_pre_screenshot_paint_flush(page)
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
@@ -5508,7 +5658,13 @@ class GrafanaPlaywrightKeeper:
     def wait_ready(self, timeout: float) -> bool:
         return self._ready.wait(timeout=timeout)
 
-    def request_png(self, url: str, timeout_ms: int) -> bytes:
+    def request_png(
+        self,
+        url: str,
+        timeout_ms: int,
+        *,
+        legend_targets: Optional[List[Dict[str, str]]] = None,
+    ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
             raise TimeoutError("GrafanaPlaywrightKeeper not ready (warm-up still running or failed)")
@@ -5517,7 +5673,16 @@ class GrafanaPlaywrightKeeper:
         job_timeout = max(30.0, _cfg_float("GRAFANA_PERSISTENT_BROWSER_JOB_TIMEOUT_SECONDS", 180.0))
         ev = threading.Event()
         box: Dict[str, Any] = {}
-        self._q.put({"op": "png", "url": url, "timeout_ms": int(timeout_ms), "ev": ev, "box": box})
+        self._q.put(
+            {
+                "op": "png",
+                "url": url,
+                "timeout_ms": int(timeout_ms),
+                "legend_targets": legend_targets,
+                "ev": ev,
+                "box": box,
+            }
+        )
         if not ev.wait(timeout=job_timeout):
             raise TimeoutError("GrafanaPlaywrightKeeper screenshot job timed out")
         err = box.get("err")
@@ -5622,6 +5787,7 @@ class GrafanaPlaywrightKeeper:
                         jurl,
                         max(5000, jto),
                         skip_nav_and_refresh=True,
+                        legend_targets=job.get("legend_targets"),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -5672,6 +5838,7 @@ def _grafana_headless_screenshot_png(
     relative_from: Optional[str] = None,
     relative_to: Optional[str] = None,
     timezone_param: Optional[str] = None,
+    legend_targets: Optional[List[Dict[str, str]]] = None,
 ) -> bytes:
     """
     Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
@@ -5718,7 +5885,7 @@ def _grafana_headless_screenshot_png(
     if k is not None and _grafana_persistent_browser_enabled():
         try:
             logger.info("Grafana screenshot: using persistent Playwright keeper")
-            return k.request_png(url, timeout_ms)
+            return k.request_png(url, timeout_ms, legend_targets=legend_targets)
         except Exception as e:
             logger.warning(
                 "Grafana persistent keeper screenshot failed (%s); falling back to ephemeral browser",
@@ -5761,20 +5928,120 @@ def _grafana_headless_screenshot_png(
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
                 page.wait_for_timeout(140)
 
-            return _grafana_playwright_render_dashboard_and_png(page, url, timeout_ms)
+            return _grafana_playwright_render_dashboard_and_png(
+                page, url, timeout_ms, legend_targets=legend_targets
+            )
         finally:
             browser.close()
 
 
-def _grafana_watchdog_alert_screenshot_png(session: requests.Session) -> bytes:
-    """
-    Watchdog alert image: Grafana **browser** range ``now-30m`` … ``now`` (plus optional ``timezone``),
-    independent of the shorter Prometheus eval window on the payload.
-    """
+def _analysis_hit_alert_series_labels(analysis: Dict[str, Any]) -> List[str]:
+    """Series labels that triggered ``hit_alert`` (per-series or aggregate)."""
+    labels: List[str] = []
+    per = analysis.get("per_series")
+    if isinstance(per, list) and per:
+        for sub in per:
+            if isinstance(sub, dict) and sub.get("hit_alert"):
+                lbl = str(sub.get("series_label") or "").strip()
+                if lbl and lbl not in labels:
+                    labels.append(lbl)
+        return labels
+    if analysis.get("hit_alert"):
+        lbl = str(analysis.get("series_label") or "").strip()
+        if lbl:
+            labels.append(lbl)
+    return labels
+
+
+def _monitoring_collect_alert_legend_targets(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    """``[{panel, series}, …]`` for panels/series that hit alert — used before alert screenshots."""
+    _mute_purge_expired()
+    out: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    def append(panel: str, series: str) -> None:
+        p = (panel or "").strip()
+        s = (series or "").strip()
+        if not p or not s:
+            return
+        key = (p.casefold(), s.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"panel": p, "series": s})
+
+    if MONITORING_HTTP_PRIMARY_ENABLE and not _monitoring_alert_channel_muted("http"):
+        for lbl in _analysis_hit_alert_series_labels(_http_analysis_for_payload(payload)):
+            append(GRAFANA_PANEL_TITLE, lbl)
+
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        kind = (ex.get("kind") or "")
+        logical = _extra_panel_logical_kind(kind)
+        if logical not in (
+            MONITORING_EXTRA_KIND_EGAME_ONLINE,
+            MONITORING_EXTRA_KIND_EGAMES_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_BET,
+            MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT,
+        ):
+            continue
+        if _monitoring_extra_channel_muted(kind):
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE:
+            panel_title = GRAFANA_PANEL_TITLE_EGAME_ONLINE
+            analysis = _analysis_for_egame_online_payload(p2)
+            fallbacks: Tuple[str, ...] = (
+                (MONITORING_EGAME_ONLINE_SERIES_KEYWORD,) if MONITORING_EGAME_ONLINE_SERIES_KEYWORD else ()
+            )
+        elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
+            panel_title = GRAFANA_PANEL_TITLE_EGAMES_BET
+            analysis = _analysis_for_egames_bet_payload(p2)
+            inc = (MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD or "").strip()
+            fallbacks = tuple(_parse_monitoring_series_keywords(inc))
+        elif logical == MONITORING_EXTRA_KIND_LIVESLOT_BET:
+            panel_title = GRAFANA_PANEL_TITLE_LIVESLOT_BET
+            analysis = _analysis_for_liveslot_bet_payload(p2)
+            fallbacks = (MONITORING_LIVESLOT_BET_SERIES_INCLUDE or "total spins",)
+        else:
+            panel_title = GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET
+            analysis = _analysis_for_liveslot_spin_count_payload(p2)
+            fallbacks = (MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE or "spin_count",)
+
+        hit_labels = _analysis_hit_alert_series_labels(analysis)
+        if hit_labels:
+            for lbl in hit_labels:
+                append(panel_title, lbl)
+        elif _analysis_aggregate_hit_alert(analysis):
+            for fb in fallbacks:
+                append(panel_title, fb)
+
+    return out
+
+
+def _grafana_monitoring_screenshot_png(
+    session: requests.Session,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    for_alert: bool = False,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+) -> bytes:
+    """Dashboard screenshot (default **1h** browser range). Alert shots isolate legend series."""
     su, eu = _monitoring_watch_eval_window_unix()
-    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-30m").strip() or "now-30m"
-    rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
-    tz = _cfg_str("MONITORING_WATCH_SCREENSHOT_TIMEZONE", "browser").strip()
+    rf = (relative_from or "").strip() or (
+        _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-1h").strip()
+        if for_alert
+        else _cfg_str("GRAFANA_DASHBOARD_FROM", "now-1h").strip()
+    ) or "now-1h"
+    rt = (relative_to or "").strip() or (
+        _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip()
+        if for_alert
+        else _cfg_str("GRAFANA_DASHBOARD_TO", "now").strip()
+    ) or "now"
+    tz = _cfg_str("GRAFANA_SCREENSHOT_TIMEZONE", "browser").strip()
+    targets = _monitoring_collect_alert_legend_targets(payload) if for_alert and payload else None
     return _grafana_headless_screenshot_png(
         session,
         su,
@@ -5782,7 +6049,19 @@ def _grafana_watchdog_alert_screenshot_png(session: requests.Session) -> bytes:
         relative_from=rf,
         relative_to=rt,
         timezone_param=tz or None,
+        legend_targets=targets,
     )
+
+
+def _grafana_watchdog_alert_screenshot_png(
+    session: requests.Session,
+    payload: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    """
+    Watchdog alert image: Grafana **browser** range ``now-1h`` … ``now`` (plus optional ``timezone``),
+    independent of the shorter Prometheus eval window on the payload.
+    """
+    return _grafana_monitoring_screenshot_png(session, payload, for_alert=True)
 
 
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
@@ -7473,12 +7752,8 @@ def _monitoring_send_screenshot_on_card_click(chat_id: str, open_id: str) -> Non
             raise RuntimeError("GRAFANA_SCREENSHOT_ENABLE=0")
         sess = grafana_login_session()
         payload = fetch_monitoring_payload(session=sess)
-        w = payload.get("window") or {}
-        su = int(w.get("startUnix") or 0)
-        eu = int(w.get("endUnix") or 0)
-        if su <= 0 or eu <= 0:
-            raise RuntimeError(f"invalid screenshot window start={su} end={eu}")
-        png = _grafana_headless_screenshot_png(sess, su, eu)
+        alert_hit = _monitoring_payload_hit_alert(payload)
+        png = _grafana_monitoring_screenshot_png(sess, payload, for_alert=alert_hit)
         key = _lark_upload_png_image_key(png)
         if (chat_id or "").strip():
             _lark_send_image_message("chat_id", chat_id.strip(), key)
@@ -7546,16 +7821,16 @@ def _monitoring_watchdog_loop() -> None:
     cool = max(0.0, _cfg_float("MONITORING_WATCH_ALERT_COOLDOWN_SECONDS", 300.0))
     confirm_s = MONITORING_WATCH_CONFIRM_SECONDS
     match_rp = _lark_env_truthy("MONITORING_WATCH_MATCH_REPORT_WINDOW")
-    qs, qe = _monitoring_watch_daily_quiet_tod_bounds()
-    if qs < 0:
+    quiet_wins = _monitoring_watch_daily_quiet_windows()
+    if not quiet_wins:
         q_note = "daily_quiet=disabled"
     else:
-        sh, sm = qs // 3600, (qs // 60) % 60
-        eh, em = qe // 3600, (qe // 60) % 60
-        q_note = (
-            f"daily_quiet=on server-local {sh:02d}:{sm:02d}–{eh:02d}:{em:02d} "
-            f"(end time exclusive; no fetch/alert)"
-        )
+        parts: List[str] = []
+        for qs, qe in quiet_wins:
+            sh, sm = qs // 3600, (qs // 60) % 60
+            eh, em = qe // 3600, (qe // 60) % 60
+            parts.append(f"{sh:02d}:{sm:02d}–{eh:02d}:{em:02d}")
+        q_note = f"daily_quiet=on {' + '.join(parts)} (end exclusive; no fetch/alert)"
     logger.info(
         "monitoring watchdog started interval=%.0fs cooldown=%.0fs confirm=%.0fs match_report_window=%s "
         "alert_chat=%r target_user=%r %s",
@@ -7645,7 +7920,9 @@ def _monitoring_watchdog_loop() -> None:
                 pre_key: Optional[str] = None
                 if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
-                        pre_key = _lark_upload_png_image_key(_grafana_watchdog_alert_screenshot_png(sess_c))
+                        pre_key = _lark_upload_png_image_key(
+                            _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
+                        )
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
 
@@ -7671,7 +7948,7 @@ def _monitoring_watchdog_loop() -> None:
                             logger.exception("monitoring watchdog pre_key image send failed")
                     else:
                         try:
-                            png = _grafana_watchdog_alert_screenshot_png(sess_c)
+                            png = _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
                             key = _lark_upload_png_image_key(png)
                             _lark_send_image_message("chat_id", alert_chat, key)
                             logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
@@ -7734,7 +8011,9 @@ def _monitoring_watchdog_loop() -> None:
                 pre_key = None
                 if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
-                        pre_key = _lark_upload_png_image_key(_grafana_watchdog_alert_screenshot_png(sess))
+                        pre_key = _lark_upload_png_image_key(
+                            _grafana_watchdog_alert_screenshot_png(sess, payload)
+                        )
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
 
@@ -7760,7 +8039,7 @@ def _monitoring_watchdog_loop() -> None:
                             logger.exception("monitoring watchdog pre_key image send failed")
                     else:
                         try:
-                            png = _grafana_watchdog_alert_screenshot_png(sess)
+                            png = _grafana_watchdog_alert_screenshot_png(sess, payload)
                             key = _lark_upload_png_image_key(png)
                             _lark_send_image_message("chat_id", alert_chat, key)
                             logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
@@ -7939,41 +8218,34 @@ def _monitoring_background_worker(
                             "monitoring follow-up image send failed (card may have been plain text)"
                         )
                 else:
-                    w = payload.get("window") or {}
-                    su = int(w.get("startUnix") or 0)
-                    eu = int(w.get("endUnix") or 0)
-                    if su <= 0 or eu <= 0:
-                        logger.warning(
-                            "monitoring screenshot skipped: invalid window start=%s end=%s", su, eu
+                    try:
+                        jar = grafana_session.cookies.get_dict()
+                        if "grafana_session" not in jar:
+                            logger.warning(
+                                "monitoring screenshot: no grafana_session cookie — expect login wall in PNG"
+                            )
+                        n_cookies = len(_playwright_cookie_list(grafana_session))
+                        logger.info(
+                            "monitoring screenshot start cookies=%s alert_hit=%s",
+                            n_cookies,
+                            alert_hit,
                         )
-                    else:
-                        try:
-                            jar = grafana_session.cookies.get_dict()
-                            if "grafana_session" not in jar:
-                                logger.warning(
-                                    "monitoring screenshot: no grafana_session cookie — expect login wall in PNG"
-                                )
-                            n_cookies = len(_playwright_cookie_list(grafana_session))
-                            logger.info(
-                                "monitoring screenshot start cookies=%s window=%s..%s",
-                                n_cookies,
-                                su,
-                                eu,
-                            )
-                            png = _grafana_headless_screenshot_png(grafana_session, su, eu)
-                            key = _lark_upload_png_image_key(png)
-                            if chat_id:
-                                _lark_send_image_message("chat_id", chat_id, key)
-                            else:
-                                _lark_send_image_message("open_id", open_id, key)
-                            logger.info(
-                                "monitoring Grafana screenshot sent (background) bytes=%s",
-                                len(png),
-                            )
-                        except Exception:
-                            logger.exception(
-                                "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
-                            )
+                        png = _grafana_monitoring_screenshot_png(
+                            grafana_session, payload, for_alert=alert_hit
+                        )
+                        key = _lark_upload_png_image_key(png)
+                        if chat_id:
+                            _lark_send_image_message("chat_id", chat_id, key)
+                        else:
+                            _lark_send_image_message("open_id", open_id, key)
+                        logger.info(
+                            "monitoring Grafana screenshot sent (background) bytes=%s",
+                            len(png),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "monitoring Grafana screenshot or Lark image upload failed (text was already sent)"
+                        )
             elif sent:
                 logger.warning(
                     "monitoring screenshot skipped: sent text but grafana_session or payload is missing (unexpected)"
