@@ -270,7 +270,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
     # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
     "DEPLOY_ENABLE": "1",
-    "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
+    "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_c2b8722767f4c17df35edc1b2fbcc55a",
     # Optional extra allow-list (space/comma separated open_ids)
     "DEPLOY_ALLOWED_USER_OPEN_IDS": "",
     # Empty = directory containing this main.py; override on server if repo lives elsewhere
