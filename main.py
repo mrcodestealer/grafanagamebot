@@ -22,6 +22,7 @@ import subprocess
 from urllib.parse import urlencode
 from datetime import datetime
 import re
+import shlex
 import threading
 import time
 import warnings
@@ -4535,6 +4536,20 @@ def _deploy_run_cmd(
         return 1, str(e)
 
 
+def _deploy_schedule_service_restart(svc: str, delay_sec: float = 2.0) -> None:
+    """Restart after a short delay so Lark can deliver the final Done message first."""
+    name = (svc or "grafanagamebot").strip() or "grafanagamebot"
+    delay = max(1.0, min(15.0, float(delay_sec)))
+    cmd = f"sleep {int(delay)} && systemctl restart {shlex.quote(name)}"
+    subprocess.Popen(
+        ["bash", "-c", cmd],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
     def _reply(msg: str) -> None:
         try:
@@ -4551,18 +4566,11 @@ def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: st
         if rc != 0:
             _reply(f"Deploy failed — `git pull origin main` exit {rc}:\n```\n{tail or '(no output)'}\n```")
             return
-        _reply(f"`git pull origin main` OK (exit 0):\n```\n{tail or '(no output)'}\n```\nRestarting `{svc}` …")
-        restart_rc, restart_out = _deploy_run_cmd(
-            ["systemctl", "restart", svc],
-            timeout=120,
+        _reply(f"`git pull origin main` OK (exit 0):\n```\n{tail or '(no output)'}\n```")
+        _deploy_schedule_service_restart(svc, delay_sec=2.0)
+        _reply(
+            f"Done — `{svc}` will restart in ~2s and come back shortly."
         )
-        if restart_rc != 0:
-            rtail = "\n".join((restart_out or "").splitlines()[-8:])
-            _reply(
-                f"`systemctl restart {svc}` failed (exit {restart_rc}):\n```\n{rtail or '(no output)'}\n```"
-            )
-            return
-        _reply(f"`systemctl restart {svc}` sent — service should come back shortly.")
     except Exception:
         logger.exception("deploy git pull + restart failed")
         _reply("Deploy failed — unexpected error (see server logs).")
