@@ -4327,6 +4327,50 @@ def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
             _monitoring_inflight_keys.discard(debounce_key)
 
 
+def _deploy_message_text_blobs(
+    msg: Dict[str, Any],
+    event: Dict[str, Any],
+    raw_text: str,
+    clean: str,
+) -> List[str]:
+    """Collect every text surface that might carry the deploy phrase (HTTP / post / mobile skew)."""
+    blobs: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(t: str) -> None:
+        s = re.sub(r"\s+", " ", (t or "").strip())
+        if s and s not in seen:
+            seen.add(s)
+            blobs.append(s)
+
+    _add(clean or "")
+    _add(raw_text or "")
+    if isinstance(event, dict):
+        for k in ("text_without_at_bot", "textWithoutAtBot", "text"):
+            _add(_lark_dict_pick_str(event, k))
+    if isinstance(msg, dict):
+        _add(_lark_extract_plain_text_from_message(msg))
+        raw_c = msg.get("content")
+        if raw_c is None:
+            raw_c = msg.get("Content")
+        if isinstance(raw_c, str):
+            _add(raw_c)
+            try:
+                obj = json.loads(raw_c or "{}")
+                if isinstance(obj, dict):
+                    parts: List[str] = []
+                    _lark_collect_post_text(obj, parts)
+                    _add("".join(parts))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif isinstance(raw_c, dict):
+            _add(json.dumps(raw_c, ensure_ascii=False))
+            parts2: List[str] = []
+            _lark_collect_post_text(raw_c, parts2)
+            _add("".join(parts2))
+    return blobs
+
+
 def _im_text_matches_deploy_request(*texts: str) -> bool:
     """True when any cleaned IM blob asks for ``git pull`` + ``restart`` (``service`` optional)."""
     for raw in texts:
@@ -4336,10 +4380,7 @@ def _im_text_matches_deploy_request(*texts: str) -> bool:
     return False
 
 
-def _deploy_sender_authorized(sender: Dict[str, Any], open_id: str) -> bool:
-    allowed = (DEPLOY_ALLOWED_USER_OPEN_ID or "").strip()
-    if not allowed:
-        return False
+def _deploy_sender_id_set(sender: Dict[str, Any], open_id: str) -> Set[str]:
     ids: Set[str] = set()
     o = (open_id or "").strip()
     if o:
@@ -4359,7 +4400,44 @@ def _deploy_sender_authorized(sender: Dict[str, Any], open_id: str) -> bool:
                     s = str(v).strip()
                     if s:
                         ids.add(s)
-    return allowed in ids
+    return ids
+
+
+def _deploy_sender_authorized(sender: Dict[str, Any], open_id: str) -> bool:
+    allowed = (DEPLOY_ALLOWED_USER_OPEN_ID or "").strip()
+    if not allowed:
+        return False
+    return allowed in _deploy_sender_id_set(sender, open_id)
+
+
+def _deploy_bot_addressed(
+    raw_text: str,
+    mentions: Any,
+    content_at_entity_ids: Optional[List[str]],
+    msg: Optional[Dict[str, Any]],
+    chat_type: str,
+) -> bool:
+    """True when this deploy should run on **Game** bot (not Platform peer)."""
+    ct = (chat_type or "").strip().lower()
+    if ct in ("p2p", "private"):
+        return True
+    if not MONITORING_TRIGGER_REQUIRES_AT_BOT:
+        return True
+    if _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids):
+        return True
+    if _monitoring_at_bot_requirement_satisfied(
+        raw_text,
+        mentions,
+        content_at_entity_ids=content_at_entity_ids,
+        msg=msg,
+        chat_type=chat_type,
+    ):
+        return True
+    ml = mentions if isinstance(mentions, list) else []
+    app = str(APP_ID or "").strip()
+    if app and _lark_mentions_any_row_matches_app(ml, app):
+        return True
+    return False
 
 
 def _deploy_reply(chat_id: str, open_id: str, text: str) -> None:
@@ -8581,13 +8659,21 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             ).start()
         return
 
-    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(clean or "", raw_text or "")
+    deploy_blobs = _deploy_message_text_blobs(msg, event, raw_text or "", clean or "")
+    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(*deploy_blobs)
     if deploy_req:
+        logger.info(
+            "deploy phrase detected open_id=%r chat=%r blobs=%r",
+            (open_id or "")[:24],
+            (chat_id or "")[:16],
+            [b[:80] for b in deploy_blobs[:4]],
+        )
         deploy_user_ok = _deploy_sender_authorized(sender, open_id or "")
         if not deploy_user_ok:
             logger.info(
-                "deploy request denied — sender %r not in DEPLOY_ALLOWED_USER_OPEN_ID=%r",
+                "deploy request denied — sender %r ids=%r allowed=%r",
                 (open_id or "")[:24],
+                sorted(_deploy_sender_id_set(sender, open_id or "")),
                 (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
             )
             try:
@@ -8599,16 +8685,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             except Exception:
                 logger.exception("deploy unauthorized feedback failed")
             return
-        deploy_at_ok = (
-            not req_at_bot
-            or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
-            or _monitoring_at_bot_requirement_satisfied(
-                raw_text,
-                mentions,
-                content_at_entity_ids=content_at_entity_ids,
-                msg=msg,
-                chat_type=im_chat_type,
-            )
+        deploy_at_ok = _deploy_bot_addressed(
+            raw_text,
+            mentions,
+            content_at_entity_ids,
+            msg,
+            im_chat_type,
         )
         if not deploy_at_ok:
             logger.info("deploy request skip — @ not addressed to this bot")
@@ -8629,9 +8711,17 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         with _monitoring_reply_dispatch_lock:
             if im_event_id and im_event_id in _processed_lark_im_event_ids:
                 logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
+                try:
+                    _deploy_reply(chat_id, open_id, "OK — already handled.")
+                except Exception:
+                    logger.exception("deploy duplicate ack failed")
                 return
             if processed_stick_d and processed_stick_d in _processed_lark_message_ids:
                 logger.info("duplicate deploy stick=%r — skip", processed_stick_d[:96])
+                try:
+                    _deploy_reply(chat_id, open_id, "OK — already handled.")
+                except Exception:
+                    logger.exception("deploy duplicate stick ack failed")
                 return
             if debounce_key_d in _monitoring_inflight_keys:
                 logger.info("deploy skip — already in flight")
@@ -8669,7 +8759,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
-        and not _im_text_matches_deploy_request(clean or "", raw_text or "")
+        and not _im_text_matches_deploy_request(*deploy_blobs)
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
