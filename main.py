@@ -8590,6 +8590,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 (open_id or "")[:24],
                 (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
             )
+            try:
+                _deploy_reply(
+                    chat_id,
+                    open_id,
+                    "Deploy (Grafana Game Bot): not authorized.",
+                )
+            except Exception:
+                logger.exception("deploy unauthorized feedback failed")
             return
         deploy_at_ok = (
             not req_at_bot
@@ -8605,7 +8613,12 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         if not deploy_at_ok:
             logger.info("deploy request skip — @ not addressed to this bot")
             try:
-                _deploy_reply(chat_id, open_id, "Please @ this bot, then send: git pull and restart service")
+                _deploy_reply(
+                    chat_id,
+                    open_id,
+                    "Deploy (Grafana Game Bot): please @ **Grafana Game Bot** (not Platform), "
+                    "then send: git pull origin main and restart service",
+                )
             except Exception:
                 logger.exception("deploy @-gate feedback failed")
             return
