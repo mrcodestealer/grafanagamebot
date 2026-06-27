@@ -268,7 +268,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     "JUNCHEN": "",
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
-    # @ bot + "git pull and restart service" — git pull then systemctl restart (authorized user only)
+    # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
     "DEPLOY_ENABLE": "1",
     "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
     # Empty = directory containing this main.py; override on server if repo lives elsewhere
@@ -628,7 +628,7 @@ DEPLOY_ENABLE = _lark_env_truthy_or_default("DEPLOY_ENABLE", default=True)
 DEPLOY_ALLOWED_USER_OPEN_ID = _cfg_str("DEPLOY_ALLOWED_USER_OPEN_ID", "").strip()
 DEPLOY_GIT_REPO_PATH = _cfg_str("DEPLOY_GIT_REPO_PATH", "").strip()
 DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "grafanagamebot").strip()
-_DEPLOY_REQUEST_RE = re.compile(r"git\s+pull\b.*\brestart\b.*\bservice\b", re.IGNORECASE)
+_DEPLOY_REQUEST_RE = re.compile(r"git\s+pull\b.*\brestart\b", re.IGNORECASE)
 MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
@@ -4327,12 +4327,47 @@ def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
             _monitoring_inflight_keys.discard(debounce_key)
 
 
-def _im_text_matches_deploy_request(clean: str) -> bool:
-    """True when cleaned IM text asks for ``git pull`` + ``restart service`` (after @ bot)."""
-    c = re.sub(r"\s+", " ", (clean or "").strip())
-    if not c:
+def _im_text_matches_deploy_request(*texts: str) -> bool:
+    """True when any cleaned IM blob asks for ``git pull`` + ``restart`` (``service`` optional)."""
+    for raw in texts:
+        c = re.sub(r"\s+", " ", (raw or "").strip())
+        if c and _DEPLOY_REQUEST_RE.search(c):
+            return True
+    return False
+
+
+def _deploy_sender_authorized(sender: Dict[str, Any], open_id: str) -> bool:
+    allowed = (DEPLOY_ALLOWED_USER_OPEN_ID or "").strip()
+    if not allowed:
         return False
-    return bool(_DEPLOY_REQUEST_RE.search(c))
+    ids: Set[str] = set()
+    o = (open_id or "").strip()
+    if o:
+        ids.add(o)
+    if isinstance(sender, dict):
+        for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
+            v = sender.get(k)
+            if v is not None:
+                s = str(v).strip()
+                if s:
+                    ids.add(s)
+        sid = sender.get("sender_id") or sender.get("senderId")
+        if isinstance(sid, dict):
+            for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
+                v = sid.get(k)
+                if v is not None:
+                    s = str(v).strip()
+                    if s:
+                        ids.add(s)
+    return allowed in ids
+
+
+def _deploy_reply(chat_id: str, open_id: str, text: str) -> None:
+    rt = "chat_id" if (chat_id or "").strip() else "open_id"
+    rv = (chat_id or open_id or "").strip()
+    if not rv:
+        return
+    _lark_send_text(rt, rv, text)
 
 
 def _deploy_git_repo_path() -> str:
@@ -4367,21 +4402,16 @@ def _deploy_run_cmd(
 
 
 def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
-    rt = "chat_id" if (chat_id or "").strip() else "open_id"
-    rv = (chat_id or open_id or "").strip()
-
     def _reply(msg: str) -> None:
-        if not rv:
-            return
         try:
-            _lark_send_text(rt, rv, msg)
+            _deploy_reply(chat_id, open_id, msg)
         except Exception:
             logger.exception("deploy reply failed")
 
     try:
         repo = _deploy_git_repo_path()
         svc = (DEPLOY_SYSTEMD_SERVICE or "grafanagamebot").strip() or "grafanagamebot"
-        _reply(f"Deploy: running `git pull origin main` in `{repo}` …")
+        _reply(f"Starting `git pull origin main` in `{repo}` …")
         rc, out = _deploy_run_cmd(["git", "pull", "origin", "main"], cwd=repo, timeout=300)
         tail = "\n".join((out or "").splitlines()[-12:])
         if rc != 0:
@@ -8551,12 +8581,14 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             ).start()
         return
 
-    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(clean or "")
+    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(clean or "", raw_text or "")
     if deploy_req:
-        if (open_id or "").strip() != DEPLOY_ALLOWED_USER_OPEN_ID:
+        deploy_user_ok = _deploy_sender_authorized(sender, open_id or "")
+        if not deploy_user_ok:
             logger.info(
-                "deploy request denied — sender %r not in DEPLOY_ALLOWED_USER_OPEN_ID",
+                "deploy request denied — sender %r not in DEPLOY_ALLOWED_USER_OPEN_ID=%r",
                 (open_id or "")[:24],
+                (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
             )
             return
         deploy_at_ok = (
@@ -8572,6 +8604,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         )
         if not deploy_at_ok:
             logger.info("deploy request skip — @ not addressed to this bot")
+            try:
+                _deploy_reply(chat_id, open_id, "Please @ this bot, then send: git pull and restart service")
+            except Exception:
+                logger.exception("deploy @-gate feedback failed")
             return
         processed_stick_d = _monitoring_processed_stick(
             mid, im_event_id, chat_id or "", sender_debounce, msg_time
@@ -8586,6 +8622,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 return
             if debounce_key_d in _monitoring_inflight_keys:
                 logger.info("deploy skip — already in flight")
+                try:
+                    _deploy_reply(chat_id, open_id, "OK — deploy already running.")
+                except Exception:
+                    logger.exception("deploy in-flight ack failed")
                 return
             _monitoring_inflight_keys.add(debounce_key_d)
             if processed_stick_d:
@@ -8596,6 +8636,10 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                     _processed_lark_im_event_ids.clear()
                     _processed_lark_im_event_ids.add(im_event_id)
         logger.info("deploy command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        try:
+            _deploy_reply(chat_id, open_id, "OK")
+        except Exception:
+            logger.exception("deploy OK ack failed")
         threading.Thread(
             target=_deploy_git_pull_restart_worker,
             args=(chat_id, open_id, debounce_key_d),
@@ -8612,7 +8656,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
-        and not _im_text_matches_deploy_request(clean or "")
+        and not _im_text_matches_deploy_request(clean or "", raw_text or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
