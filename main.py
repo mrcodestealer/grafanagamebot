@@ -271,6 +271,8 @@ _CFG: Dict[str, Any] = {
     # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
     "DEPLOY_ENABLE": "1",
     "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_039809aab3d6df17028dfe4bdfc568cd",
+    # Optional extra allow-list (space/comma separated open_ids)
+    "DEPLOY_ALLOWED_USER_OPEN_IDS": "",
     # Empty = directory containing this main.py; override on server if repo lives elsewhere
     "DEPLOY_GIT_REPO_PATH": "",
     "DEPLOY_SYSTEMD_SERVICE": "grafanagamebot",
@@ -627,6 +629,14 @@ MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
 DEPLOY_ENABLE = _lark_env_truthy_or_default("DEPLOY_ENABLE", default=True)
 DEPLOY_ALLOWED_USER_OPEN_ID = _cfg_str("DEPLOY_ALLOWED_USER_OPEN_ID", "").strip()
+DEPLOY_ALLOWED_USER_OPEN_ID_SET: Set[str] = set()
+if DEPLOY_ALLOWED_USER_OPEN_ID:
+    DEPLOY_ALLOWED_USER_OPEN_ID_SET.add(DEPLOY_ALLOWED_USER_OPEN_ID)
+for _dep_uid in re.split(
+    r"[\s,;]+", _cfg_str("DEPLOY_ALLOWED_USER_OPEN_IDS", "").strip()
+):
+    if _dep_uid.strip():
+        DEPLOY_ALLOWED_USER_OPEN_ID_SET.add(_dep_uid.strip())
 DEPLOY_GIT_REPO_PATH = _cfg_str("DEPLOY_GIT_REPO_PATH", "").strip()
 DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "grafanagamebot").strip()
 DEPLOY_TRIGGER = _cfg_str("DEPLOY_TRIGGER", "/deploy").strip()
@@ -4399,19 +4409,25 @@ def _lark_payload_looks_deploy_like(data: Any) -> bool:
     return bool(tri and tri in blob)
 
 
-def _deploy_sender_id_set(sender: Dict[str, Any], open_id: str) -> Set[str]:
+def _deploy_sender_id_set(
+    sender: Dict[str, Any],
+    open_id: str,
+    send_wrap: Optional[Dict[str, Any]] = None,
+) -> Set[str]:
     ids: Set[str] = set()
     o = (open_id or "").strip()
     if o:
         ids.add(o)
-    if isinstance(sender, dict):
+    for root in (sender, send_wrap or {}):
+        if not isinstance(root, dict):
+            continue
         for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
-            v = sender.get(k)
+            v = root.get(k)
             if v is not None:
                 s = str(v).strip()
                 if s:
                     ids.add(s)
-        sid = sender.get("sender_id") or sender.get("senderId")
+        sid = root.get("sender_id") or root.get("senderId")
         if isinstance(sid, dict):
             for k in ("open_id", "openId", "user_id", "userId", "union_id", "unionId"):
                 v = sid.get(k)
@@ -4419,14 +4435,35 @@ def _deploy_sender_id_set(sender: Dict[str, Any], open_id: str) -> Set[str]:
                     s = str(v).strip()
                     if s:
                         ids.add(s)
+        for s in _lark_iter_mention_scalar_strings(root):
+            if s.startswith("ou_"):
+                ids.add(s)
     return ids
 
 
-def _deploy_sender_authorized(sender: Dict[str, Any], open_id: str) -> bool:
-    allowed = (DEPLOY_ALLOWED_USER_OPEN_ID or "").strip()
-    if not allowed:
+def _deploy_sender_authorized(
+    sender: Dict[str, Any],
+    open_id: str,
+    send_wrap: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not DEPLOY_ALLOWED_USER_OPEN_ID_SET:
         return False
-    return allowed in _deploy_sender_id_set(sender, open_id)
+    sender_ids = _deploy_sender_id_set(sender, open_id, send_wrap)
+    return bool(sender_ids & DEPLOY_ALLOWED_USER_OPEN_ID_SET)
+
+
+def _deploy_sender_primary_open_id(
+    sender: Dict[str, Any],
+    open_id: str,
+    send_wrap: Optional[Dict[str, Any]] = None,
+) -> str:
+    o = (open_id or "").strip()
+    if o:
+        return o
+    for s in sorted(_deploy_sender_id_set(sender, open_id, send_wrap)):
+        if s.startswith("ou_"):
+            return s
+    return "unknown"
 
 
 def _deploy_bot_addressed(
@@ -4547,6 +4584,7 @@ def _deploy_try_handle_im_message(
     chat_id: str,
     open_id: str,
     sender: Dict[str, Any],
+    send_wrap: Dict[str, Any],
     mid: str,
     im_event_id: str,
     sender_debounce: str,
@@ -4564,27 +4602,35 @@ def _deploy_try_handle_im_message(
         "deploy phrase detected open_id=%r chat=%r authorized=%s blobs=%r",
         (open_id or "")[:24],
         (chat_id or "")[:16],
-        _deploy_sender_authorized(sender, open_id or ""),
+        _deploy_sender_authorized(sender, open_id or "", send_wrap),
         [b[:80] for b in deploy_blobs[:4]],
     )
 
     if not DEPLOY_ENABLE:
         logger.warning("deploy-like message but DEPLOY_ENABLE=0")
-        if _deploy_sender_authorized(sender, open_id or ""):
+        if _deploy_sender_authorized(sender, open_id or "", send_wrap):
             try:
                 _deploy_reply(chat_id, open_id, "Deploy (Grafana Game Bot): disabled (DEPLOY_ENABLE=0).")
             except Exception:
                 logger.exception("deploy disabled feedback failed")
         return True
 
-    if not _deploy_sender_authorized(sender, open_id or ""):
+    if not _deploy_sender_authorized(sender, open_id or "", send_wrap):
+        sender_ids = sorted(_deploy_sender_id_set(sender, open_id or "", send_wrap))
+        primary = _deploy_sender_primary_open_id(sender, open_id or "", send_wrap)
         logger.info(
             "deploy request denied — sender ids=%r allowed=%r",
-            sorted(_deploy_sender_id_set(sender, open_id or "")),
-            (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
+            sender_ids,
+            sorted(DEPLOY_ALLOWED_USER_OPEN_ID_SET),
         )
         try:
-            _deploy_reply(chat_id, open_id, "Deploy (Grafana Game Bot): not authorized.")
+            _deploy_reply(
+                chat_id,
+                open_id,
+                f"Deploy (Grafana Game Bot): not authorized.\n"
+                f"Your Feishu id: `{primary}`\n"
+                f"Allowed: `{next(iter(DEPLOY_ALLOWED_USER_OPEN_ID_SET), '')}`",
+            )
         except Exception:
             logger.exception("deploy unauthorized feedback failed")
         return True
@@ -8736,6 +8782,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         chat_id=chat_id,
         open_id=open_id or "",
         sender=sender,
+        send_wrap=send_wrap,
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,
@@ -8927,7 +8974,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 raw_text=raw_text,
                 chat_type=im_chat_type,
             )
-        elif deploy_like and _deploy_sender_authorized(sender, open_id or ""):
+        elif deploy_like and _deploy_sender_authorized(sender, open_id or "", send_wrap):
             logger.warning(
                 "deploy-like IM reached no-trigger exit — open_id=%r (unexpected)",
                 (open_id or "")[:24],
