@@ -274,6 +274,7 @@ _CFG: Dict[str, Any] = {
     # Empty = directory containing this main.py; override on server if repo lives elsewhere
     "DEPLOY_GIT_REPO_PATH": "",
     "DEPLOY_SYSTEMD_SERVICE": "grafanagamebot",
+    "DEPLOY_TRIGGER": "/deploy",
 }
 
 
@@ -628,6 +629,7 @@ DEPLOY_ENABLE = _lark_env_truthy_or_default("DEPLOY_ENABLE", default=True)
 DEPLOY_ALLOWED_USER_OPEN_ID = _cfg_str("DEPLOY_ALLOWED_USER_OPEN_ID", "").strip()
 DEPLOY_GIT_REPO_PATH = _cfg_str("DEPLOY_GIT_REPO_PATH", "").strip()
 DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "grafanagamebot").strip()
+DEPLOY_TRIGGER = _cfg_str("DEPLOY_TRIGGER", "/deploy").strip()
 _DEPLOY_REQUEST_RE = re.compile(r"git\s+pull\b.*\brestart\b", re.IGNORECASE)
 MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
@@ -1488,6 +1490,7 @@ def _lark_clean_command_text(raw_text: str, mentions: Any) -> str:
             ((MONITORING_TRIGGER or "").strip() or "/mo"),
             ((MONITORING_MUTE_TRIGGER or "").strip() or "/m"),
             ((MONITORING_CANCELMUTE_TRIGGER or "").strip() or "/c"),
+            ((DEPLOY_TRIGGER or "").strip() or "/deploy"),
         },
         key=len,
         reverse=True,
@@ -4372,12 +4375,28 @@ def _deploy_message_text_blobs(
 
 
 def _im_text_matches_deploy_request(*texts: str) -> bool:
-    """True when any cleaned IM blob asks for ``git pull`` + ``restart`` (``service`` optional)."""
+    """True for ``/deploy`` or natural ``git pull … restart …`` phrasing."""
+    tri = (DEPLOY_TRIGGER or "/deploy").strip()
     for raw in texts:
         c = re.sub(r"\s+", " ", (raw or "").strip())
-        if c and _DEPLOY_REQUEST_RE.search(c):
+        if not c:
+            continue
+        if tri and _im_command_matches(c, tri):
+            return True
+        if _DEPLOY_REQUEST_RE.search(c):
             return True
     return False
+
+
+def _lark_payload_looks_deploy_like(data: Any) -> bool:
+    try:
+        blob = json.dumps(data, ensure_ascii=False).casefold()
+    except Exception:
+        return False
+    if "git pull" in blob and "restart" in blob:
+        return True
+    tri = (DEPLOY_TRIGGER or "/deploy").strip().casefold()
+    return bool(tri and tri in blob)
 
 
 def _deploy_sender_id_set(sender: Dict[str, Any], open_id: str) -> Set[str]:
@@ -4513,6 +4532,129 @@ def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: st
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _deploy_try_handle_im_message(
+    *,
+    msg: Dict[str, Any],
+    event: Dict[str, Any],
+    data: Dict[str, Any],
+    raw_text: str,
+    clean: str,
+    mentions: Any,
+    content_at_entity_ids: Optional[List[str]],
+    im_chat_type: str,
+    chat_id: str,
+    open_id: str,
+    sender: Dict[str, Any],
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """
+    Handle ``/deploy`` or ``git pull … restart …`` for the authorized user.
+    Returns True when the message looks like a deploy command (handled or rejected with a reply).
+    """
+    deploy_blobs = _deploy_message_text_blobs(msg, event, raw_text or "", clean or "")
+    if not _im_text_matches_deploy_request(*deploy_blobs):
+        return False
+
+    logger.info(
+        "deploy phrase detected open_id=%r chat=%r authorized=%s blobs=%r",
+        (open_id or "")[:24],
+        (chat_id or "")[:16],
+        _deploy_sender_authorized(sender, open_id or ""),
+        [b[:80] for b in deploy_blobs[:4]],
+    )
+
+    if not DEPLOY_ENABLE:
+        logger.warning("deploy-like message but DEPLOY_ENABLE=0")
+        if _deploy_sender_authorized(sender, open_id or ""):
+            try:
+                _deploy_reply(chat_id, open_id, "Deploy (Grafana Game Bot): disabled (DEPLOY_ENABLE=0).")
+            except Exception:
+                logger.exception("deploy disabled feedback failed")
+        return True
+
+    if not _deploy_sender_authorized(sender, open_id or ""):
+        logger.info(
+            "deploy request denied — sender ids=%r allowed=%r",
+            sorted(_deploy_sender_id_set(sender, open_id or "")),
+            (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
+        )
+        try:
+            _deploy_reply(chat_id, open_id, "Deploy (Grafana Game Bot): not authorized.")
+        except Exception:
+            logger.exception("deploy unauthorized feedback failed")
+        return True
+
+    if not _deploy_bot_addressed(
+        raw_text,
+        mentions,
+        content_at_entity_ids,
+        msg,
+        im_chat_type,
+    ):
+        logger.info("deploy request skip — @ not addressed to this bot")
+        try:
+            _deploy_reply(
+                chat_id,
+                open_id,
+                "Deploy (Grafana Game Bot): please @ **Grafana Game Bot** (not Platform), "
+                "then send `/deploy` or: git pull origin main and restart service",
+            )
+        except Exception:
+            logger.exception("deploy @-gate feedback failed")
+        return True
+
+    processed_stick_d = _monitoring_processed_stick(
+        mid, im_event_id, chat_id or "", sender_debounce, msg_time
+    )
+    debounce_key_d = f"{(chat_id or '').strip()}\n__deploy_cmd__"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
+            try:
+                _deploy_reply(chat_id, open_id, "OK — already handled.")
+            except Exception:
+                logger.exception("deploy duplicate ack failed")
+            return True
+        if processed_stick_d and processed_stick_d in _processed_lark_message_ids:
+            logger.info("duplicate deploy stick=%r — skip", processed_stick_d[:96])
+            try:
+                _deploy_reply(chat_id, open_id, "OK — already handled.")
+            except Exception:
+                logger.exception("deploy duplicate stick ack failed")
+            return True
+        if debounce_key_d in _monitoring_inflight_keys:
+            logger.info("deploy skip — already in flight")
+            try:
+                _deploy_reply(chat_id, open_id, "OK — deploy already running.")
+            except Exception:
+                logger.exception("deploy in-flight ack failed")
+            return True
+        _monitoring_inflight_keys.add(debounce_key_d)
+        if processed_stick_d:
+            _processed_lark_message_ids.add(processed_stick_d)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    logger.info("deploy command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+    try:
+        _deploy_reply(chat_id, open_id, "OK")
+    except Exception:
+        logger.exception("deploy OK ack failed")
+    threading.Thread(
+        target=_deploy_git_pull_restart_worker,
+        args=(chat_id, open_id, debounce_key_d),
+        daemon=True,
+        name="deploy-git-restart",
+    ).start()
+    return True
 
 
 def _monitoring_at_mention_help_text() -> str:
@@ -8531,12 +8673,17 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     mtype = (_lark_dict_pick_str(msg, "message_type", "messageType") or "").lower()
     chat_resolved = _lark_message_chat_id(msg)
     im_chat_type_log = _lark_dict_pick_str(msg, "chat_type", "chatType") or ""
+    raw_preview = ""
+    if isinstance(msg, dict):
+        raw_preview = (_lark_extract_plain_text_from_message(msg) or "")[:100]
     logger.info(
-        "im.message mid=%r mtype=%r chat_type=%r chat_prefix=%r",
+        "im.message mid=%r mtype=%r chat_type=%r chat_prefix=%r raw_preview=%r deploy_payload=%s",
         mid or None,
         mtype or None,
         im_chat_type_log or None,
         (chat_resolved[:12] + "…") if len(chat_resolved) > 12 else (chat_resolved or None),
+        raw_preview or None,
+        _lark_payload_looks_deploy_like(data),
     )
     logger.debug("im.message msg_keys=%s", list(msg.keys())[:24] if isinstance(msg, dict) else [])
     if mtype and mtype in _SKIP_IM_MESSAGE_TYPES:
@@ -8574,6 +8721,27 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
     sender_debounce = _lark_im_sender_debounce_token(sender, open_id)
     im_event_id = _lark_im_payload_event_id(data)
     msg_time = _lark_im_message_time_token(msg)
+    deploy_blobs = _deploy_message_text_blobs(msg, event, raw_text or "", clean or "")
+    deploy_like = _im_text_matches_deploy_request(*deploy_blobs)
+
+    if _deploy_try_handle_im_message(
+        msg=msg,
+        event=event,
+        data=data,
+        raw_text=raw_text or "",
+        clean=clean or "",
+        mentions=mentions,
+        content_at_entity_ids=content_at_entity_ids,
+        im_chat_type=im_chat_type,
+        chat_id=chat_id,
+        open_id=open_id or "",
+        sender=sender,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
 
     sp_cmd: Optional[str] = None
     req_at_bot = MONITORING_TRIGGER_REQUIRES_AT_BOT
@@ -8659,98 +8827,6 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             ).start()
         return
 
-    deploy_blobs = _deploy_message_text_blobs(msg, event, raw_text or "", clean or "")
-    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(*deploy_blobs)
-    if deploy_req:
-        logger.info(
-            "deploy phrase detected open_id=%r chat=%r blobs=%r",
-            (open_id or "")[:24],
-            (chat_id or "")[:16],
-            [b[:80] for b in deploy_blobs[:4]],
-        )
-        deploy_user_ok = _deploy_sender_authorized(sender, open_id or "")
-        if not deploy_user_ok:
-            logger.info(
-                "deploy request denied — sender %r ids=%r allowed=%r",
-                (open_id or "")[:24],
-                sorted(_deploy_sender_id_set(sender, open_id or "")),
-                (DEPLOY_ALLOWED_USER_OPEN_ID or "")[:24],
-            )
-            try:
-                _deploy_reply(
-                    chat_id,
-                    open_id,
-                    "Deploy (Grafana Game Bot): not authorized.",
-                )
-            except Exception:
-                logger.exception("deploy unauthorized feedback failed")
-            return
-        deploy_at_ok = _deploy_bot_addressed(
-            raw_text,
-            mentions,
-            content_at_entity_ids,
-            msg,
-            im_chat_type,
-        )
-        if not deploy_at_ok:
-            logger.info("deploy request skip — @ not addressed to this bot")
-            try:
-                _deploy_reply(
-                    chat_id,
-                    open_id,
-                    "Deploy (Grafana Game Bot): please @ **Grafana Game Bot** (not Platform), "
-                    "then send: git pull origin main and restart service",
-                )
-            except Exception:
-                logger.exception("deploy @-gate feedback failed")
-            return
-        processed_stick_d = _monitoring_processed_stick(
-            mid, im_event_id, chat_id or "", sender_debounce, msg_time
-        )
-        debounce_key_d = f"{(chat_id or '').strip()}\n__deploy_cmd__"
-        with _monitoring_reply_dispatch_lock:
-            if im_event_id and im_event_id in _processed_lark_im_event_ids:
-                logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
-                try:
-                    _deploy_reply(chat_id, open_id, "OK — already handled.")
-                except Exception:
-                    logger.exception("deploy duplicate ack failed")
-                return
-            if processed_stick_d and processed_stick_d in _processed_lark_message_ids:
-                logger.info("duplicate deploy stick=%r — skip", processed_stick_d[:96])
-                try:
-                    _deploy_reply(chat_id, open_id, "OK — already handled.")
-                except Exception:
-                    logger.exception("deploy duplicate stick ack failed")
-                return
-            if debounce_key_d in _monitoring_inflight_keys:
-                logger.info("deploy skip — already in flight")
-                try:
-                    _deploy_reply(chat_id, open_id, "OK — deploy already running.")
-                except Exception:
-                    logger.exception("deploy in-flight ack failed")
-                return
-            _monitoring_inflight_keys.add(debounce_key_d)
-            if processed_stick_d:
-                _processed_lark_message_ids.add(processed_stick_d)
-            if im_event_id:
-                _processed_lark_im_event_ids.add(im_event_id)
-                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
-                    _processed_lark_im_event_ids.clear()
-                    _processed_lark_im_event_ids.add(im_event_id)
-        logger.info("deploy command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
-        try:
-            _deploy_reply(chat_id, open_id, "OK")
-        except Exception:
-            logger.exception("deploy OK ack failed")
-        threading.Thread(
-            target=_deploy_git_pull_restart_worker,
-            args=(chat_id, open_id, debounce_key_d),
-            daemon=True,
-            name="deploy-git-restart",
-        ).start()
-        return
-
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -8759,7 +8835,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
-        and not _im_text_matches_deploy_request(*deploy_blobs)
+        and not deploy_like
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
@@ -8851,6 +8927,19 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
                 raw_text=raw_text,
                 chat_type=im_chat_type,
             )
+        elif deploy_like and _deploy_sender_authorized(sender, open_id or ""):
+            logger.warning(
+                "deploy-like IM reached no-trigger exit — open_id=%r (unexpected)",
+                (open_id or "")[:24],
+            )
+            try:
+                _deploy_reply(
+                    chat_id,
+                    open_id,
+                    "Deploy (Grafana Game Bot): message seen but not handled — server may need restart with latest code.",
+                )
+            except Exception:
+                logger.exception("deploy no-trigger fallback failed")
         return
 
     body_key = _monitoring_dispatch_body_key(clean, raw_text, mentions)
@@ -8965,6 +9054,12 @@ def _handle_im_message_receive(data: Dict[str, Any]) -> Response:
         try:
             payload = copy.deepcopy(ref)
             et = _lark_header_event_type(payload)
+            if _lark_payload_looks_deploy_like(payload):
+                logger.warning(
+                    "im ingress HTTP %s — deploy-like payload detected mid=%r",
+                    et,
+                    ((payload.get("event") or {}).get("message") or {}).get("message_id"),
+                )
             logger.info(
                 "handling %s (async) message_id=%r chat_id_prefix=%s",
                 et,
@@ -8983,6 +9078,8 @@ def _on_ws_p2_im_message_receive_v1(data: Any) -> None:
     """Official WS handler for ``im.message.receive_v1`` (Feishu long-connection sample code)."""
     try:
         payload = _lark_ws_sdk_event_to_dict(data)
+        if _lark_payload_looks_deploy_like(payload):
+            logger.warning("im ingress WS im.message.receive_v1 — deploy-like payload detected")
         mid, mtype, chat = _ws_log_message_snip(payload)
         logger.info("ws im.message.receive_v1 mid=%r mtype=%r chat=%r", mid, mtype, chat)
         _lark_ws_mark_im_received()
@@ -9562,6 +9659,13 @@ def run_monitoring_bot() -> None:
     logger.info(
         "monitoring bot pid=%s — duplicate replies: check two processes (same APP_ID) or IM dedupe logs.",
         os.getpid(),
+    )
+    logger.info(
+        "DEPLOY git-restart: enable=%s trigger=%r allowed_user=%s service=%s",
+        DEPLOY_ENABLE,
+        (DEPLOY_TRIGGER or "/deploy"),
+        ((DEPLOY_ALLOWED_USER_OPEN_ID[:20] + "…") if len(DEPLOY_ALLOWED_USER_OPEN_ID or "") > 20 else (DEPLOY_ALLOWED_USER_OPEN_ID or "(none)")),
+        DEPLOY_SYSTEMD_SERVICE,
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
