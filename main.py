@@ -4669,24 +4669,12 @@ def _deploy_try_handle_im_message(
     with _monitoring_reply_dispatch_lock:
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
             logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
-            try:
-                _deploy_reply(chat_id, open_id, "OK — already handled.")
-            except Exception:
-                logger.exception("deploy duplicate ack failed")
             return True
         if processed_stick_d and processed_stick_d in _processed_lark_message_ids:
             logger.info("duplicate deploy stick=%r — skip", processed_stick_d[:96])
-            try:
-                _deploy_reply(chat_id, open_id, "OK — already handled.")
-            except Exception:
-                logger.exception("deploy duplicate stick ack failed")
             return True
         if debounce_key_d in _monitoring_inflight_keys:
-            logger.info("deploy skip — already in flight")
-            try:
-                _deploy_reply(chat_id, open_id, "OK — deploy already running.")
-            except Exception:
-                logger.exception("deploy in-flight ack failed")
+            logger.info("deploy skip — already in flight (duplicate delivery — no extra reply)")
             return True
         _monitoring_inflight_keys.add(debounce_key_d)
         if processed_stick_d:
