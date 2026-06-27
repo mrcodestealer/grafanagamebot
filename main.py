@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import queue
+import subprocess
 from urllib.parse import urlencode
 from datetime import datetime
 import re
@@ -267,6 +268,12 @@ _CFG: Dict[str, Any] = {
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     "JUNCHEN": "",
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    # @ bot + "git pull and restart service" — git pull then systemctl restart (authorized user only)
+    "DEPLOY_ENABLE": "1",
+    "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
+    # Empty = directory containing this main.py; override on server if repo lives elsewhere
+    "DEPLOY_GIT_REPO_PATH": "",
+    "DEPLOY_SYSTEMD_SERVICE": "grafanagamebot",
 }
 
 
@@ -617,6 +624,11 @@ MONITORING_TRIGGER = _cfg_str("MONITORING_TRIGGER", "/mo")
 MONITORING_MUTE_TRIGGER = _cfg_str("MONITORING_MUTE_TRIGGER", "/m").strip()
 MONITORING_CANCELMUTE_TRIGGER = _cfg_str("MONITORING_CANCELMUTE_TRIGGER", "/c").strip()
 TARGET_USER_OPEN_ID = _cfg_str("TARGET_USER_OPEN_ID", _cfg_str("JUNCHEN", "")).strip()
+DEPLOY_ENABLE = _lark_env_truthy_or_default("DEPLOY_ENABLE", default=True)
+DEPLOY_ALLOWED_USER_OPEN_ID = _cfg_str("DEPLOY_ALLOWED_USER_OPEN_ID", "").strip()
+DEPLOY_GIT_REPO_PATH = _cfg_str("DEPLOY_GIT_REPO_PATH", "").strip()
+DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "grafanagamebot").strip()
+_DEPLOY_REQUEST_RE = re.compile(r"git\s+pull\b.*\brestart\b.*\bservice\b", re.IGNORECASE)
 MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
     "MONITORING_ALERT_AT_USER_NOTE",
     "It might be event started or false alert kindly check",
@@ -4310,6 +4322,86 @@ def _cancelmute_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
         )
     except Exception:
         logger.exception("cancelmute failed")
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _im_text_matches_deploy_request(clean: str) -> bool:
+    """True when cleaned IM text asks for ``git pull`` + ``restart service`` (after @ bot)."""
+    c = re.sub(r"\s+", " ", (clean or "").strip())
+    if not c:
+        return False
+    return bool(_DEPLOY_REQUEST_RE.search(c))
+
+
+def _deploy_git_repo_path() -> str:
+    p = (DEPLOY_GIT_REPO_PATH or "").strip()
+    if p:
+        return os.path.abspath(p)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _deploy_run_cmd(
+    argv: List[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out.strip()
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or "") + (e.stderr or "")).strip()
+        return 124, partial or f"timed out after {timeout}s"
+    except Exception as e:
+        return 1, str(e)
+
+
+def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: str) -> None:
+    rt = "chat_id" if (chat_id or "").strip() else "open_id"
+    rv = (chat_id or open_id or "").strip()
+
+    def _reply(msg: str) -> None:
+        if not rv:
+            return
+        try:
+            _lark_send_text(rt, rv, msg)
+        except Exception:
+            logger.exception("deploy reply failed")
+
+    try:
+        repo = _deploy_git_repo_path()
+        svc = (DEPLOY_SYSTEMD_SERVICE or "grafanagamebot").strip() or "grafanagamebot"
+        _reply(f"Deploy: running `git pull` in `{repo}` …")
+        rc, out = _deploy_run_cmd(["git", "pull"], cwd=repo, timeout=300)
+        tail = "\n".join((out or "").splitlines()[-12:])
+        if rc != 0:
+            _reply(f"Deploy failed — `git pull` exit {rc}:\n```\n{tail or '(no output)'}\n```")
+            return
+        _reply(f"`git pull` OK (exit 0):\n```\n{tail or '(no output)'}\n```\nRestarting `{svc}` …")
+        restart_rc, restart_out = _deploy_run_cmd(
+            ["systemctl", "restart", svc],
+            timeout=120,
+        )
+        if restart_rc != 0:
+            rtail = "\n".join((restart_out or "").splitlines()[-8:])
+            _reply(
+                f"`systemctl restart {svc}` failed (exit {restart_rc}):\n```\n{rtail or '(no output)'}\n```"
+            )
+            return
+        _reply(f"`systemctl restart {svc}` sent — service should come back shortly.")
+    except Exception:
+        logger.exception("deploy git pull + restart failed")
+        _reply("Deploy failed — unexpected error (see server logs).")
     finally:
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
@@ -8459,6 +8551,59 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
             ).start()
         return
 
+    deploy_req = DEPLOY_ENABLE and _im_text_matches_deploy_request(clean or "")
+    if deploy_req:
+        if (open_id or "").strip() != DEPLOY_ALLOWED_USER_OPEN_ID:
+            logger.info(
+                "deploy request denied — sender %r not in DEPLOY_ALLOWED_USER_OPEN_ID",
+                (open_id or "")[:24],
+            )
+            return
+        deploy_at_ok = (
+            not req_at_bot
+            or _lark_im_bot_addressed_in_mentions_or_body(mentions, content_at_entity_ids)
+            or _monitoring_at_bot_requirement_satisfied(
+                raw_text,
+                mentions,
+                content_at_entity_ids=content_at_entity_ids,
+                msg=msg,
+                chat_type=im_chat_type,
+            )
+        )
+        if not deploy_at_ok:
+            logger.info("deploy request skip — @ not addressed to this bot")
+            return
+        processed_stick_d = _monitoring_processed_stick(
+            mid, im_event_id, chat_id or "", sender_debounce, msg_time
+        )
+        debounce_key_d = f"{(chat_id or '').strip()}\n__deploy_cmd__"
+        with _monitoring_reply_dispatch_lock:
+            if im_event_id and im_event_id in _processed_lark_im_event_ids:
+                logger.info("duplicate IM event_id=%s — skip (deploy)", im_event_id)
+                return
+            if processed_stick_d and processed_stick_d in _processed_lark_message_ids:
+                logger.info("duplicate deploy stick=%r — skip", processed_stick_d[:96])
+                return
+            if debounce_key_d in _monitoring_inflight_keys:
+                logger.info("deploy skip — already in flight")
+                return
+            _monitoring_inflight_keys.add(debounce_key_d)
+            if processed_stick_d:
+                _processed_lark_message_ids.add(processed_stick_d)
+            if im_event_id:
+                _processed_lark_im_event_ids.add(im_event_id)
+                if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                    _processed_lark_im_event_ids.clear()
+                    _processed_lark_im_event_ids.add(im_event_id)
+        logger.info("deploy command accepted chat=%r open=%r", bool(chat_id), bool(open_id))
+        threading.Thread(
+            target=_deploy_git_pull_restart_worker,
+            args=(chat_id, open_id, debounce_key_d),
+            daemon=True,
+            name="deploy-git-restart",
+        ).start()
+        return
+
     cn = re.sub(r"\s+", " ", (clean or "").strip().lower())
     if (
         _lark_effective_bot_open_id()
@@ -8467,6 +8612,7 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         and not _im_command_matches(clean or "", MONITORING_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_MUTE_TRIGGER)
         and not _im_command_matches(clean or "", MONITORING_CANCELMUTE_TRIGGER)
+        and not _im_text_matches_deploy_request(clean or "")
     ):
         if MONITORING_TRIGGER_REQUIRES_AT_BOT and not _monitoring_at_bot_requirement_satisfied(
             raw_text,
