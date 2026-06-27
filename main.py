@@ -4381,13 +4381,13 @@ def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: st
     try:
         repo = _deploy_git_repo_path()
         svc = (DEPLOY_SYSTEMD_SERVICE or "grafanagamebot").strip() or "grafanagamebot"
-        _reply(f"Deploy: running `git pull` in `{repo}` …")
-        rc, out = _deploy_run_cmd(["git", "pull"], cwd=repo, timeout=300)
+        _reply(f"Deploy: running `git pull origin main` in `{repo}` …")
+        rc, out = _deploy_run_cmd(["git", "pull", "origin", "main"], cwd=repo, timeout=300)
         tail = "\n".join((out or "").splitlines()[-12:])
         if rc != 0:
-            _reply(f"Deploy failed — `git pull` exit {rc}:\n```\n{tail or '(no output)'}\n```")
+            _reply(f"Deploy failed — `git pull origin main` exit {rc}:\n```\n{tail or '(no output)'}\n```")
             return
-        _reply(f"`git pull` OK (exit 0):\n```\n{tail or '(no output)'}\n```\nRestarting `{svc}` …")
+        _reply(f"`git pull origin main` OK (exit 0):\n```\n{tail or '(no output)'}\n```\nRestarting `{svc}` …")
         restart_rc, restart_out = _deploy_run_cmd(
             ["systemctl", "restart", svc],
             timeout=120,
