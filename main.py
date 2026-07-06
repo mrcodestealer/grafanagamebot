@@ -267,6 +267,22 @@ _CFG: Dict[str, Any] = {
     "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
+    # Person tagging in alerts is DISABLED by default. Set =1 to restore @TARGET_USER_OPEN_ID.
+    "MONITORING_ALERT_AT_USER_ENABLE": "0",
+    # ---- AI second-review gate (local Ollama vision model / Qwen) ----
+    # After a threshold fires (first review), the (series-isolated) alert screenshot is sent to a
+    # local Ollama model for a SECOND review; the alert is posted to the group only when the model
+    # judges it ABNORMAL, and the AI explanation is appended to the message body.
+    "MONITORING_AI_GATE_ENABLE": "1",
+    "MONITORING_AI_OLLAMA_URL": "http://localhost:11434",
+    "MONITORING_AI_MODEL": "qwen3.6:35b-a3b",
+    "MONITORING_AI_TIMEOUT_SECONDS": "120",
+    # AI unreachable / undecided: 1=send anyway (no missed alerts), 0=suppress
+    "MONITORING_AI_GATE_FAIL_OPEN": "1",
+    # fail-open 时在正文末尾追加的说明（空=不追加）
+    "MONITORING_AI_FAIL_OPEN_NOTE": "🤖 AI review unavailable — alert sent without AI explanation.",
+    # 自定义判定提示词（留空用内置默认；可用 {alert} 占位符插入告警正文）
+    "MONITORING_AI_PROMPT": "",
     "JUNCHEN": "",
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
     # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
@@ -5782,98 +5798,154 @@ def _grafana_persistent_browser_enabled() -> bool:
     return _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and _lark_env_truthy("GRAFANA_PERSISTENT_BROWSER")
 
 
+_GRAFANA_LEGEND_ISOLATE_FIND_JS = r"""([panelTitle, seriesNeedle]) => {
+  const norm = (s) => (s || '').replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+  const pt = norm(panelTitle);
+  const sn = norm(seriesNeedle);
+  if (!pt || !sn) return { status: 'missing' };
+  const panelRoots = document.querySelectorAll('.react-grid-item, [data-testid="dashboard-panel"]');
+  let panelRoot = null;
+  for (const root of panelRoots) {
+    const titleEl = root.querySelector('[data-testid="panel-title"], h2, [class*="panel-title"]');
+    const titleTxt = norm(titleEl && (titleEl.textContent || titleEl.getAttribute('title')));
+    if (titleTxt && (titleTxt === pt || titleTxt.includes(pt) || pt.includes(titleTxt))) {
+      panelRoot = root;
+      break;
+    }
+  }
+  if (!panelRoot) return { status: 'panel_not_found' };
+  try { panelRoot.scrollIntoView({ block: 'center', behavior: 'auto' }); } catch (e) {}
+  // Grafana timeseries legend rows render as <button class="...LegendLabel...">.
+  let btns = Array.from(panelRoot.querySelectorAll('button[class*="LegendLabel"]'));
+  if (!btns.length) {
+    btns = Array.from(panelRoot.querySelectorAll(
+      '[data-testid="viz-legend-list-item"], [class*="LegendItem"], ' +
+      '.uplot-legend .u-series, button[class*="legend"], div[class*="legendItem"]'
+    ));
+  }
+  // A single-series panel already shows "only that series" — clicking would just hide it.
+  if (btns.length < 2) return { status: 'already_solo' };
+  let target = btns.find(b => norm(b.textContent) === sn);
+  if (!target) target = btns.find(b => { const t = norm(b.textContent); return t && (t.includes(sn) || sn.includes(t)); });
+  if (!target) return { status: 'legend_not_found' };
+  try { target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'auto' }); } catch (e) {}
+  const r = target.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return { status: 'not_visible' };
+  return { status: 'found', x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}"""
+
+_GRAFANA_LEGEND_ISOLATE_VERIFY_JS = r"""([panelTitle, seriesNeedle]) => {
+  const norm = (s) => (s || '').replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+  const pt = norm(panelTitle);
+  const sn = norm(seriesNeedle);
+  const panelRoots = document.querySelectorAll('.react-grid-item, [data-testid="dashboard-panel"]');
+  let panelRoot = null;
+  for (const root of panelRoots) {
+    const titleEl = root.querySelector('[data-testid="panel-title"], h2, [class*="panel-title"]');
+    const titleTxt = norm(titleEl && (titleEl.textContent || titleEl.getAttribute('title')));
+    if (titleTxt && (titleTxt === pt || titleTxt.includes(pt) || pt.includes(titleTxt))) { panelRoot = root; break; }
+  }
+  if (!panelRoot) return false;
+  const btns = Array.from(panelRoot.querySelectorAll('button[class*="LegendLabel"]'));
+  if (btns.length < 2) return true;
+  const isDisabled = (b) => /LegendLabelDisabled/.test(b.className || '');
+  let target = btns.find(b => norm(b.textContent) === sn);
+  if (!target) target = btns.find(b => { const t = norm(b.textContent); return t && (t.includes(sn) || sn.includes(t)); });
+  if (!target) return false;
+  if (isDisabled(target)) return false;               // target itself hidden → not isolated
+  return btns.some(b => b !== target && isDisabled(b)); // others hidden → only target shown
+}"""
+
+
 def _grafana_playwright_click_alert_series_legends(
     page: Any,
     targets: List[Dict[str, str]],
 ) -> int:
     """
-    On each alerting panel, Ctrl+click the legend row matching the alert series (Grafana isolate).
-    Returns count of successful isolations.
+    On each alerting panel, isolate the alert series so the screenshot shows **only that series**.
+
+    Uses Grafana's native "show only this series" gesture — a **single real mouse click** on the
+    series' legend label (ported from the ``monitoring`` project), not a synthetic Ctrl+click
+    (which only *toggles* one line on/off). Isolation is verified via the ``LegendLabelDisabled``
+    class the other labels gain, and retried a few times because a stray click can toggle a prior
+    isolate back off. Single-series panels are left untouched (already "only that series"). This
+    only affects the throwaway screenshot render session — the dashboard/graph is not modified.
+    Returns the count of panels isolated (or already solo).
     """
     if not targets or not _lark_env_truthy("GRAFANA_SCREENSHOT_ALERT_LEGEND_CLICK_ENABLE"):
         return 0
-    ok = 0
+
+    # One isolate per panel: a second plain click in the same panel would flip the isolate to a
+    # different series ("last wins"). Keep the first alerting series encountered for each panel.
+    seen_panels: Set[str] = set()
+    ordered: List[Tuple[str, str]] = []
     for tgt in targets:
         panel_title = str(tgt.get("panel") or "").strip()
         series_label = str(tgt.get("series") or "").strip()
         if not panel_title or not series_label:
             continue
+        pkey = panel_title.casefold()
+        if pkey in seen_panels:
+            continue
+        seen_panels.add(pkey)
+        ordered.append((panel_title, series_label))
+
+    ok = 0
+    for panel_title, series_label in ordered:
         try:
-            result = page.evaluate(
-                """([panelTitle, seriesNeedle]) => {
-                  const norm = (s) => (s || '').trim().toLowerCase();
-                  const pt = norm(panelTitle);
-                  const sn = norm(seriesNeedle);
-                  if (!pt || !sn) return 'missing';
-
-                  const panelRoots = document.querySelectorAll(
-                    '.react-grid-item, [data-testid="dashboard-panel"]'
-                  );
-                  let panelRoot = null;
-                  for (const root of panelRoots) {
-                    const titleEl = root.querySelector(
-                      '[data-testid="panel-title"], h2, [class*="panel-title"]'
-                    );
-                    const titleTxt = norm(
-                      titleEl && (titleEl.textContent || titleEl.getAttribute('title'))
-                    );
-                    if (titleTxt && (titleTxt === pt || titleTxt.includes(pt) || pt.includes(titleTxt))) {
-                      panelRoot = root;
-                      break;
-                    }
-                  }
-                  if (!panelRoot) return 'panel_not_found';
-
-                  try {
-                    panelRoot.scrollIntoView({ block: 'center', behavior: 'instant' });
-                  } catch (e) {}
-
-                  const items = panelRoot.querySelectorAll(
-                    '[data-testid="viz-legend-list-item"], [class*="LegendItem"], ' +
-                    '.uplot-legend .u-series, button[class*="legend"], div[class*="legendItem"]'
-                  );
-                  for (const item of items) {
-                    const txt = norm(item.textContent);
-                    if (!txt) continue;
-                    if (!(txt.includes(sn) || sn.includes(txt))) continue;
-                    const rect = item.getBoundingClientRect();
-                    if (rect.width <= 0 || rect.height <= 0) continue;
-                    const opts = {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window,
-                      ctrlKey: true,
-                      metaKey: true,
-                      clientX: rect.left + Math.min(4, rect.width / 2),
-                      clientY: rect.top + Math.min(4, rect.height / 2),
-                    };
-                    item.dispatchEvent(new MouseEvent('mousedown', opts));
-                    item.dispatchEvent(new MouseEvent('mouseup', opts));
-                    item.dispatchEvent(new MouseEvent('click', opts));
-                    if (typeof item.click === 'function') {
-                      try { item.click(); } catch (e2) {}
-                    }
-                    return 'ok';
-                  }
-                  return 'legend_not_found';
-                }""",
-                [panel_title, series_label],
-            )
-            if result == "ok":
+            isolated = False
+            for attempt in range(3):
+                info = page.evaluate(_GRAFANA_LEGEND_ISOLATE_FIND_JS, [panel_title, series_label])
+                status = info.get("status") if isinstance(info, dict) else None
+                if status == "already_solo":
+                    isolated = True
+                    logger.info(
+                        "Grafana screenshot: panel already single-series panel=%r", panel_title
+                    )
+                    break
+                if status != "found":
+                    logger.info(
+                        "Grafana screenshot: legend isolate %s panel=%r series=%r attempt=%s",
+                        status,
+                        panel_title,
+                        series_label,
+                        attempt,
+                    )
+                    break
+                page.mouse.click(float(info["x"]), float(info["y"]))
+                try:
+                    page.evaluate(
+                        "() => { const s = window.getSelection && window.getSelection();"
+                        " if (s && s.removeAllRanges) s.removeAllRanges(); }"
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(400)
+                try:
+                    _grafana_wait_loading_like_gone(
+                        page, min(3000, int(GRAFANA_SCREENSHOT_SPINNER_MAX_MS))
+                    )
+                except Exception:
+                    pass
+                if page.evaluate(_GRAFANA_LEGEND_ISOLATE_VERIFY_JS, [panel_title, series_label]):
+                    isolated = True
+                    logger.info(
+                        "Grafana screenshot: isolated legend panel=%r series=%r attempt=%s",
+                        panel_title,
+                        series_label,
+                        attempt,
+                    )
+                    break
+                # Not verified — a click may have toggled a prior isolate off; loop re-clicks.
+            if isolated:
                 ok += 1
-                logger.info(
-                    "Grafana screenshot: isolated legend panel=%r series=%r",
-                    panel_title,
-                    series_label,
-                )
             else:
-                logger.info(
-                    "Grafana screenshot: legend isolate %s panel=%r series=%r",
-                    result,
+                logger.warning(
+                    "Grafana screenshot: legend isolate not verified panel=%r series=%r — "
+                    "PNG may show all series",
                     panel_title,
                     series_label,
                 )
-            page.wait_for_timeout(120)
         except Exception as ex:
             logger.info(
                 "Grafana screenshot: legend isolate failed panel=%r series=%r: %s",
@@ -7809,7 +7881,13 @@ def _format_alert_reason_chunks_for_analysis(
 
 
 def _append_monitoring_alert_target_user_mention(lines: List[str]) -> None:
-    """Alert / threshold hits: mention only ``TARGET_USER_OPEN_ID`` with optional disclaimer line."""
+    """Alert / threshold hits: optionally mention ``TARGET_USER_OPEN_ID``.
+
+    Person tagging is DISABLED by default (the Qwen second-review replaces the human ping);
+    set ``MONITORING_ALERT_AT_USER_ENABLE=1`` to restore the @mention.
+    """
+    if not _lark_env_truthy_or_default("MONITORING_ALERT_AT_USER_ENABLE", default=False):
+        return
     if not TARGET_USER_OPEN_ID:
         return
     lines.append("")
@@ -8198,6 +8276,297 @@ def _handle_monitoring_card_action(data: Dict[str, Any]) -> None:
     ).start()
 
 
+def _monitoring_ai_extract_ollama_text(data: Any) -> str:
+    """Collect assistant text from Ollama ``/api/chat`` (content + thinking fallbacks)."""
+    chunks: List[str] = []
+    if isinstance(data, dict):
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            for key in ("content", "thinking"):
+                part = str(msg.get(key) or "").strip()
+                if part:
+                    chunks.append(part)
+        resp = str(data.get("response") or "").strip()
+        if resp:
+            chunks.append(resp)
+    return "\n\n".join(chunks).strip()
+
+
+def _monitoring_ai_strip_model_reasoning(text: str) -> str:
+    """Remove hidden reasoning blocks; keep the user-visible verdict + explanation."""
+    out = (text or "").strip()
+    for pat in (
+        r"(?is)``.*?``",
+        r"(?is)<think>.*?</think>",
+        r"(?is)<thinking>.*?</thinking>",
+    ):
+        out = re.sub(pat, "", out)
+    return out.strip()
+
+
+def _monitoring_ai_parse_verdict(raw: str) -> Tuple[Optional[bool], str]:
+    """
+    Parse ``ABNORMAL`` / ``NORMAL`` and return ``(verdict, explanation_body)``.
+    Explanation excludes the verdict line itself.
+    """
+    cleaned = _monitoring_ai_strip_model_reasoning(raw)
+    if not cleaned:
+        return None, ""
+
+    lines = cleaned.splitlines()
+    verdict: Optional[bool] = None
+    verdict_idx = -1
+    for i, line in enumerate(lines):
+        u = line.strip().upper()
+        if u == "ABNORMAL" or u.startswith("ABNORMAL"):
+            verdict = True
+            verdict_idx = i
+            break
+        if u == "NORMAL" or u.startswith("NORMAL"):
+            verdict = False
+            verdict_idx = i
+            break
+
+    if verdict is None:
+        upper = cleaned.upper()
+        if "ABNORMAL" in upper:
+            verdict = True
+        elif "NORMAL" in upper:
+            verdict = False
+        else:
+            return None, cleaned
+
+    explain_lines: List[str] = []
+    if verdict_idx >= 0:
+        for line in lines[verdict_idx + 1 :]:
+            st = line.strip()
+            if not st:
+                continue
+            if st.upper() in ("ABNORMAL", "NORMAL"):
+                continue
+            explain_lines.append(line.rstrip())
+    explanation = "\n".join(explain_lines).strip()
+    if verdict and not explanation:
+        # Model returned only the verdict token — still show a visible AI block.
+        explanation = "🤖 AI Assessment: ABNORMAL\n(模型未返回详细说明 / model returned no detail.)"
+    return verdict, explanation
+
+
+def _monitoring_ai_abnormal_verdict(
+    png_bytes: bytes, alert_text: str
+) -> Tuple[Optional[bool], str]:
+    """
+    Ask the local Ollama model whether a Grafana alert screenshot shows a genuine
+    abnormality worth paging the group.
+
+    Returns ``(is_abnormal, explanation)``. ``is_abnormal`` is ``None`` when the AI
+    could not be reached / its answer could not be parsed (caller decides fail-open).
+    """
+    import base64
+
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    timeout = max(5.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 120.0))
+    prompt = _cfg_str("MONITORING_AI_PROMPT", "").strip() or (
+        "You are an SRE assistant reviewing a Grafana monitoring screenshot. "
+        "A threshold rule already detected this change:\n"
+        "-----\n"
+        "{alert}\n"
+        "-----\n"
+        "IMPORTANT rules:\n"
+        "1) Base your decision ONLY on the alert lines above — do NOT invent numbers or "
+        "times that are not in that text.\n"
+        "2) If the listed changes are tiny (mostly single-digit or low-teens errors/min, "
+        "e.g. 10→11, 2→1, 14→10), respond NORMAL — that is routine noise.\n"
+        "3) Respond ABNORMAL only for a genuine incident worth paging on-call (large spike, "
+        "sustained outage, or clearly abnormal pattern in the alert lines).\n"
+        "4) **Main Site Deposit (createProposal)** and **Withdrawal (InitiateWithdrawal)** "
+        "are naturally jagged every minute. A single-minute move similar to others on the "
+        "chart (e.g. deposit 191→242, withdraw 53→32) is NORMAL business volatility — "
+        "respond NORMAL unless the chart shows a sustained flatline, zero traffic, or an "
+        "extreme outlier far outside the usual band.\n"
+        "5) Your explanation must reference the specific series and values from the alert "
+        "text, not unrelated peaks elsewhere on the chart.\n"
+        "Reply with the FIRST line being exactly 'ABNORMAL' or 'NORMAL', then on the "
+        "following lines a short explanation (1-3 sentences) in 中文 and English."
+    )
+    prompt = prompt.replace("{alert}", alert_text or "")
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    body: Dict[str, Any] = {
+        "model": model,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+        "options": {"temperature": 0},
+    }
+    # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
+    if "qwen3" in model.casefold():
+        body["think"] = False
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.exception(
+            "monitoring AI gate: Ollama request failed (model=%s url=%s)", model, url
+        )
+        return None, ""
+
+    raw = _monitoring_ai_extract_ollama_text(data)
+    if not raw:
+        logger.warning("monitoring AI gate: empty response from model=%s payload=%r", model, data)
+        return None, ""
+
+    verdict, explanation = _monitoring_ai_parse_verdict(raw)
+    if verdict is None:
+        logger.warning(
+            "monitoring AI gate: could not parse verdict from response=%r",
+            raw[:300],
+        )
+    else:
+        logger.info(
+            "monitoring AI gate: parsed verdict=%s explanation_len=%s",
+            "ABNORMAL" if verdict else "NORMAL",
+            len(explanation or ""),
+        )
+    return verdict, explanation
+
+
+def _monitoring_ai_parse_alert_move(line: str) -> Tuple[Optional[float], Optional[float], str]:
+    """Parse ``value of X increased/decreased to … value of Y`` from one alert block line."""
+    m = re.search(
+        r"value of ([\d,]+(?:\.\d+)?)\s+(increased|decreased)\s+to"
+        r"(?:\s+\d{2}-\d{2}\s+\d{2}:\d{2}\s+value of)?\s+([\d,]+(?:\.\d+)?)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None, None, ""
+    try:
+        fv = float(m.group(1).replace(",", ""))
+        tv = float(m.group(3).replace(",", ""))
+    except (TypeError, ValueError):
+        return None, None, ""
+    direction = "SPIKE" if m.group(2).casefold() == "increased" else "DROP"
+    return fv, tv, direction
+
+
+def _monitoring_ai_alert_block_pairs(alert_text: str) -> List[Tuple[str, str]]:
+    """Each block: ``(emoji header line, following value/time line)``."""
+    pairs: List[Tuple[str, str]] = []
+    lines = [ln.rstrip() for ln in (alert_text or "").splitlines()]
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(("📈", "📉")):
+            detail = ""
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if nxt and not nxt.startswith(("📈", "📉", "[", "🤖")):
+                    detail = nxt
+            pairs.append((lines[i], detail))
+            i += 2
+            continue
+        i += 1
+    return pairs
+
+
+def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optional[str]:
+    """
+    Deposit/withdraw panels are naturally jagged. Single-minute moves like 191→242 or
+    53→32 are routine — suppress before calling the vision model.
+    """
+    text = alert_text or ""
+    pairs = _monitoring_ai_alert_block_pairs(text)
+    if not pairs:
+        return None
+    other_panels = (
+        "请求总数",
+        "错误请求数",
+        "9280",
+        "IGO Distributions",
+        "FPMS-NT",
+        "Providers",
+        "Games",
+    )
+    if any(tok in text for tok in other_panels):
+        return None
+    for header, detail in pairs:
+        fv, tv, direction = _monitoring_ai_parse_alert_move(detail)
+        if fv is None or tv is None:
+            return None
+        peak = max(fv, tv)
+        delta = abs(tv - fv)
+        if "主站充值" in header or "createProposal" in header:
+            if direction != "SPIKE":
+                return None
+            if peak > 450 or peak < 80 or delta > 80:
+                return None
+        elif "提款" in header or "InitiateWithdrawal" in header:
+            if direction != "DROP":
+                return None
+            if fv > 150 or fv < 20 or delta > 40:
+                return None
+        else:
+            return None
+    return (
+        "🤖 AI Assessment: NORMAL\n"
+        "主站充值/提款分钟级锯齿波动属于正常业务节奏，非持续故障。\n"
+        "Main Site Deposit / Withdrawal minute-level jitter is normal business volatility, "
+        "not a sustained outage."
+    )
+
+
+def _monitoring_ai_fail_open_note() -> str:
+    return _cfg_str(
+        "MONITORING_AI_FAIL_OPEN_NOTE",
+        "🤖 AI review unavailable — alert sent without AI explanation.",
+    ).strip()
+
+
+def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
+    """
+    Second gate after threshold detection: only let the alert through if the AI
+    judges the screenshot abnormal. Returns ``(should_send, reply)`` where ``reply``
+    has the AI explanation appended when the alert is allowed through.
+    """
+    if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
+        return True, reply
+    fail_open = _lark_env_truthy_or_default("MONITORING_AI_GATE_FAIL_OPEN", default=True)
+    fail_note = _monitoring_ai_fail_open_note()
+    if not alert_pngs:
+        logger.warning(
+            "monitoring AI gate: no screenshot available — %s",
+            "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
+        )
+        if fail_open and fail_note:
+            reply = f"{reply}\n\n{fail_note}"
+        return fail_open, reply
+    routine = _monitoring_ai_deposit_withdraw_routine_volatility(reply)
+    if routine:
+        logger.info(
+            "monitoring AI gate: deposit/withdraw routine volatility — alert suppressed"
+        )
+        return False, reply
+    verdict, explanation = _monitoring_ai_abnormal_verdict(alert_pngs[0], reply)
+    if verdict is None:
+        logger.warning(
+            "monitoring AI gate: undecided verdict — %s",
+            "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
+        )
+        if fail_open and fail_note:
+            reply = f"{reply}\n\n{fail_note}"
+        return fail_open, reply
+    if not verdict:
+        logger.info(
+            "monitoring AI gate: AI judged NORMAL — alert suppressed. explanation=%r",
+            (explanation or "")[:300],
+        )
+        return False, reply
+    logger.info("monitoring AI gate: AI judged ABNORMAL — alert will be sent")
+    if explanation:
+        reply = f"{reply}\n\n{explanation}"
+    return True, reply
+
+
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
     global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
@@ -8302,13 +8671,32 @@ def _monitoring_watchdog_loop() -> None:
 
                 reply = _format_alert_trigger_reply(payload_c)
                 pre_key: Optional[str] = None
-                if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                # Screenshot up-front (series-isolated) so the AI can review it before we post.
+                alert_png: Optional[bytes] = None
+                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
-                        pre_key = _lark_upload_png_image_key(
-                            _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
-                        )
+                        alert_png = _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
+
+                # Second review: only page the group if the local AI (Qwen) judges the isolated
+                # screenshot abnormal; the AI explanation is appended to ``reply``.
+                ai_ok, reply = _monitoring_ai_gate_decide(
+                    [alert_png] if alert_png is not None else [], reply
+                )
+                if not ai_ok:
+                    logger.info(
+                        "monitoring watchdog: alert suppressed by AI gate (after confirm) chat_prefix=%s...",
+                        alert_chat[:16],
+                    )
+                    time.sleep(sec)
+                    continue
+
+                if alert_png is not None and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+                    try:
+                        pre_key = _lark_upload_png_image_key(alert_png)
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot upload failed")
 
                 used_card, embedded = _lark_send_monitoring_user_message(
                     "chat_id",
@@ -8332,7 +8720,11 @@ def _monitoring_watchdog_loop() -> None:
                             logger.exception("monitoring watchdog pre_key image send failed")
                     else:
                         try:
-                            png = _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
+                            png = (
+                                alert_png
+                                if alert_png is not None
+                                else _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
+                            )
                             key = _lark_upload_png_image_key(png)
                             _lark_send_image_message("chat_id", alert_chat, key)
                             logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
@@ -8393,13 +8785,32 @@ def _monitoring_watchdog_loop() -> None:
 
                 reply = _format_alert_trigger_reply(payload)
                 pre_key = None
-                if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") and _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+                # Screenshot up-front (series-isolated) so the AI can review it before we post.
+                alert_png = None
+                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
                     try:
-                        pre_key = _lark_upload_png_image_key(
-                            _grafana_watchdog_alert_screenshot_png(sess, payload)
-                        )
+                        alert_png = _grafana_watchdog_alert_screenshot_png(sess, payload)
                     except Exception:
                         logger.exception("monitoring watchdog pre-screenshot failed")
+
+                # Second review: only page the group if the local AI (Qwen) judges the isolated
+                # screenshot abnormal; the AI explanation is appended to ``reply``.
+                ai_ok, reply = _monitoring_ai_gate_decide(
+                    [alert_png] if alert_png is not None else [], reply
+                )
+                if not ai_ok:
+                    logger.info(
+                        "monitoring watchdog: alert suppressed by AI gate chat_prefix=%s...",
+                        alert_chat[:16],
+                    )
+                    time.sleep(sec)
+                    continue
+
+                if alert_png is not None and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+                    try:
+                        pre_key = _lark_upload_png_image_key(alert_png)
+                    except Exception:
+                        logger.exception("monitoring watchdog pre-screenshot upload failed")
 
                 used_card, embedded = _lark_send_monitoring_user_message(
                     "chat_id",
@@ -8423,7 +8834,11 @@ def _monitoring_watchdog_loop() -> None:
                             logger.exception("monitoring watchdog pre_key image send failed")
                     else:
                         try:
-                            png = _grafana_watchdog_alert_screenshot_png(sess, payload)
+                            png = (
+                                alert_png
+                                if alert_png is not None
+                                else _grafana_watchdog_alert_screenshot_png(sess, payload)
+                            )
                             key = _lark_upload_png_image_key(png)
                             _lark_send_image_message("chat_id", alert_chat, key)
                             logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
