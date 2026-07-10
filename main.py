@@ -10284,6 +10284,19 @@ def _p0_om_op_open_id(op: Dict[str, Any]) -> str:
     return _lark_dict_pick_str(idobj, "open_id", "openId") or _lark_dict_pick_str(op, "open_id", "openId")
 
 
+def _p0_om_op_key(op: Dict[str, Any]) -> str:
+    """Stable dedup key for a participant, even rooms/phone/SIP that carry no open_id."""
+    idobj = op.get("id") if isinstance(op.get("id"), dict) else {}
+    for k in ("open_id", "openId", "union_id", "unionId", "user_id", "userId"):
+        v = idobj.get(k) or op.get(k)
+        if v:
+            return str(v).strip()
+    ut = str(op.get("user_type") if op.get("user_type") is not None else op.get("userType") or "").strip()
+    if idobj:
+        return f"ut{ut}:{json.dumps(idobj, sort_keys=True, ensure_ascii=False)}"
+    return f"ut{ut}" if ut else ""
+
+
 def _p0_om_card(chat_id: str, title: str, template: str, lines: List[str]) -> None:
     if not (chat_id or "").strip():
         return
@@ -10439,15 +10452,17 @@ def _p0_om_on_join(ce: Any) -> None:
         if not mno:
             return
         op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
-        oid = _p0_om_op_open_id(op)
+        key = _p0_om_op_key(op)
         with _p0_om_lock:
             rec = _p0_om_active.get(mno)
-            if rec is not None:
-                if oid and oid in rec["present"]:
-                    return
-                if oid:
-                    rec["present"].add(oid)
-        _p0_om_card(_p0_om_lookup_chat(mno), "🟢 加入会议 / Joined", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+            if rec is None:
+                return  # not a meeting this bot opened — ignore tenant-wide events
+            if key and key in rec["present"]:
+                return  # already announced this participant (WS redelivery)
+            if key:
+                rec["present"].add(key)
+            chat = rec.get("chat_id") or _p0_om_announce_chat_default()
+        _p0_om_card(chat, "🟢 加入会议 / Joined", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
                     [f"**{_p0_om_display(op)}** 加入了会议 / joined the meeting"])
     except Exception:
         logger.exception("p0 openmeeting join handler failed")
@@ -10461,14 +10476,17 @@ def _p0_om_on_leave(ce: Any) -> None:
         if not mno:
             return
         op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
-        oid = _p0_om_op_open_id(op)
+        key = _p0_om_op_key(op)
         with _p0_om_lock:
             rec = _p0_om_active.get(mno)
-            if rec is not None and oid:
-                rec["present"].discard(oid)
+            if rec is None:
+                return  # not a meeting this bot opened
+            if key:
+                rec["present"].discard(key)
+            chat = rec.get("chat_id") or _p0_om_announce_chat_default()
         reason = str(ev.get("leave_reason") or ev.get("leaveReason") or "").strip()
         why = {"1": "", "2": "（会议结束/meeting ended）", "3": "（被移出/removed）"}.get(reason, "")
-        _p0_om_card(_p0_om_lookup_chat(mno), "🔴 离开会议 / Left", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+        _p0_om_card(chat, "🔴 离开会议 / Left", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
                     [f"**{_p0_om_display(op)}** 离开了会议 / left the meeting {why}"])
     except Exception:
         logger.exception("p0 openmeeting leave handler failed")
@@ -10481,7 +10499,16 @@ def _p0_om_on_ended(ce: Any) -> None:
         _ev, _m, mno, _mid = _p0_om_event_parts(ce)
         if not mno:
             return
-        _p0_om_card(_p0_om_lookup_chat(mno), "🏁 会议结束 / Meeting ended",
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is None:
+                return  # not a meeting this bot opened
+            # Ended → clear meeting_id so /endmeeting can't re-target it; keep the record so a
+            # later recording_ready can still resolve the chat + deliver, then pop it.
+            rec["meeting_id"] = ""
+            rec["ended"] = True
+            chat = rec.get("chat_id") or _p0_om_announce_chat_default()
+        _p0_om_card(chat, "🏁 会议结束 / Meeting ended",
                     _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
                     ["会议已结束。若开启了录制，录制生成后会发给主持人。",
                      "Meeting ended. If it was recorded, the recording will be sent to the host once ready."])
@@ -10495,6 +10522,11 @@ def _p0_om_on_recording_ready(ce: Any) -> None:
         return
     try:
         ev, _m, mno, mid = _p0_om_event_parts(ce)
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is None:
+                return  # not a meeting this bot opened — don't leak someone else's recording
+            chat = rec.get("chat_id") or _p0_om_announce_chat_default()
         url = _lark_dict_pick_str(ev, "url")
         if not url and mid:
             try:
@@ -10509,7 +10541,7 @@ def _p0_om_on_recording_ready(ce: Any) -> None:
                 _lark_send_text_auto("open_id", host, f"🎬 会议录制已生成 / Meeting recording ready:\n{url}")
             except Exception:
                 logger.exception("p0 openmeeting recording DM to host failed")
-        _p0_om_card(_p0_om_lookup_chat(mno), "🎬 录制完成 / Recording ready",
+        _p0_om_card(chat, "🎬 录制完成 / Recording ready",
                     _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
                     ["录制已生成并发送给主持人。/ Recording is ready and sent to the host."
                      if (url and host) else "录制已生成（未能获取链接）。/ Recording ready (link unavailable)."])
@@ -10565,6 +10597,11 @@ def _p0_om_end_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -
             _reply(f"结束会议请求失败 / end request failed: {e.__class__.__name__}")
             return
         if isinstance(j, dict) and int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) == 0:
+            with _p0_om_lock:
+                for _rec in _p0_om_active.values():
+                    if _rec.get("meeting_id") == target_id:
+                        _rec["meeting_id"] = ""
+                        _rec["ended"] = True
             _reply("✅ 已结束会议 / meeting ended.")
         else:
             code = j.get("code") if isinstance(j, dict) else "?"
