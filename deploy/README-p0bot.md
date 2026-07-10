@@ -62,7 +62,12 @@ sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
 - **Lark console → Events & Callbacks →** subscription mode **"Use long connection"**,
   subscribe to event **`im.message.receive_v1`**. Do NOT also set a Request URL.
 - **Scopes** (add + publish a version): `im:message`, `wiki:wiki:readonly`,
-  `docx:document:readonly`. Then **share the wiki space/doc with the app**, or it can't read it.
+  `docx:document:readonly`, and (for the 👌/✅ reactions) `im:message.reaction`.
+  Then **share the wiki space/doc with the app**, or it can't read it.
+- **Reactions**: p0bot reacts 👌 (`P0_REACT_ACK_EMOJI=OK`) while Qwen is thinking and ✅
+  (`P0_REACT_DONE_EMOJI=DONE`) when the answer is sent. Reactions are best-effort — if the
+  reaction scope is missing they just don't appear; the answer still sends. Disable with
+  `P0_REACT_ENABLE=0`.
 - `python3 -m venv` needs `python3-venv` (`sudo apt install python3-venv`) on Debian/Ubuntu.
 - Startup logs `p0 bot open_id=ou_…` — optionally set that as `P0_BOT_OPEN_ID` in `.env`
   for the most reliable group @-mention detection (DMs and `/ask` work without it).

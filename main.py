@@ -332,6 +332,13 @@ _CFG: Dict[str, Any] = {
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
     "P0_QA_SYSTEM_PROMPT": "",
+    # ---- p0bot message reactions (ACK while Qwen thinks, DONE when the answer is sent) ----
+    "P0_REACT_ENABLE": "1",
+    # Lark emoji_type keys (see Lark reaction emoji list). ACK shows while processing.
+    "P0_REACT_ACK_EMOJI": "OK",
+    "P0_REACT_DONE_EMOJI": "DONE",
+    # 1=remove the ACK reaction once DONE is added (leaves only the ✅); 0=keep both
+    "P0_REACT_REMOVE_ACK": "1",
 }
 
 
@@ -8671,6 +8678,48 @@ def _p0_lark_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Dic
     return r.json()
 
 
+def _p0_lark_add_reaction(message_id: str, emoji_type: str) -> Optional[str]:
+    """Add an emoji reaction to a message; return its reaction_id (best-effort, never raises)."""
+    mid = (message_id or "").strip()
+    emoji = (emoji_type or "").strip()
+    if not mid or not emoji:
+        return None
+    try:
+        tok = _lark_tenant_access_token_string()
+        url = f"{_lark_api_domain()}/open-apis/im/v1/messages/{mid}/reactions"
+        r = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"reaction_type": {"emoji_type": emoji}},
+            timeout=15,
+        )
+        j = r.json()
+        if int(j.get("code", -1)) != 0:
+            logger.info("p0 reaction add failed emoji=%s: %s", emoji, j)
+            return None
+        return _lark_dict_pick_str(j.get("data") or {}, "reaction_id", "reactionId") or None
+    except Exception:
+        logger.exception("p0 reaction add error (emoji=%s)", emoji)
+        return None
+
+
+def _p0_lark_remove_reaction(message_id: str, reaction_id: str) -> None:
+    """Remove a previously-added reaction (best-effort, never raises)."""
+    mid = (message_id or "").strip()
+    rid = (reaction_id or "").strip()
+    if not mid or not rid:
+        return
+    try:
+        tok = _lark_tenant_access_token_string()
+        url = f"{_lark_api_domain()}/open-apis/im/v1/messages/{mid}/reactions/{rid}"
+        requests.delete(url, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    except Exception:
+        logger.exception("p0 reaction remove error")
+
+
 def _p0_wiki_get_node(node_token: str) -> Dict[str, Any]:
     """``wiki/v2/spaces/get_node`` → node dict (obj_type/obj_token/space_id/title/has_child)."""
     j = _p0_lark_get_json("/open-apis/wiki/v2/spaces/get_node", {"token": node_token})
@@ -8958,7 +9007,7 @@ def _p0_command_body(text_clean: str, trigger: str) -> Optional[str]:
 
 
 def _p0_qa_worker(
-    chat_id: str, open_id: str, kind: str, question: str, debounce_key: str
+    chat_id: str, open_id: str, kind: str, question: str, mid: str, debounce_key: str
 ) -> None:
     def _send(text: str) -> None:
         try:
@@ -8971,9 +9020,27 @@ def _p0_qa_worker(
         except Exception:
             logger.exception("p0 qa reply send failed")
 
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id: Optional[str] = None
+
+    def _ack() -> None:
+        nonlocal ack_id
+        if react:
+            ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK")
+
+    def _done() -> None:
+        if not react:
+            return
+        _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+        if ack_id and _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+            _p0_lark_remove_reaction(mid, ack_id)
+
     ask_trig = _cfg_str("P0_ASK_TRIGGER", "/ask").strip() or "/ask"
+    did_ack = False
     try:
         if kind == "reload":
+            _ack()
+            did_ack = True
             ok, meta = _p0_doc_reload()
             _send(
                 f"✅ 文档已重新读取 / Documentation reloaded.\n{meta}"
@@ -8984,6 +9051,7 @@ def _p0_qa_worker(
 
         q = (question or "").strip()
         if not q:
+            # Bare hello / empty @-mention — send usage, no reactions.
             _send(
                 "👋 我是 p0bot。直接问我关于文档的问题即可"
                 f"（群里请 @我 或用 `{ask_trig} 你的问题`）。\n"
@@ -8992,6 +9060,8 @@ def _p0_qa_worker(
             )
             return
 
+        _ack()
+        did_ack = True
         doc = _p0_doc_get_cached()
         if not doc:
             _send(
@@ -9003,6 +9073,12 @@ def _p0_qa_worker(
             return
         _send(_p0_ai_answer(q, doc))
     finally:
+        # Mark done for any path that acknowledged (success, no-doc, or error).
+        if did_ack:
+            try:
+                _done()
+            except Exception:
+                logger.exception("p0 qa done-reaction failed")
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
 
@@ -9101,7 +9177,7 @@ def _p0_try_handle_doc_qa(
     try:
         threading.Thread(
             target=_p0_qa_worker,
-            args=(chat_id or "", open_id or "", kind, question, debounce_key),
+            args=(chat_id or "", open_id or "", kind, question, mid or "", debounce_key),
             daemon=True,
             name="p0-doc-qa",
         ).start()
