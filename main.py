@@ -339,6 +339,12 @@ _CFG: Dict[str, Any] = {
     "P0_REACT_DONE_EMOJI": "DONE",
     # 1=remove the ACK reaction once DONE is added (leaves only the ✅); 0=keep both
     "P0_REACT_REMOVE_ACK": "1",
+    # ---- p0bot answer formatting: render answers as a clean interactive card ----
+    "P0_ANSWER_CARD": "1",
+    "P0_CARD_TITLE": "📖 p0bot",
+    "P0_CARD_TEMPLATE": "blue",
+    # Per-card body budget; a longer answer is split across multiple cards (part n/N)
+    "P0_CARD_MAX_CHARS": "8000",
 }
 
 
@@ -9006,19 +9012,80 @@ def _p0_command_body(text_clean: str, trigger: str) -> Optional[str]:
     return None
 
 
+def _p0_answer_card(question: str, answer_chunk: str, part: int, total: int) -> Dict[str, Any]:
+    """Clean schema-2.0 interactive card: header + echoed question + divider + answer (lark markdown)."""
+    title = _cfg_str("P0_CARD_TITLE", "📖 p0bot").strip() or "📖 p0bot"
+    template = _cfg_str("P0_CARD_TEMPLATE", "blue").strip() or "blue"
+    subtitle = "文档解答 · Doc answer" + (f"  ({part}/{total})" if total > 1 else "")
+    elements: List[Dict[str, Any]] = []
+    q = (question or "").strip()
+    if part == 1 and q:
+        q_show = q if len(q) <= 300 else (q[:300] + "…")
+        elements.append({"tag": "markdown", "content": f"**❓ 问题 / Question**\n{q_show}"})
+        elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": answer_chunk})
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title[:190]},
+            "subtitle": {"tag": "plain_text", "content": subtitle[:190]},
+        },
+        "body": {"elements": elements},
+    }
+
+
+def _p0_send_answer(receive_id_type: str, receive_id: str, question: str, answer: str) -> None:
+    """Send the doc answer as an interactive card (falls back to plain text on any failure)."""
+    text = (answer or "").strip()
+    if not text:
+        return
+    if not _lark_env_truthy_or_default("P0_ANSWER_CARD", default=True):
+        _lark_send_text_auto(receive_id_type, receive_id, text)
+        return
+    max_card = max(500, _cfg_int("P0_CARD_MAX_CHARS", 8000))
+    chunks = _split_text_for_lark(text, max_chars=max_card)
+    total = len(chunks)
+    for i, ch in enumerate(chunks, 1):
+        try:
+            _lark_send_interactive_card(
+                receive_id_type, receive_id, _p0_answer_card(question, ch, i, total)
+            )
+        except Exception:
+            logger.exception("p0 answer card send failed — falling back to text")
+            try:
+                _lark_send_text_auto(receive_id_type, receive_id, ch)
+            except Exception:
+                logger.exception("p0 answer text fallback failed")
+
+
 def _p0_qa_worker(
     chat_id: str, open_id: str, kind: str, question: str, mid: str, debounce_key: str
 ) -> None:
+    def _target() -> Tuple[str, str]:
+        if (chat_id or "").strip():
+            return "chat_id", chat_id
+        if (open_id or "").strip():
+            return "open_id", open_id
+        return "", ""
+
     def _send(text: str) -> None:
+        rt, rv = _target()
+        if not rt:
+            logger.warning("p0 qa: no chat_id/open_id to reply to")
+            return
         try:
-            if (chat_id or "").strip():
-                _lark_send_text_auto("chat_id", chat_id, text)
-            elif (open_id or "").strip():
-                _lark_send_text_auto("open_id", open_id, text)
-            else:
-                logger.warning("p0 qa: no chat_id/open_id to reply to")
+            _lark_send_text_auto(rt, rv, text)
         except Exception:
             logger.exception("p0 qa reply send failed")
+
+    def _send_answer(q_text: str, answer: str) -> None:
+        rt, rv = _target()
+        if not rt:
+            logger.warning("p0 qa: no chat_id/open_id to reply to")
+            return
+        _p0_send_answer(rt, rv, q_text, answer)
 
     react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
     ack_id: Optional[str] = None
@@ -9071,7 +9138,7 @@ def _p0_qa_worker(
                 "share the page with the app, then send /reload."
             )
             return
-        _send(_p0_ai_answer(q, doc))
+        _send_answer(q, _p0_ai_answer(q, doc))
     finally:
         # Mark done for any path that acknowledged (success, no-doc, or error).
         if did_ack:
