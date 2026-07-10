@@ -294,6 +294,44 @@ _CFG: Dict[str, Any] = {
     "DEPLOY_GIT_REPO_PATH": "",
     "DEPLOY_SYSTEMD_SERVICE": "grafanagamebot",
     "DEPLOY_TRIGGER": "/deploy",
+    # ---- p0bot: Lark wiki doc Q&A via local Ollama / Qwen ----
+    # Read a Lark wiki page (and, optionally, its whole subtree), cache the plain
+    # text, and answer questions about it. Nothing is fine-tuned — "learning the
+    # doc" = giving the model that text as grounding context on every question.
+    "P0_DOC_QA_ENABLE": "0",
+    # Wiki node token = the segment after /wiki/ in the doc URL (…/wiki/<TOKEN>?…)
+    "P0_WIKI_NODE_TOKEN": "",
+    # Full wiki URL (optional; when set and P0_WIKI_NODE_TOKEN empty, token is parsed from it)
+    "P0_WIKI_URL": "",
+    # 1=also fetch every descendant page under the node ("read all"); 0=just this page
+    "P0_WIKI_INCLUDE_CHILDREN": "1",
+    "P0_WIKI_MAX_NODES": "200",
+    # Command trigger for an explicit question, e.g. "/ask how do I …"
+    "P0_ASK_TRIGGER": "/ask",
+    # Command trigger to re-fetch the doc from Lark, e.g. "/reload"
+    "P0_RELOAD_TRIGGER": "/reload",
+    # 1=answer any direct (p2p) message without a command/@; 0=require /ask
+    "P0_QA_ANSWER_DM": "1",
+    # 1=in group chats, answer when the bot is @-mentioned (any text); 0=require /ask
+    "P0_QA_AT_MENTION_ENABLE": "1",
+    # Ollama endpoint + model for Q&A (fall back to MONITORING_AI_* when empty)
+    "P0_QA_OLLAMA_URL": "",
+    "P0_QA_MODEL": "",
+    "P0_QA_TIMEOUT_SECONDS": "180",
+    # Ollama context window; MUST be large enough to hold the doc + question
+    # (Ollama defaults to 4096, which would silently truncate the documentation).
+    "P0_QA_NUM_CTX": "32768",
+    "P0_QA_TEMPERATURE": "0.2",
+    # Max characters of doc context passed to the model (keyword-selected when the doc is larger).
+    # Keep this comfortably below P0_QA_NUM_CTX in TOKENS — CJK text is ~1.3-1.7 chars/token, so
+    # 24000 chars ≈ 15-18k tokens, leaving room for the question + answer inside a 32768 window.
+    "P0_DOC_MAX_CHARS": "24000",
+    # Re-fetch the doc every N seconds in the background; 0=only on startup + /reload
+    "P0_DOC_REFRESH_SECONDS": "0",
+    # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
+    "P0_BOT_OPEN_ID": "",
+    # Optional custom system prompt for answers; use {doc} where the documentation should be injected
+    "P0_QA_SYSTEM_PROMPT": "",
 }
 
 
@@ -8569,6 +8607,560 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
     return True, reply
 
 
+# ---------------------------------------------------------------------------
+# p0bot — Lark wiki doc Q&A (local Ollama / Qwen)
+#
+# Reads a Lark wiki page (optionally its whole subtree), caches the plain text,
+# and answers questions by passing that text to the local Ollama model as
+# grounding context. Independent of the Grafana monitoring paths above.
+# ---------------------------------------------------------------------------
+
+_p0_doc_lock = threading.Lock()
+_p0_doc_text: str = ""
+_p0_doc_fetched_at: float = 0.0
+_p0_doc_meta: str = ""
+
+
+def _p0_qa_enabled() -> bool:
+    return _lark_env_truthy("P0_DOC_QA_ENABLE")
+
+
+def _p0_wiki_node_token() -> str:
+    """Wiki node token from P0_WIKI_NODE_TOKEN, else parsed from P0_WIKI_URL."""
+    tok = _cfg_str("P0_WIKI_NODE_TOKEN", "").strip()
+    if tok:
+        return tok
+    url = _cfg_str("P0_WIKI_URL", "").strip()
+    if url:
+        m = re.search(r"/wiki(?:/[a-z]{2}-[A-Z]{2})?/([A-Za-z0-9]+)", url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _p0_qa_model() -> str:
+    return (
+        _cfg_str("P0_QA_MODEL", "").strip()
+        or _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    )
+
+
+def _p0_qa_ollama_url() -> str:
+    return (
+        (
+            _cfg_str("P0_QA_OLLAMA_URL", "").strip()
+            or _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip()
+        )
+    ).rstrip("/")
+
+
+def _p0_lark_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET a Lark Open API endpoint with the tenant token; return parsed JSON."""
+    tok = _lark_tenant_access_token_string()
+    url = f"{_lark_api_domain()}{path}"
+    r = requests.get(
+        url,
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _p0_wiki_get_node(node_token: str) -> Dict[str, Any]:
+    """``wiki/v2/spaces/get_node`` → node dict (obj_type/obj_token/space_id/title/has_child)."""
+    j = _p0_lark_get_json("/open-apis/wiki/v2/spaces/get_node", {"token": node_token})
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"wiki get_node failed: {j}")
+    node = (j.get("data") or {}).get("node") or {}
+    return node if isinstance(node, dict) else {}
+
+
+def _p0_wiki_list_children(space_id: str, parent_node_token: str) -> List[Dict[str, Any]]:
+    """List immediate child nodes of a wiki node (paginated)."""
+    out: List[Dict[str, Any]] = []
+    page_token = ""
+    for _ in range(50):  # hard cap on pages
+        params: Dict[str, Any] = {"parent_node_token": parent_node_token, "page_size": 50}
+        if page_token:
+            params["page_token"] = page_token
+        j = _p0_lark_get_json(f"/open-apis/wiki/v2/spaces/{space_id}/nodes", params)
+        if int(j.get("code", -1)) != 0:
+            logger.warning(
+                "p0 wiki list children failed space=%s parent=%s: %s",
+                space_id,
+                parent_node_token[:12],
+                j,
+            )
+            break
+        data = j.get("data") or {}
+        items = data.get("items") or []
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    out.append(it)
+        if not data.get("has_more"):
+            break
+        page_token = str(data.get("page_token") or "")
+        if not page_token:
+            break
+    return out
+
+
+def _p0_docx_raw_content(document_id: str) -> str:
+    """Plain-text body of a docx document (``docx/v1/documents/{id}/raw_content``)."""
+    j = _p0_lark_get_json(
+        f"/open-apis/docx/v1/documents/{document_id}/raw_content", {"lang": 0}
+    )
+    if int(j.get("code", -1)) != 0:
+        raise RuntimeError(f"docx raw_content failed: {j}")
+    return str((j.get("data") or {}).get("content") or "")
+
+
+def _p0_node_plain_text(node: Dict[str, Any]) -> str:
+    """Plain text for a wiki node's underlying object (docx; other types are skipped)."""
+    obj_type = _lark_dict_pick_str(node, "obj_type", "objType").lower()
+    obj_token = _lark_dict_pick_str(node, "obj_token", "objToken")
+    if not obj_token:
+        return ""
+    if obj_type in ("docx", "doc"):
+        try:
+            return _p0_docx_raw_content(obj_token)
+        except Exception:
+            logger.exception(
+                "p0 docx fetch failed obj_type=%s token=%s", obj_type, obj_token[:12]
+            )
+            return ""
+    logger.info("p0 wiki node obj_type=%r not text-extractable — skipped", obj_type)
+    return ""
+
+
+def _p0_fetch_wiki_doc_text() -> Tuple[str, str]:
+    """Fetch the configured wiki node (and, if enabled, its descendants). Returns (text, meta)."""
+    node_token = _p0_wiki_node_token()
+    if not node_token:
+        raise RuntimeError("P0_WIKI_NODE_TOKEN / P0_WIKI_URL not configured")
+    root = _p0_wiki_get_node(node_token)
+    if not root:
+        raise RuntimeError("wiki get_node returned no node (check wiki scopes + doc sharing)")
+    space_id = _lark_dict_pick_str(root, "space_id", "spaceId")
+    include_children = _lark_env_truthy_or_default("P0_WIKI_INCLUDE_CHILDREN", default=True)
+    max_nodes = max(1, _cfg_int("P0_WIKI_MAX_NODES", 200))
+
+    sections: List[str] = []
+    counter = {"n": 0}
+    seen_tokens: Set[str] = set()
+
+    def _emit(node: Dict[str, Any], depth: int) -> None:
+        if counter["n"] >= max_nodes:
+            return
+        tok = _lark_dict_pick_str(node, "node_token", "nodeToken")
+        if tok and tok in seen_tokens:
+            return
+        if tok:
+            seen_tokens.add(tok)
+        title = _lark_dict_pick_str(node, "title") or "(untitled)"
+        text = _p0_node_plain_text(node)
+        counter["n"] += 1
+        header = ("#" * min(6, depth + 1)) + " " + title
+        sections.append(f"{header}\n{text}".strip())
+        if not include_children:
+            return
+        has_child = bool(
+            node.get("has_child") if "has_child" in node else node.get("hasChild")
+        )
+        if space_id and tok and has_child and counter["n"] < max_nodes:
+            for child in _p0_wiki_list_children(space_id, tok):
+                if counter["n"] >= max_nodes:
+                    break
+                _emit(child, depth + 1)
+
+    _emit(root, 0)
+    text = "\n\n".join(s for s in sections if s).strip()
+    meta = f"nodes={counter['n']} chars={len(text)} space={space_id or '?'}"
+    return text, meta
+
+
+def _p0_doc_reload() -> Tuple[bool, str]:
+    """(Re)fetch the wiki doc into the cache. Returns (ok, meta_or_error)."""
+    global _p0_doc_text, _p0_doc_fetched_at, _p0_doc_meta
+    try:
+        text, meta = _p0_fetch_wiki_doc_text()
+    except Exception as e:
+        logger.exception("p0 doc reload failed")
+        return False, str(e)
+    with _p0_doc_lock:
+        _p0_doc_text = text
+        _p0_doc_fetched_at = time.time()
+        _p0_doc_meta = meta
+    logger.info("p0 doc loaded: %s", meta)
+    return True, meta
+
+
+def _p0_doc_get_cached() -> str:
+    """Cached doc text; fetch once on first use if the cache is empty."""
+    with _p0_doc_lock:
+        if _p0_doc_text:
+            return _p0_doc_text
+    _p0_doc_reload()
+    with _p0_doc_lock:
+        return _p0_doc_text
+
+
+def _p0_select_doc_context(doc_text: str, question: str, max_chars: int) -> str:
+    """Whole doc when it fits, else the paragraphs most relevant to the question (doc order preserved)."""
+    if len(doc_text) <= max_chars:
+        return doc_text
+    q_words = {
+        w
+        for w in re.findall(r"[\w一-鿿]+", (question or "").lower())
+        if len(w) >= 2
+    }
+    paras = [p for p in re.split(r"\n\s*\n", doc_text) if p.strip()]
+    scored: List[Tuple[int, int, str]] = []
+    for idx, p in enumerate(paras):
+        pl = p.lower()
+        score = sum(1 for w in q_words if w in pl)
+        scored.append((score, idx, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    note = (
+        "（文档较长，仅提供与问题最相关的片段 / doc is long — showing the most relevant "
+        "sections only）\n\n"
+    )
+    budget = max(1000, max_chars - len(note))
+    chosen: List[Tuple[int, str]] = []
+    used = 0
+    for _score, idx, p in scored:
+        if used + len(p) + 2 > budget:
+            continue
+        chosen.append((idx, p))
+        used += len(p) + 2
+        if used >= budget:
+            break
+    if not chosen:
+        return note + doc_text[:budget]
+    chosen.sort(key=lambda t: t[0])
+    return note + "\n\n".join(p for _, p in chosen)
+
+
+def _p0_clean_answer(text: str) -> str:
+    """Strip qwen3 reasoning blocks; keep code/commands (unlike the monitoring-gate cleaner)."""
+    out = (text or "").strip()
+    for pat in (r"(?is)<think>.*?</think>", r"(?is)<thinking>.*?</thinking>"):
+        out = re.sub(pat, "", out)
+    return out.strip()
+
+
+def _p0_ai_answer(question: str, doc_text: str) -> str:
+    """Ask the local Ollama model the question, grounded on the documentation text."""
+    url = _p0_qa_ollama_url()
+    model = _p0_qa_model()
+    timeout = max(10.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 180.0))
+    num_ctx = max(2048, _cfg_int("P0_QA_NUM_CTX", 32768))
+    temp = _cfg_float("P0_QA_TEMPERATURE", 0.2)
+    max_chars = max(1000, _cfg_int("P0_DOC_MAX_CHARS", 24000))
+    context = _p0_select_doc_context(doc_text, question, max_chars)
+    system = _cfg_str("P0_QA_SYSTEM_PROMPT", "").strip() or (
+        "You are p0bot, a helpful assistant that answers questions using ONLY the "
+        "documentation provided below. Rules:\n"
+        "1) Base every answer strictly on the documentation. If the answer is not in "
+        "the docs, say you could not find it in the documentation.\n"
+        "2) Be concise and specific; quote exact steps, names, values or commands when relevant.\n"
+        "3) Reply in the same language the user asked in (中文提问用中文回答, English → English).\n"
+        "----- DOCUMENTATION -----\n"
+        "{doc}\n"
+        "----- END DOCUMENTATION -----"
+    )
+    if "{doc}" in system:
+        system = system.replace("{doc}", context)
+    else:
+        system = (
+            f"{system}\n\n----- DOCUMENTATION -----\n{context}\n----- END DOCUMENTATION -----"
+        )
+    body: Dict[str, Any] = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": (question or "").strip()},
+        ],
+        "options": {"temperature": temp, "num_ctx": num_ctx},
+    }
+    # Q&A never needs the model's chain-of-thought; disable it for every model so reasoning
+    # text is never surfaced to users (Ollama ignores ``think`` for non-thinking models).
+    body["think"] = False
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.exception("p0 QA Ollama request failed (model=%s url=%s)", model, url)
+        return (
+            "⚠️ 抱歉，本地 AI 模型暂时无法访问。/ Sorry — the local AI model is unreachable right now."
+        )
+    raw = _monitoring_ai_extract_ollama_text(data)
+    ans = _p0_clean_answer(raw)
+    if not ans:
+        logger.warning("p0 QA empty answer payload=%r", data)
+        return "⚠️ 模型没有返回内容，请重试。/ The model returned no content — please try again."
+    return ans
+
+
+def _p0_bot_open_id() -> str:
+    """This app's bot open_id: P0_BOT_OPEN_ID or LARK_BOT_OPEN_ID (raw env), else bot/v3/info.
+
+    Deliberately does NOT use ``_lark_effective_bot_open_id()``: on this fork that value is
+    force-normalized to the embedded Game bot open_id when unset, which is the wrong identity
+    for a standalone p0bot. ``bot/v3/info`` (called with THIS app's creds) resolves p0bot's
+    real open_id. Set P0_BOT_OPEN_ID in the env to pin it if bot/v3/info is flaky.
+    """
+    for key in ("P0_BOT_OPEN_ID", "LARK_BOT_OPEN_ID"):
+        v = _cfg_str(key, "").strip()
+        if v:
+            return v
+    try:
+        return _lark_resolve_bot_open_id_via_api() or ""
+    except Exception:
+        return ""
+
+
+def _p0_mentions_contain_bot(mentions: Any) -> bool:
+    """True when the @-mentions include this bot's open_id or APP_ID."""
+    oid = _p0_bot_open_id()
+    app = str(APP_ID or "").strip()
+    targets = {t for t in (oid, app) if t}
+    if not targets:
+        # Bot identity unknown — don't guess (avoids answering @other-bot). Use /ask instead.
+        return False
+    for s in _lark_iter_mention_scalar_strings(mentions):
+        if s and s.strip() in targets:
+            return True
+    return False
+
+
+def _p0_command_body(text_clean: str, trigger: str) -> Optional[str]:
+    """If ``text_clean`` is ``<trigger>`` or ``<trigger> body``, return body (possibly ''); else None."""
+    c = (text_clean or "").strip()
+    t = (trigger or "").strip()
+    if not c or not t:
+        return None
+    cl = c.lower()
+    tl = t.lower()
+    if cl == tl:
+        return ""
+    if cl.startswith(tl + " "):
+        return c[len(t):].strip()
+    return None
+
+
+def _p0_qa_worker(
+    chat_id: str, open_id: str, kind: str, question: str, debounce_key: str
+) -> None:
+    def _send(text: str) -> None:
+        try:
+            if (chat_id or "").strip():
+                _lark_send_text_auto("chat_id", chat_id, text)
+            elif (open_id or "").strip():
+                _lark_send_text_auto("open_id", open_id, text)
+            else:
+                logger.warning("p0 qa: no chat_id/open_id to reply to")
+        except Exception:
+            logger.exception("p0 qa reply send failed")
+
+    ask_trig = _cfg_str("P0_ASK_TRIGGER", "/ask").strip() or "/ask"
+    try:
+        if kind == "reload":
+            ok, meta = _p0_doc_reload()
+            _send(
+                f"✅ 文档已重新读取 / Documentation reloaded.\n{meta}"
+                if ok
+                else f"⚠️ 重新读取失败 / Reload failed:\n{meta}"
+            )
+            return
+
+        q = (question or "").strip()
+        if not q:
+            _send(
+                "👋 我是 p0bot。直接问我关于文档的问题即可"
+                f"（群里请 @我 或用 `{ask_trig} 你的问题`）。\n"
+                "I'm p0bot — ask me anything about the documentation "
+                f"(in groups, @ me or use `{ask_trig} your question`)."
+            )
+            return
+
+        doc = _p0_doc_get_cached()
+        if not doc:
+            _send(
+                "⚠️ 我还没能读取到文档。请确认机器人已获授权访问该 wiki"
+                "（需要 wiki 与 docx 读取权限，且文档/知识库已共享给本应用），然后发送 /reload 重试。\n"
+                "I couldn't read the documentation yet — grant the bot wiki + docx read scopes and "
+                "share the page with the app, then send /reload."
+            )
+            return
+        _send(_p0_ai_answer(q, doc))
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_doc_qa(
+    *,
+    chat_id: str,
+    open_id: str,
+    raw_text: str,
+    clean: str,
+    mentions: Any,
+    msg: Dict[str, Any],
+    im_chat_type: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle a p0 doc Q&A / reload IM. Returns True when handled (skips monitoring)."""
+    if not _p0_qa_enabled():
+        return False
+    ct = (im_chat_type or "").strip().lower()
+    is_dm = ct in ("p2p", "private")
+    ask_trigger = _cfg_str("P0_ASK_TRIGGER", "/ask").strip() or "/ask"
+    reload_trigger = _cfg_str("P0_RELOAD_TRIGGER", "/reload").strip() or "/reload"
+    text_clean = (clean or "").strip()
+
+    # Never swallow the monitoring commands (/mo, /m, /c) — let them fall through so the
+    # monitoring handlers still work when both features share a process.
+    is_monitoring_cmd = (
+        _im_command_matches(text_clean, MONITORING_TRIGGER)
+        or _im_command_matches(text_clean, MONITORING_MUTE_TRIGGER)
+        or _im_command_matches(text_clean, MONITORING_CANCELMUTE_TRIGGER)
+    )
+
+    kind = ""
+    question = ""
+    if _p0_command_body(text_clean, reload_trigger) is not None:
+        kind = "reload"
+    else:
+        asked = _p0_command_body(text_clean, ask_trigger)
+        if asked is not None:
+            kind, question = "ask", asked
+        elif is_monitoring_cmd:
+            # A monitoring command that isn't /ask or /reload — hand off to monitoring.
+            return False
+        elif (
+            not is_dm
+            and _lark_env_truthy_or_default("P0_QA_AT_MENTION_ENABLE", default=True)
+            and _p0_mentions_contain_bot(mentions)
+        ):
+            kind, question = "mention", text_clean
+        elif is_dm and _lark_env_truthy_or_default("P0_QA_ANSWER_DM", default=True):
+            kind, question = "dm", text_clean
+
+    if not kind:
+        return False
+
+    processed_stick = _monitoring_processed_stick(
+        mid, im_event_id, chat_id or "", sender_debounce, msg_time
+    )
+    # Key on the question text (not just chat+kind) so a second, distinct question in the
+    # same chat is not silently dropped while the first is still being answered by the model.
+    # (True duplicate deliveries are already collapsed by the event-id / stick guards below.)
+    if kind == "reload":
+        debounce_key = f"{(chat_id or '').strip()}\n__p0_reload__"
+    else:
+        _qn = re.sub(r"\s+", " ", (question or "").strip().lower())[:200]
+        debounce_key = f"{(chat_id or '').strip()}\n__p0_{kind}__\n{_qn}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            logger.info("duplicate IM event_id=%s — skip (p0 %s)", im_event_id, kind)
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            logger.info("duplicate p0 %s stick=%r — skip", kind, processed_stick[:96])
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            logger.info("p0 %s skip — already in flight", kind)
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    logger.info(
+        "p0 doc-qa accepted kind=%s chat=%s dm=%s q_len=%d",
+        kind,
+        bool(chat_id),
+        is_dm,
+        len(question or ""),
+    )
+    try:
+        threading.Thread(
+            target=_p0_qa_worker,
+            args=(chat_id or "", open_id or "", kind, question, debounce_key),
+            daemon=True,
+            name="p0-doc-qa",
+        ).start()
+    except Exception:
+        # Worker never started → its finally never runs; release the in-flight key here
+        # so this chat+question is not blocked forever (the set has no TTL/sweep).
+        logger.exception("p0 doc-qa: worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+def _p0_start_doc_preload_if_enabled() -> None:
+    """Warm the doc cache on startup (and optionally refresh it periodically)."""
+    if not _p0_qa_enabled():
+        return
+    if not _p0_wiki_node_token():
+        logger.warning(
+            "P0_DOC_QA_ENABLE=1 but P0_WIKI_NODE_TOKEN/P0_WIKI_URL empty — Q&A will have no doc"
+        )
+        return
+    logger.info(
+        "p0 doc-qa enabled — model=%s ollama=%s node=%s include_children=%s",
+        _p0_qa_model(),
+        _p0_qa_ollama_url(),
+        _p0_wiki_node_token(),
+        _lark_env_truthy_or_default("P0_WIKI_INCLUDE_CHILDREN", default=True),
+    )
+
+    def _boot() -> None:
+        ok, meta = _p0_doc_reload()
+        if not ok:
+            logger.warning(
+                "p0 doc preload failed: %s (fix wiki/docx scopes + sharing, then /reload)", meta
+            )
+        try:
+            oid = _p0_bot_open_id()
+            if oid:
+                logger.info(
+                    "p0 bot open_id=%s — pin P0_BOT_OPEN_ID to this for reliable group @-mention",
+                    oid,
+                )
+            else:
+                logger.warning(
+                    "p0 could not resolve this bot's open_id — group @-mention may miss; "
+                    "DMs and %s still work. Set P0_BOT_OPEN_ID to fix.",
+                    _cfg_str("P0_ASK_TRIGGER", "/ask").strip() or "/ask",
+                )
+        except Exception:
+            logger.exception("p0 bot open_id resolve at startup failed")
+        refresh = _cfg_int("P0_DOC_REFRESH_SECONDS", 0)
+        if refresh > 0:
+            while True:
+                time.sleep(max(60, refresh))
+                _p0_doc_reload()
+
+    threading.Thread(target=_boot, daemon=True, name="p0-doc-preload").start()
+
+
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
     global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
@@ -9196,6 +9788,22 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         open_id=open_id or "",
         sender=sender,
         send_wrap=send_wrap,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: doc Q&A takes precedence (answers questions from the cached wiki doc).
+    if _p0_try_handle_doc_qa(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        raw_text=raw_text or "",
+        clean=clean or "",
+        mentions=mentions,
+        msg=msg,
+        im_chat_type=im_chat_type,
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,
@@ -10129,6 +10737,7 @@ def run_monitoring_bot() -> None:
     )
     _start_grafana_playwright_keeper_if_enabled()
     _start_monitoring_watchdog_if_enabled()
+    _p0_start_doc_preload_if_enabled()
     if _lark_env_truthy("MONITORING_WATCH_ENABLE") and not (MONITORING_ALERT_CHAT_ID or "").strip():
         logger.error(
             "MONITORING_WATCH_ENABLE=1 but MONITORING_ALERT_CHAT_ID is empty — "

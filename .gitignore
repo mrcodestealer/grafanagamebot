@@ -1,0 +1,16 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Local environment / secrets — never commit real APP_SECRET, tokens, passwords
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
