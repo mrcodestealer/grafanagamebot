@@ -9654,6 +9654,7 @@ def _p0_try_handle_meeting(
 # ---------------------------------------------------------------------------
 
 _p0_vc_tok_lock = threading.Lock()
+_p0_vc_refresh_lock = threading.Lock()  # serialize refresh (refresh_token is single-use / rotating)
 
 
 def _p0_vc_token_path() -> str:
@@ -9789,10 +9790,17 @@ def _p0_vc_user_access_token() -> Optional[str]:
     exp = float(d.get("expires_at") or 0)
     if at and time.time() < (exp - 120):
         return at
-    ok, _msg = _p0_vc_oauth_refresh()
-    if ok:
-        return _p0_vc_token_load().get("access_token") or None
-    return None
+    # Serialize refresh so concurrent callers don't each spend the single-use refresh_token.
+    with _p0_vc_refresh_lock:
+        d = _p0_vc_token_load()
+        at = d.get("access_token")
+        exp = float(d.get("expires_at") or 0)
+        if at and time.time() < (exp - 120):
+            return at  # another thread refreshed while we waited
+        ok, _msg = _p0_vc_oauth_refresh()
+        if ok:
+            return _p0_vc_token_load().get("access_token") or None
+        return None
 
 
 def _p0_vc_admin_allowed(open_id: str) -> bool:
