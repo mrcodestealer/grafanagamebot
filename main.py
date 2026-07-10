@@ -357,6 +357,16 @@ _CFG: Dict[str, Any] = {
     "P0_MEETING_LOOKBACK_HOURS": "6",
     "P0_MEETING_MAX_ROWS": "200",
     "P0_MEETING_CARD_TEMPLATE": "turquoise",
+    # ---- Admin OAuth for /meeting (user_access_token; clears the 121005 admin-role gate) ----
+    # An admin runs /vcauth, authorizes in the browser, and pastes the code back with /vccode.
+    # The bot stores + auto-refreshes that admin's user token and uses it for the report.
+    # redirect_uri must be registered in the app's Security → Redirect URLs (localhost is fine;
+    # the code is copied from the address bar, so the URL need not actually be served).
+    "P0_VC_REDIRECT_URI": "http://localhost:5088/oauth/callback",
+    "P0_VC_OAUTH_SCOPES": "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly",
+    # Restrict who may run /vcauth //vccode (space/comma open_ids). Empty = anyone (a non-admin's
+    # token simply won't clear 121005, so it's low-risk, but restricting is recommended).
+    "P0_VC_ADMIN_OPEN_IDS": "",
 }
 
 
@@ -9192,6 +9202,8 @@ def _p0_try_handle_doc_qa(
         or _im_command_matches(text_clean, MONITORING_MUTE_TRIGGER)
         or _im_command_matches(text_clean, MONITORING_CANCELMUTE_TRIGGER)
         or _p0_command_body(text_clean, _p0_meeting_trigger()) is not None
+        or _p0_command_body(text_clean, "/vcauth") is not None
+        or _p0_command_body(text_clean, "/vccode") is not None
     )
 
     kind = ""
@@ -9359,6 +9371,10 @@ def _p0_meeting_participant_rows(
     page = ""
     cap = max(20, _cfg_int("P0_MEETING_MAX_ROWS", 200))
     base = f"{_lark_api_domain()}/open-apis/vc/v1/participant_list"
+    # This report requires an admin's user_access_token (tenant token → 121005).
+    at = _p0_vc_user_access_token()
+    if not at:
+        return None, {"code": "NO_AUTH", "msg": "no admin authorization yet — an admin must run /vcauth first"}
     for _ in range(40):
         params: Dict[str, Any] = {
             "meeting_no": meeting_no,
@@ -9374,11 +9390,10 @@ def _p0_meeting_participant_rows(
         # Deliberately do NOT raise_for_status — read the JSON body on any status so the
         # user sees Lark's real code/msg (e.g. a permission error) instead of a generic one.
         try:
-            tok = _lark_tenant_access_token_string()
             r = requests.get(
                 base,
                 headers={
-                    "Authorization": f"Bearer {tok}",
+                    "Authorization": f"Bearer {at}",
                     "Content-Type": "application/json; charset=utf-8",
                 },
                 params=params,
@@ -9492,6 +9507,17 @@ def _p0_meeting_worker(chat_id: str, open_id: str, meeting_no: str, mid: str, de
         if rows is None:
             code = err.get("code") if isinstance(err, dict) else "?"
             msg = err.get("msg") if isinstance(err, dict) else str(err)
+            if str(code) == "NO_AUTH":
+                _p0_meeting_send_card(
+                    rt, rv, meeting_no, "orange", "🔐 需要管理员授权 / Admin authorization needed",
+                    [
+                        "读取参会信息需要管理员先授权一次。请【管理员】运行 /vcauth 完成授权"
+                        "（该管理员需拥有『视频会议 · 会议管理』后台权限）。",
+                        "Reading attendance needs a one-time admin authorization. An admin runs "
+                        "**/vcauth** (the admin must hold the VC 'Meeting Management' role).",
+                    ],
+                )
+                return
             low = f"{code} {msg}".lower()
             hint = ""
             if any(k in low for k in ("permission", "access", "denied", "forbidden", "403", "99991")):
@@ -9612,6 +9638,285 @@ def _p0_try_handle_meeting(
         ).start()
     except Exception:
         logger.exception("p0 meeting worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# p0bot — VC admin OAuth (user_access_token) for the /meeting report
+#
+# participant_list requires the caller's identity to hold the admin "Meeting
+# Management" role, which the bot's tenant token lacks (121005). So an admin
+# authorizes once via OAuth (/vcauth → open link → /vccode <code>); we store +
+# auto-refresh their user_access_token and use it for the report. The code is
+# copied from the browser address bar, so NO public server is required.
+# ---------------------------------------------------------------------------
+
+_p0_vc_tok_lock = threading.Lock()
+
+
+def _p0_vc_token_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".p0_vc_token.json")
+
+
+def _p0_vc_oauth_scopes() -> str:
+    return _cfg_str(
+        "P0_VC_OAUTH_SCOPES",
+        "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly",
+    ).strip()
+
+
+def _p0_vc_redirect_uri() -> str:
+    return _cfg_str("P0_VC_REDIRECT_URI", "http://localhost:5088/oauth/callback").strip()
+
+
+def _p0_vc_token_load() -> Dict[str, Any]:
+    with _p0_vc_tok_lock:
+        try:
+            with open(_p0_vc_token_path(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.exception("p0 vc token load failed")
+            return {}
+
+
+def _p0_vc_token_save(d: Dict[str, Any]) -> None:
+    with _p0_vc_tok_lock:
+        try:
+            path = _p0_vc_token_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("p0 vc token save failed")
+
+
+def _p0_vc_oauth_accounts_host() -> str:
+    return "https://accounts.larksuite.com" if "larksuite" in (LARK_HOST or "") else "https://accounts.feishu.cn"
+
+
+def _p0_vc_oauth_token_endpoint() -> str:
+    return f"{(LARK_HOST or 'https://open.larksuite.com').rstrip('/')}/open-apis/authen/v2/oauth/token"
+
+
+def _p0_vc_oauth_authorize_url() -> str:
+    from urllib.parse import quote
+
+    params = {
+        "client_id": str(APP_ID or "").strip(),
+        "redirect_uri": _p0_vc_redirect_uri(),
+        "scope": _p0_vc_oauth_scopes(),
+        "state": os.urandom(9).hex(),
+    }
+    return f"{_p0_vc_oauth_accounts_host()}/open-apis/authen/v1/authorize?{urlencode(params, quote_via=quote)}"
+
+
+def _p0_vc_oauth_store_response(j: Dict[str, Any]) -> None:
+    now = time.time()
+    d = _p0_vc_token_load()
+    d["access_token"] = j.get("access_token") or ""
+    d["expires_at"] = now + float(j.get("expires_in") or 0)
+    if j.get("refresh_token"):
+        d["refresh_token"] = j.get("refresh_token")
+        d["refresh_expires_at"] = now + float(j.get("refresh_token_expires_in") or 0)
+    d["scope"] = j.get("scope") or d.get("scope", "")
+    d["obtained_at"] = now
+    _p0_vc_token_save(d)
+
+
+def _p0_vc_oauth_post(body: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        r = requests.post(
+            _p0_vc_oauth_token_endpoint(),
+            json=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=30,
+        )
+        j = r.json()
+    except Exception as e:
+        logger.exception("p0 vc oauth token request failed")
+        return False, f"network error: {e.__class__.__name__}: {e}"
+    if int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) != 0 or not j.get("access_token"):
+        return False, f"code={j.get('code')} error={j.get('error')} desc={j.get('error_description') or j.get('msg')}"
+    _p0_vc_oauth_store_response(j)
+    return True, ("ok" if j.get("refresh_token") else "ok (no refresh_token — add offline_access scope to keep it logged in)")
+
+
+def _p0_vc_oauth_exchange(code: str) -> Tuple[bool, str]:
+    code = (code or "").strip()
+    if not code:
+        return False, "empty code"
+    return _p0_vc_oauth_post(
+        {
+            "grant_type": "authorization_code",
+            "client_id": str(APP_ID or "").strip(),
+            "client_secret": str(APP_SECRET or "").strip(),
+            "code": code,
+            "redirect_uri": _p0_vc_redirect_uri(),
+        }
+    )
+
+
+def _p0_vc_oauth_refresh() -> Tuple[bool, str]:
+    d = _p0_vc_token_load()
+    rt = d.get("refresh_token")
+    if not rt:
+        return False, "no refresh_token stored"
+    if d.get("refresh_expires_at") and time.time() > float(d["refresh_expires_at"]):
+        return False, "refresh_token expired — re-run /vcauth"
+    return _p0_vc_oauth_post(
+        {
+            "grant_type": "refresh_token",
+            "client_id": str(APP_ID or "").strip(),
+            "client_secret": str(APP_SECRET or "").strip(),
+            "refresh_token": rt,
+        }
+    )
+
+
+def _p0_vc_user_access_token() -> Optional[str]:
+    d = _p0_vc_token_load()
+    at = d.get("access_token")
+    exp = float(d.get("expires_at") or 0)
+    if at and time.time() < (exp - 120):
+        return at
+    ok, _msg = _p0_vc_oauth_refresh()
+    if ok:
+        return _p0_vc_token_load().get("access_token") or None
+    return None
+
+
+def _p0_vc_admin_allowed(open_id: str) -> bool:
+    allow = {
+        p.strip()
+        for p in re.split(r"[\s,;]+", _cfg_str("P0_VC_ADMIN_OPEN_IDS", "").strip())
+        if p.strip()
+    }
+    if not allow:
+        return True  # open: a non-admin's token just won't clear 121005, so low-risk
+    return (open_id or "").strip() in allow
+
+
+def _p0_vcauth_worker(kind: str, arg: str, rt: str, rv: str, debounce_key: str) -> None:
+    def _reply(text: str) -> None:
+        try:
+            if rt and rv:
+                _lark_send_text_auto(rt, rv, text)
+        except Exception:
+            logger.exception("p0 vcauth reply failed")
+
+    try:
+        if kind == "auth":
+            url = _p0_vc_oauth_authorize_url()
+            _reply(
+                "① 请【管理员】在浏览器打开下面链接并登录授权"
+                "（该管理员需拥有『视频会议 · 会议管理』后台权限）：\n"
+                "Open this link in a browser and authorize as an ADMIN who holds the VC "
+                "'Meeting Management' role:\n"
+                f"{url}\n\n"
+                "② 授权后浏览器会跳转到一个地址（可能打不开，没关系）。从地址栏复制其中的 "
+                "code=… 值，然后发给我：\n"
+                "After consent the browser lands on a redirect URL (it may fail to load — that's "
+                "fine). Copy the code=… from the address bar and send it back:\n"
+                "/vccode <粘贴 code 或整个跳转网址 / paste the code, or the whole redirected URL>"
+            )
+        else:  # kind == "code"
+            code = (arg or "").strip()
+            m = re.search(r"code=([^&\s]+)", code)
+            if m:
+                code = m.group(1)
+            ok, msg = _p0_vc_oauth_exchange(code)
+            if ok:
+                _reply(
+                    "✅ 授权成功，已保存管理员令牌。现在可用 /meeting <会议号> 查询参会情况。\n"
+                    f"Authorized — admin token stored ({msg}). Now try /meeting <number>."
+                )
+            else:
+                _reply(
+                    "⚠️ 授权失败 / Authorization failed:\n"
+                    f"{msg}\n"
+                    "code 有效期仅 5 分钟且只能用一次；请重新 /vcauth 获取新链接后再试。\n"
+                    "The code is valid 5 min and single-use — run /vcauth again for a fresh link."
+                )
+    finally:
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_vcauth(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle /vcauth and /vccode <code>. Returns True when handled."""
+    if not _p0_meeting_enabled():
+        return False
+    text = (clean or "").strip()
+    is_auth = _p0_command_body(text, "/vcauth") is not None
+    code_body = _p0_command_body(text, "/vccode")
+    if not is_auth and code_body is None:
+        return False
+
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    kind = "auth" if is_auth else "code"
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_vcauth_{kind}__"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    if not _p0_vc_admin_allowed(open_id):
+        def _deny() -> None:
+            try:
+                if rt and rv:
+                    _lark_send_text_auto(rt, rv, "仅授权管理员可执行此命令 / this command is restricted to configured admins.")
+            finally:
+                with _monitoring_reply_dispatch_lock:
+                    _monitoring_inflight_keys.discard(debounce_key)
+
+        threading.Thread(target=_deny, daemon=True, name="p0-vcauth-deny").start()
+        return True
+
+    arg = "" if is_auth else (code_body or "")
+    try:
+        threading.Thread(
+            target=_p0_vcauth_worker,
+            args=(kind, arg, rt, rv, debounce_key),
+            daemon=True,
+            name="p0-vcauth",
+        ).start()
+    except Exception:
+        logger.exception("p0 vcauth worker thread failed to start")
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
     return True
@@ -10244,6 +10549,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         open_id=open_id or "",
         sender=sender,
         send_wrap=send_wrap,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: admin OAuth for the meeting report (/vcauth, /vccode) — before /meeting.
+    if _p0_try_handle_vcauth(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,
@@ -10940,6 +11257,26 @@ def start_lark_ws_client_blocking() -> None:
             last_domain_err,
         )
         raise last_domain_err
+
+
+@app.route("/oauth/callback", methods=["GET"])
+def _p0_oauth_callback():
+    """Optional: auto-exchange the OAuth code if the redirect is reachable (ENABLE_HTTP=1 + public).
+
+    Not required — the admin can instead copy code=… from the address bar and send /vccode <code>.
+    """
+    code = request.args.get("code", "")
+    if not code:
+        err = request.args.get("error", "")
+        return (
+            f"No authorization code (error={err or 'none'}). "
+            "If you see code=… in the address bar, send it to the bot: /vccode <code>",
+            400,
+        )
+    ok, msg = _p0_vc_oauth_exchange(code)
+    if ok:
+        return "Authorized. You can close this tab and use /meeting in Lark.", 200
+    return f"Authorization failed: {msg}. You can also try /vccode <code> in chat.", 400
 
 
 @app.route("/health", methods=["GET"])

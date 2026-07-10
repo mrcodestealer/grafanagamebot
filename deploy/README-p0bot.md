@@ -67,11 +67,22 @@ included by the API.
 Enable in `.env`: `P0_MEETING_ENABLE=1` (optional `P0_MEETING_TRIGGER`, `P0_MEETING_LOOKBACK_HOURS`).
 Use it: DM the bot `/meeting 123456789`, or in a group `@p0bot /meeting <link>`.
 
-**Permission (the catch):** the report API `GET /open-apis/vc/v1/participant_list` needs the
-app to hold the enterprise **VC "Meeting Management" report permission** (granted by an admin
-in the Lark admin console). On some tenants this endpoint only accepts a `user_access_token`
-(admin OAuth) rather than the bot's tenant token — if so, the bot replies with the exact
-permission error so you know to arrange it. Look-back window is capped at 24h (Lark limit).
+**Permission (the catch):** the report API `GET /open-apis/vc/v1/participant_list` returns
+`121005` for the bot's tenant token — it requires the **caller** to hold the admin
+**"Video Conferencing · Meeting Management"** role. So p0bot uses an **admin's user token via
+OAuth**. One-time setup:
+
+1. Developer Console → your app → add scope `vc:rooms.room.detailinfo:read` (+ the contact
+   name scopes), and in **Security → Redirect URLs** register the exact `P0_VC_REDIRECT_URI`
+   (default `http://localhost:5088/oauth/callback` — it doesn't need to be reachable).
+2. In chat, an **admin who holds the Meeting-Management role** runs **`/vcauth`** → the bot
+   replies with a login link → the admin opens it, consents → the browser lands on the
+   redirect (may fail to load — fine) → the admin copies `code=…` from the address bar and
+   sends **`/vccode <code>`** (or pastes the whole redirected URL).
+3. The bot stores + auto-refreshes that admin's token (needs `offline_access`, included by
+   default) and uses it for `/meeting`. Re-auth only if the refresh token expires (~30d/365d cap).
+
+If `/meeting` shows a `NO_AUTH` card, run `/vcauth` first. Look-back window is capped at 24h.
 
 ## Prerequisites / gotchas
 
