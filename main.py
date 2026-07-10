@@ -9536,6 +9536,12 @@ def _p0_try_handle_meeting(
 
     if not meeting_no:
         def _usage() -> None:
+            react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+            ack = (
+                _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK")
+                if react
+                else None
+            )
             try:
                 rt, rv = (
                     ("chat_id", chat_id)
@@ -9546,10 +9552,16 @@ def _p0_try_handle_meeting(
                     _lark_send_text_auto(
                         rt,
                         rv,
-                        f"用法 / Usage: {_p0_meeting_trigger()} <会议号或会议链接 / meeting number or link>\n"
-                        "例 / e.g. /meeting 123456789",
+                        "请给我会议的 **9 位会议号** 或会议链接（不是会议名称）。\n"
+                        "Please give the meeting's **9-digit number** or join link — not its name.\n"
+                        f"例 / e.g. {_p0_meeting_trigger()} 123456789   或/or   "
+                        f"{_p0_meeting_trigger()} https://vc.larksuite.com/j/123456789",
                     )
             finally:
+                if react and ack:
+                    _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+                    if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                        _p0_lark_remove_reaction(mid, ack)
                 with _monitoring_reply_dispatch_lock:
                     _monitoring_inflight_keys.discard(debounce_key)
 
