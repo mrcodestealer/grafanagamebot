@@ -10255,11 +10255,19 @@ def _p0_contact_name(open_id: str) -> str:
             timeout=15,
         )
         j = r.json()
-        if isinstance(j, dict) and int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) == 0:
+        code = int(j.get("code", -1) if isinstance(j, dict) and str(j.get("code", "")).lstrip("-").isdigit() else -1)
+        if isinstance(j, dict) and code == 0:
             for it in (j.get("data") or {}).get("items") or []:
                 if isinstance(it, dict) and _lark_dict_pick_str(it, "open_id", "openId") == oid:
                     name = _lark_dict_pick_str(it, "name", "en_name", "enName", "nickname")
                     break
+        elif isinstance(j, dict):
+            logger.info(
+                "p0 contact name lookup code=%s msg=%s — grant the app 'contact:contact.base:readonly' "
+                "(and publish a version) to show real names instead of open_id.",
+                j.get("code"),
+                j.get("msg"),
+            )
     except Exception:
         logger.debug("p0 contact name lookup failed for %s", oid[:10])
     if name:
@@ -10397,21 +10405,48 @@ def _p0_om_open_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) 
                 for k in list(_p0_om_active)[:20]:
                     _p0_om_active.pop(k, None)
         host_name = _p0_contact_name(host) or "指定主持人 / assigned host"
-        _p0_om_card(
-            announce_chat or chat_id,
-            "🎥 会议已开 / Meeting opened",
-            template,
-            [
-                f"**主题 / Topic:** {topic}",
-                f"**会议号 / No.:** {meeting_no}",
-                f"**加入 / Join:** {url}" if url else "",
-                f"**主持人 / Host:** {host_name}（自动录制已开 / auto-record on）",
-                "",
-                "点链接加入，我会在这里播报谁加入/离开。/ Click to join — I'll announce joins & leaves here.",
-                f"结束：主持人在客户端结束，或发送 {_p0_om_end_trigger()} / End: host ends it in-client, or send {_p0_om_end_trigger()}.",
-            ],
-        )
-        logger.info("p0 openmeeting reserved no=%s host=%s chat=%s", meeting_no, host[:10], (announce_chat or chat_id)[:12])
+        chat_target = announce_chat or chat_id
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "\n".join(
+                    [
+                        f"**主题 / Topic:** {topic}",
+                        f"**会议号 / No.:** {meeting_no}",
+                        f"**主持人 / Host:** {host_name}（自动录制已开 / auto-record on）",
+                        "",
+                        "点下方按钮加入，我会在这里播报谁加入/离开。/ Tap **Join** — I'll announce joins & leaves here.",
+                        f"结束 / End: 主持人在客户端结束，或发送 {_p0_om_end_trigger()}。",
+                    ]
+                ),
+            }
+        ]
+        if url:
+            elements.append({"tag": "hr"})
+            elements.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🎥 加入会议 / Join meeting"},
+                    "type": "primary",
+                    "behaviors": [{"type": "open_url", "default_url": url}],
+                }
+            )
+        card = {
+            "schema": "2.0",
+            "config": {"update_multi": True, "wide_screen_mode": True},
+            "header": {"template": template, "title": {"tag": "plain_text", "content": "🎥 会议已开 / Meeting opened"}},
+            "body": {"elements": elements},
+        }
+        if chat_target:
+            try:
+                _lark_send_interactive_card("chat_id", chat_target, card)
+            except Exception:
+                logger.exception("p0 openmeeting open card failed; text fallback")
+                try:
+                    _lark_send_text_auto("chat_id", chat_target, f"🎥 Meeting opened: {topic}\nNo. {meeting_no}\nJoin: {url}")
+                except Exception:
+                    logger.exception("p0 openmeeting open text fallback failed")
+        logger.info("p0 openmeeting reserved no=%s host=%s chat=%s", meeting_no, host[:10], (chat_target or "")[:12])
     finally:
         if react and ack_id:
             _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
@@ -12043,9 +12078,11 @@ def start_lark_ws_client_blocking() -> None:
     if _p0_om_enabled():
         for _et, _h in (
             ("vc.meeting.meeting_started_v1", _p0_om_on_started),
+            ("vc.meeting.all_meeting_started_v1", _p0_om_on_started),  # alias if that variant is subscribed
             ("vc.meeting.join_meeting_v1", _p0_om_on_join),
             ("vc.meeting.leave_meeting_v1", _p0_om_on_leave),
             ("vc.meeting.meeting_ended_v1", _p0_om_on_ended),
+            ("vc.meeting.all_meeting_ended_v1", _p0_om_on_ended),
             ("vc.meeting.recording_ready_v1", _p0_om_on_recording_ready),
         ):
             bld = bld.register_p2_customized_event(_et, _h)
