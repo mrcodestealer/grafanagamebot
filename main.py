@@ -374,6 +374,27 @@ _CFG: Dict[str, Any] = {
     "P0_MEMBERS_TRIGGER": "/members",
     "P0_MEMBERS_CARD_TEMPLATE": "blue",
     "P0_MEMBERS_MAX_ROWS": "500",
+    # ---- Bot-hosted meeting (/openmeeting): reserve → live join/leave → auto-record → recording ----
+    # The bot reserves a meeting it owns (needs a real user as owner/host), posts the join link, and
+    # announces joins/leaves live via VC events. Scopes: vc:reserve, vc:meeting:readonly, vc:meeting,
+    # vc:record:readonly (+ contact:contact.base:readonly for names). Cloud recording must be enabled
+    # for the tenant. /endmeeting needs the host's user token (via /vcauth) AND the host in the call;
+    # otherwise the host ends it in the Lark client.
+    "P0_OPENMEETING_ENABLE": "0",
+    "P0_OPENMEETING_TRIGGER": "/openmeeting",
+    "P0_ENDMEETING_TRIGGER": "/endmeeting",
+    # Meeting owner + assigned host + recording recipient — a real Lark user open_id (REQUIRED).
+    "P0_MEETING_HOST_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    # Where joins/leaves/end are announced; empty = the chat where /openmeeting was run.
+    "P0_OPENMEETING_ANNOUNCE_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    "P0_OPENMEETING_AUTO_RECORD": "1",
+    "P0_OPENMEETING_TOPIC": "p0bot meeting",
+    "P0_OPENMEETING_DURATION_HOURS": "4",
+    "P0_OPENMEETING_ANNOUNCE_JOINS": "1",
+    "P0_OPENMEETING_ANNOUNCE_LEAVES": "1",
+    "P0_OPENMEETING_CARD_TEMPLATE": "turquoise",
+    # Who may run /openmeeting //endmeeting (space/comma open_ids); empty = anyone in the chat.
+    "P0_OPENMEETING_ALLOWED_OPEN_IDS": "",
 }
 
 
@@ -9210,6 +9231,8 @@ def _p0_try_handle_doc_qa(
         or _im_command_matches(text_clean, MONITORING_CANCELMUTE_TRIGGER)
         or _p0_command_body(text_clean, _p0_meeting_trigger()) is not None
         or _p0_command_body(text_clean, _p0_members_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_om_open_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_om_end_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
     )
@@ -10168,6 +10191,455 @@ def _p0_try_handle_vcauth(
     return True
 
 
+# ---------------------------------------------------------------------------
+# p0bot — bot-hosted meeting (/openmeeting)
+#
+# The bot reserves a meeting it "owns" (owner_id = a real user), auto-records,
+# assigns that user as host, posts the join link, and — because Open-API-reserved
+# meetings emit participant events — announces joins/leaves live over the WS. When
+# the meeting ends (host ends it in-client, or /endmeeting via the host's /vcauth
+# token) the recording link is DM'd to the host (who owns it). Live events work
+# with the bot's tenant token; only /endmeeting needs a host user token.
+# ---------------------------------------------------------------------------
+
+_p0_om_lock = threading.Lock()
+_p0_om_active: Dict[str, Dict[str, Any]] = {}  # meeting_no -> {reserve_id, meeting_id, chat_id, topic, present:set}
+_p0_name_cache: Dict[str, str] = {}
+_p0_name_cache_lock = threading.Lock()
+
+_P0_OM_USER_TYPE_LABEL = {"2": "会议室/Room", "6": "电话/Phone", "7": "SIP"}
+
+
+def _p0_om_enabled() -> bool:
+    return _lark_env_truthy("P0_OPENMEETING_ENABLE")
+
+
+def _p0_om_open_trigger() -> str:
+    return _cfg_str("P0_OPENMEETING_TRIGGER", "/openmeeting").strip() or "/openmeeting"
+
+
+def _p0_om_end_trigger() -> str:
+    return _cfg_str("P0_ENDMEETING_TRIGGER", "/endmeeting").strip() or "/endmeeting"
+
+
+def _p0_om_host_open_id() -> str:
+    return _cfg_str("P0_MEETING_HOST_OPEN_ID", "").strip()
+
+
+def _p0_om_allowed(open_id: str) -> bool:
+    allow = {
+        p.strip()
+        for p in re.split(r"[\s,;]+", _cfg_str("P0_OPENMEETING_ALLOWED_OPEN_IDS", "").strip())
+        if p.strip()
+    }
+    if not allow:
+        return True  # openmeeting just creates a meeting link; low-risk to leave open
+    return (open_id or "").strip() in allow
+
+
+def _p0_contact_name(open_id: str) -> str:
+    oid = (open_id or "").strip()
+    if not oid:
+        return ""
+    with _p0_name_cache_lock:
+        if oid in _p0_name_cache:
+            return _p0_name_cache[oid]
+    name = ""
+    try:
+        tok = _lark_tenant_access_token_string()
+        r = requests.get(
+            f"{_lark_api_domain()}/open-apis/contact/v3/users/batch",
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+            params=[("user_ids", oid), ("user_id_type", "open_id")],
+            timeout=15,
+        )
+        j = r.json()
+        if isinstance(j, dict) and int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) == 0:
+            for it in (j.get("data") or {}).get("items") or []:
+                if isinstance(it, dict) and _lark_dict_pick_str(it, "open_id", "openId") == oid:
+                    name = _lark_dict_pick_str(it, "name", "en_name", "enName", "nickname")
+                    break
+    except Exception:
+        logger.debug("p0 contact name lookup failed for %s", oid[:10])
+    if name:
+        with _p0_name_cache_lock:
+            _p0_name_cache[oid] = name
+            if len(_p0_name_cache) > 2000:
+                _p0_name_cache.clear()
+    return name
+
+
+def _p0_om_display(op: Dict[str, Any]) -> str:
+    idobj = op.get("id") if isinstance(op.get("id"), dict) else {}
+    oid = _lark_dict_pick_str(idobj, "open_id", "openId") or _lark_dict_pick_str(op, "open_id", "openId")
+    nm = _p0_contact_name(oid)
+    if nm:
+        return nm
+    ut = str(op.get("user_type") if op.get("user_type") is not None else op.get("userType") or "").strip()
+    return _P0_OM_USER_TYPE_LABEL.get(ut) or (f"用户/user …{oid[-6:]}" if oid else "someone")
+
+
+def _p0_om_op_open_id(op: Dict[str, Any]) -> str:
+    idobj = op.get("id") if isinstance(op.get("id"), dict) else {}
+    return _lark_dict_pick_str(idobj, "open_id", "openId") or _lark_dict_pick_str(op, "open_id", "openId")
+
+
+def _p0_om_card(chat_id: str, title: str, template: str, lines: List[str]) -> None:
+    if not (chat_id or "").strip():
+        return
+    card = {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {"template": template, "title": {"tag": "plain_text", "content": title[:190]}},
+        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines) if lines else "-"}]},
+    }
+    try:
+        _lark_send_interactive_card("chat_id", chat_id, card)
+    except Exception:
+        logger.exception("p0 openmeeting card failed; text fallback")
+        try:
+            _lark_send_text_auto("chat_id", chat_id, f"{title}\n" + "\n".join(lines))
+        except Exception:
+            logger.exception("p0 openmeeting text fallback failed")
+
+
+def _p0_om_reserve(topic: str, host_open_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Reserve a meeting owned by host_open_id, auto-record on. Returns (reserve, error)."""
+    end_time = int(time.time()) + max(1, _cfg_int("P0_OPENMEETING_DURATION_HOURS", 4)) * 3600
+    settings: Dict[str, Any] = {
+        "topic": (topic or "p0bot meeting")[:200],
+        "auto_record": _lark_env_truthy_or_default("P0_OPENMEETING_AUTO_RECORD", default=True),
+    }
+    if host_open_id:
+        settings["assign_host_list"] = [{"user_type": 1, "id": host_open_id}]
+    body = {"end_time": str(end_time), "owner_id": host_open_id, "meeting_settings": settings}
+    try:
+        tok = _lark_tenant_access_token_string()
+        r = requests.post(
+            f"{_lark_api_domain()}/open-apis/vc/v1/reserves/apply",
+            params={"user_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+            json=body,
+            timeout=30,
+        )
+        j = r.json()
+    except Exception as e:
+        logger.exception("p0 openmeeting reserve failed")
+        return None, {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+    if not isinstance(j, dict) or int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) != 0:
+        return None, {"code": (j.get("code") if isinstance(j, dict) else "?"), "msg": (j.get("msg") if isinstance(j, dict) else "unexpected response")}
+    reserve = (j.get("data") or {}).get("reserve") or {}
+    return (reserve if isinstance(reserve, dict) else {}), None
+
+
+def _p0_om_announce_chat_default() -> str:
+    return _cfg_str("P0_OPENMEETING_ANNOUNCE_CHAT_ID", "").strip()
+
+
+def _p0_om_lookup_chat(meeting_no: str) -> str:
+    with _p0_om_lock:
+        rec = _p0_om_active.get(meeting_no)
+        if rec and rec.get("chat_id"):
+            return rec["chat_id"]
+    return _p0_om_announce_chat_default()
+
+
+def _p0_om_open_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -> None:
+    rt, rv = ("chat_id", chat_id) if (chat_id or "").strip() else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+    template = _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise"
+    announce_chat = _p0_om_announce_chat_default() or chat_id
+    try:
+        host = _p0_om_host_open_id()
+        if not host:
+            if rt:
+                _lark_send_text_auto(rt, rv, "未配置主持人 / set P0_MEETING_HOST_OPEN_ID to a real Lark user open_id first.")
+            return
+        topic = _cfg_str("P0_OPENMEETING_TOPIC", "p0bot meeting").strip() or "p0bot meeting"
+        reserve, err = _p0_om_reserve(topic, host)
+        if err:
+            code, msg = err.get("code"), err.get("msg")
+            hint = ""
+            low = f"{code} {msg}".lower()
+            if "permission" in low or "forbidden" in low or "403" in low or "99991" in low:
+                hint = "\n提示：应用需开通 vc:reserve 权限 / grant the app the vc:reserve scope."
+            elif "123004" in str(code) or "host" in low:
+                hint = "\n提示：主持人/owner open_id 无效或非同租户用户 / host/owner open_id invalid or not a same-tenant user."
+            _p0_om_card(announce_chat or chat_id, "⚠️ 开会失败 / Could not open meeting", "red", [f"`code={code}  msg={msg}`{hint}"])
+            return
+        meeting_no = _lark_dict_pick_str(reserve, "meeting_no", "meetingNo")
+        url = _lark_dict_pick_str(reserve, "url")
+        reserve_id = _lark_dict_pick_str(reserve, "id")
+        with _p0_om_lock:
+            _p0_om_active[meeting_no] = {
+                "reserve_id": reserve_id,
+                "meeting_id": "",
+                "chat_id": announce_chat or chat_id,
+                "topic": topic,
+                "present": set(),
+            }
+            if len(_p0_om_active) > 50:
+                for k in list(_p0_om_active)[:20]:
+                    _p0_om_active.pop(k, None)
+        host_name = _p0_contact_name(host) or "指定主持人 / assigned host"
+        _p0_om_card(
+            announce_chat or chat_id,
+            "🎥 会议已开 / Meeting opened",
+            template,
+            [
+                f"**主题 / Topic:** {topic}",
+                f"**会议号 / No.:** {meeting_no}",
+                f"**加入 / Join:** {url}" if url else "",
+                f"**主持人 / Host:** {host_name}（自动录制已开 / auto-record on）",
+                "",
+                "点链接加入，我会在这里播报谁加入/离开。/ Click to join — I'll announce joins & leaves here.",
+                f"结束：主持人在客户端结束，或发送 {_p0_om_end_trigger()} / End: host ends it in-client, or send {_p0_om_end_trigger()}.",
+            ],
+        )
+        logger.info("p0 openmeeting reserved no=%s host=%s chat=%s", meeting_no, host[:10], (announce_chat or chat_id)[:12])
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_om_event_parts(ce: Any) -> Tuple[Dict[str, Any], Dict[str, Any], str, str]:
+    """Return (event, meeting, meeting_no, meeting_id) from a vc.meeting.* event."""
+    data = _lark_ws_sdk_event_to_dict(ce)
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    meeting = ev.get("meeting") if isinstance(ev.get("meeting"), dict) else {}
+    return ev, meeting, _lark_dict_pick_str(meeting, "meeting_no", "meetingNo"), _lark_dict_pick_str(meeting, "id", "meeting_id", "meetingId")
+
+
+def _p0_om_on_started(ce: Any) -> None:
+    if not _p0_om_enabled():
+        return
+    try:
+        _ev, _m, mno, mid = _p0_om_event_parts(ce)
+        if not mno:
+            return
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is not None and mid:
+                rec["meeting_id"] = mid
+        logger.info("p0 openmeeting started no=%s meeting_id=%s", mno, (mid or "")[:12])
+    except Exception:
+        logger.exception("p0 openmeeting started handler failed")
+
+
+def _p0_om_on_join(ce: Any) -> None:
+    if not _p0_om_enabled() or not _lark_env_truthy_or_default("P0_OPENMEETING_ANNOUNCE_JOINS", default=True):
+        return
+    try:
+        ev, _m, mno, _mid = _p0_om_event_parts(ce)
+        if not mno:
+            return
+        op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
+        oid = _p0_om_op_open_id(op)
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is not None:
+                if oid and oid in rec["present"]:
+                    return
+                if oid:
+                    rec["present"].add(oid)
+        _p0_om_card(_p0_om_lookup_chat(mno), "🟢 加入会议 / Joined", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+                    [f"**{_p0_om_display(op)}** 加入了会议 / joined the meeting"])
+    except Exception:
+        logger.exception("p0 openmeeting join handler failed")
+
+
+def _p0_om_on_leave(ce: Any) -> None:
+    if not _p0_om_enabled() or not _lark_env_truthy_or_default("P0_OPENMEETING_ANNOUNCE_LEAVES", default=True):
+        return
+    try:
+        ev, _m, mno, _mid = _p0_om_event_parts(ce)
+        if not mno:
+            return
+        op = ev.get("operator") if isinstance(ev.get("operator"), dict) else {}
+        oid = _p0_om_op_open_id(op)
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is not None and oid:
+                rec["present"].discard(oid)
+        reason = str(ev.get("leave_reason") or ev.get("leaveReason") or "").strip()
+        why = {"1": "", "2": "（会议结束/meeting ended）", "3": "（被移出/removed）"}.get(reason, "")
+        _p0_om_card(_p0_om_lookup_chat(mno), "🔴 离开会议 / Left", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+                    [f"**{_p0_om_display(op)}** 离开了会议 / left the meeting {why}"])
+    except Exception:
+        logger.exception("p0 openmeeting leave handler failed")
+
+
+def _p0_om_on_ended(ce: Any) -> None:
+    if not _p0_om_enabled():
+        return
+    try:
+        _ev, _m, mno, _mid = _p0_om_event_parts(ce)
+        if not mno:
+            return
+        _p0_om_card(_p0_om_lookup_chat(mno), "🏁 会议结束 / Meeting ended",
+                    _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+                    ["会议已结束。若开启了录制，录制生成后会发给主持人。",
+                     "Meeting ended. If it was recorded, the recording will be sent to the host once ready."])
+        logger.info("p0 openmeeting ended no=%s", mno)
+    except Exception:
+        logger.exception("p0 openmeeting ended handler failed")
+
+
+def _p0_om_on_recording_ready(ce: Any) -> None:
+    if not _p0_om_enabled():
+        return
+    try:
+        ev, _m, mno, mid = _p0_om_event_parts(ce)
+        url = _lark_dict_pick_str(ev, "url")
+        if not url and mid:
+            try:
+                j = _p0_lark_get_json(f"/open-apis/vc/v1/meetings/{mid}/recording")
+                if int(j.get("code", -1)) == 0:
+                    url = _lark_dict_pick_str((j.get("data") or {}).get("recording") or {}, "url")
+            except Exception:
+                logger.exception("p0 openmeeting get-recording fallback failed")
+        host = _p0_om_host_open_id()
+        if url and host:
+            try:
+                _lark_send_text_auto("open_id", host, f"🎬 会议录制已生成 / Meeting recording ready:\n{url}")
+            except Exception:
+                logger.exception("p0 openmeeting recording DM to host failed")
+        _p0_om_card(_p0_om_lookup_chat(mno), "🎬 录制完成 / Recording ready",
+                    _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
+                    ["录制已生成并发送给主持人。/ Recording is ready and sent to the host."
+                     if (url and host) else "录制已生成（未能获取链接）。/ Recording ready (link unavailable)."])
+        with _p0_om_lock:
+            _p0_om_active.pop(mno, None)
+    except Exception:
+        logger.exception("p0 openmeeting recording-ready handler failed")
+
+
+def _p0_om_end_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -> None:
+    rt, rv = ("chat_id", chat_id) if (chat_id or "").strip() else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+
+    def _reply(text: str) -> None:
+        try:
+            if rt:
+                _lark_send_text_auto(rt, rv, text)
+        except Exception:
+            logger.exception("p0 endmeeting reply failed")
+
+    try:
+        # Pick the active meeting for this chat (else the most recent tracked one).
+        target_id = ""
+        with _p0_om_lock:
+            for rec in _p0_om_active.values():
+                if rec.get("meeting_id") and rec.get("chat_id") == (chat_id or ""):
+                    target_id = rec["meeting_id"]
+            if not target_id:
+                for rec in _p0_om_active.values():
+                    if rec.get("meeting_id"):
+                        target_id = rec["meeting_id"]
+        if not target_id:
+            _reply("没有正在进行的、由我开启的会议（或会议尚未开始）。/ No active bot-opened meeting to end (or it hasn't started yet).")
+            return
+        at = _p0_vc_user_access_token()
+        if not at:
+            _reply(
+                "无法通过 API 结束会议：需要主持人的用户令牌。请主持人在 Lark 客户端里直接结束会议，"
+                "或先用 /vcauth 授权主持人账号后再试。\n"
+                "Can't end via API (needs the host's user token). The host can end it in the Lark client, "
+                "or authorize once with /vcauth (as the host) then retry."
+            )
+            return
+        try:
+            r = requests.patch(
+                f"{_lark_api_domain()}/open-apis/vc/v1/meetings/{target_id}/end",
+                headers={"Authorization": f"Bearer {at}", "Content-Type": "application/json; charset=utf-8"},
+                timeout=20,
+            )
+            j = r.json()
+        except Exception as e:
+            _reply(f"结束会议请求失败 / end request failed: {e.__class__.__name__}")
+            return
+        if isinstance(j, dict) and int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) == 0:
+            _reply("✅ 已结束会议 / meeting ended.")
+        else:
+            code = j.get("code") if isinstance(j, dict) else "?"
+            msg = j.get("msg") if isinstance(j, dict) else str(j)
+            extra = ""
+            if str(code) == "122003":
+                extra = "\n（结束会议的用户必须是会中的当前主持人 / the user must be the current host, present in the meeting.）"
+            _reply(f"⚠️ 结束失败 / end failed: code={code} msg={msg}{extra}")
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_om_dispatch(kind: str, chat_id: str, open_id: str, clean: str, mid: str, im_event_id: str, sender_debounce: str, msg_time: str) -> bool:
+    trigger = _p0_om_open_trigger() if kind == "open" else _p0_om_end_trigger()
+    if _p0_command_body((clean or "").strip(), trigger) is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_om_{kind}__"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    if not _p0_om_allowed(open_id):
+        def _deny() -> None:
+            try:
+                rt, rv = ("chat_id", chat_id) if (chat_id or "").strip() else ("open_id", open_id)
+                if rt and rv:
+                    _lark_send_text_auto(rt, rv, "仅授权用户可执行 / restricted to configured users (P0_OPENMEETING_ALLOWED_OPEN_IDS).")
+            except Exception:
+                logger.exception("p0 openmeeting deny reply failed")
+            finally:
+                with _monitoring_reply_dispatch_lock:
+                    _monitoring_inflight_keys.discard(debounce_key)
+        try:
+            threading.Thread(target=_deny, daemon=True, name="p0-om-deny").start()
+        except Exception:
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key)
+        return True
+    worker = _p0_om_open_worker if kind == "open" else _p0_om_end_worker
+    try:
+        threading.Thread(target=worker, args=(chat_id or "", open_id or "", mid or "", debounce_key), daemon=True, name=f"p0-om-{kind}").start()
+    except Exception:
+        logger.exception("p0 openmeeting %s worker thread failed to start", kind)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+def _p0_try_handle_openmeeting(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time) -> bool:
+    if not _p0_om_enabled():
+        return False
+    if _p0_command_body((clean or "").strip(), _p0_om_end_trigger()) is not None:
+        return _p0_om_dispatch("end", chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time)
+    if _p0_command_body((clean or "").strip(), _p0_om_open_trigger()) is not None:
+        return _p0_om_dispatch("open", chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time)
+    return False
+
+
 def _monitoring_watchdog_loop() -> None:
     """Periodic Grafana check; alert chat on >= threshold drop/spike."""
     global _monitoring_watch_last_alert_at, _monitoring_watch_pending_confirm
@@ -10795,6 +11267,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         open_id=open_id or "",
         sender=sender,
         send_wrap=send_wrap,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: bot-hosted meeting (/openmeeting, /endmeeting) — before other commands.
+    if _p0_try_handle_openmeeting(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,
@@ -11448,6 +11932,21 @@ def start_lark_ws_client_blocking() -> None:
             continue
         logger.info("Lark WS also registering custom event_type=%r (LARK_WS_EXTRA_IM_TYPES)", t)
         bld = bld.register_p2_customized_event(t, _on_ws_im_message_p2_customized)
+    if _p0_om_enabled():
+        for _et, _h in (
+            ("vc.meeting.meeting_started_v1", _p0_om_on_started),
+            ("vc.meeting.join_meeting_v1", _p0_om_on_join),
+            ("vc.meeting.leave_meeting_v1", _p0_om_on_leave),
+            ("vc.meeting.meeting_ended_v1", _p0_om_on_ended),
+            ("vc.meeting.recording_ready_v1", _p0_om_on_recording_ready),
+        ):
+            bld = bld.register_p2_customized_event(_et, _h)
+        logger.info(
+            "p0 openmeeting enabled — subscribing VC meeting events (started/join/leave/ended/recording_ready); "
+            "host=%s announce_chat=%s (needs scopes vc:reserve + vc:meeting:readonly + vc:record:readonly)",
+            (_p0_om_host_open_id()[:12] or "?"),
+            bool(_p0_om_announce_chat_default()),
+        )
     handler = bld.build()
     pmap = getattr(handler, "_processorMap", None) or {}
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))

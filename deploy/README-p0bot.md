@@ -55,6 +55,29 @@ journalctl -u p0bot -f          # watch: "Lark WebSocket client starting", "p0 d
 sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
 ```
 
+## Bot-hosted meeting ("/openmeeting") — live attendance + recording
+
+The one video path that works: the bot **reserves a meeting it owns**, so it gets live
+participant events. `@p0bot /openmeeting` (in the group) →
+- bot posts the **join link** (auto-record on, host pre-assigned to `P0_MEETING_HOST_OPEN_ID`);
+- as people join/leave it posts **🟢 X joined / 🔴 X left** to `P0_OPENMEETING_ANNOUNCE_CHAT_ID`;
+- when the meeting ends, it announces it, and once the recording is ready it **DMs the link to
+  the host** (who owns the recording).
+
+**Only works for meetings started from the bot's link** — the bot can't attach to a meeting
+someone else started (Lark emits participant events only for API-reserved meetings).
+
+Enable: `P0_OPENMEETING_ENABLE=1` + set `P0_MEETING_HOST_OPEN_ID` (a real Lark user) and
+`P0_OPENMEETING_ANNOUNCE_CHAT_ID`. Console: add scopes **`vc:reserve`, `vc:meeting:readonly`,
+`vc:meeting`, `vc:record:readonly`, `contact:contact.base:readonly`**, and **subscribe the events**
+`vc.meeting.meeting_started_v1`, `join_meeting_v1`, `leave_meeting_v1`, `meeting_ended_v1`,
+`recording_ready_v1`. **Cloud recording must be enabled** for the tenant, and a meeting only
+records if someone actually joins.
+
+**Ending:** the host ends it in the Lark client (always works → bot announces it). `/endmeeting`
+tries the API too, but Lark only lets a **user** end a meeting and only if they're the host *in
+the call* — so `/endmeeting` works only if the host authorized via `/vcauth` and is in the meeting.
+
 ## Group members ("/members") — the easy "who's in it"
 
 Lists who is in the **chat group** (not a video call). In any group the bot is a member of,
