@@ -9,31 +9,31 @@ because it binds nothing.
 
 ```bash
 # first time
-sudo git clone https://github.com/mrcodestealer/grafanagamebot.git /opt/p0bot
+sudo git clone https://github.com/mrcodestealer/grafanagamebot.git /root/p0bot
 # later, to update
-sudo git -C /opt/p0bot pull origin main
+sudo git -C /root/p0bot pull origin main
 ```
 
 ## 2. One-shot setup (venv + deps + systemd unit)
 
 ```bash
-sudo bash /opt/p0bot/deploy/setup-p0bot.sh
+sudo bash /root/p0bot/deploy/setup-p0bot.sh
 ```
 
-This creates `/opt/p0bot/venv`, installs `flask requests lark-oapi`, and installs
+This creates `/root/p0bot/venv`, installs `flask requests lark-oapi`, and installs
 `/etc/systemd/system/p0bot.service`. Re-running it also does `git pull` + `daemon-reload`
 (handy as your update command).
 
 Override paths/user if needed:
 ```bash
-sudo APP_DIR=/opt/p0bot RUN_USER=root bash /opt/p0bot/deploy/setup-p0bot.sh
+sudo APP_DIR=/root/p0bot RUN_USER=root bash /root/p0bot/deploy/setup-p0bot.sh
 ```
 
 ## 3. Create the env file (holds the secret — never committed)
 
 ```bash
-sudo nano /opt/p0bot/.env      # paste the p0bot env block, then save
-sudo chmod 600 /opt/p0bot/.env
+sudo nano /root/p0bot/.env      # paste the p0bot env block, then save
+sudo chmod 600 /root/p0bot/.env
 ```
 
 Minimum required keys: `APP_ID`, `APP_SECRET`, `LARK_HOST=https://open.larksuite.com`,
@@ -52,7 +52,7 @@ journalctl -u p0bot -f          # watch: "Lark WebSocket client starting", "p0 d
 ## 5. Update loop (what you asked for)
 
 ```bash
-sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
+sudo git -C /root/p0bot pull origin main && sudo systemctl restart p0bot
 ```
 
 ## Bot-hosted meeting ("/openmeeting") — live attendance + recording

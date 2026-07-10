@@ -3,7 +3,7 @@
 # p0bot server setup / updater. Run on the Linux server as root (or via sudo).
 #
 #   First time:  sudo bash deploy/setup-p0bot.sh
-#   Updates:     sudo bash /opt/p0bot/deploy/setup-p0bot.sh   (git pull + deps + reload)
+#   Updates:     sudo bash /root/p0bot/deploy/setup-p0bot.sh   (git pull + deps + reload)
 #
 # Overridable via env, e.g.:  sudo APP_DIR=/srv/p0bot RUN_USER=lark bash deploy/setup-p0bot.sh
 #   PYTHON_BIN=/opt/anaconda3/envs/p0bot/bin/python   # force interpreter (MUST be >= 3.8)
@@ -24,7 +24,7 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-APP_DIR="${APP_DIR:-/opt/p0bot}"
+APP_DIR="${APP_DIR:-/root/p0bot}"
 REPO_URL="${REPO_URL:-https://github.com/mrcodestealer/grafanagamebot.git}"
 RUN_USER="${RUN_USER:-root}"
 SERVICE_NAME="p0bot"
@@ -107,7 +107,7 @@ fi
 # 4) install/refresh the systemd unit, pointing ExecStart at the chosen interpreter
 UNIT_SRC="$APP_DIR/deploy/p0bot.service"
 UNIT_DST="/etc/systemd/system/${SERVICE_NAME}.service"
-sed -e "s#/opt/p0bot#${APP_DIR}#g" \
+sed -e "s#/root/p0bot#${APP_DIR}#g" \
     -e "s#^User=root#User=${RUN_USER}#" \
     -e "s#^ExecStart=.*#ExecStart=${PY} ${APP_DIR}/main.py#" \
     "$UNIT_SRC" > "$UNIT_DST"
