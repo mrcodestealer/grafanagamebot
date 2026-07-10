@@ -364,8 +364,9 @@ _CFG: Dict[str, Any] = {
     # the code is copied from the address bar, so the URL need not actually be served).
     "P0_VC_REDIRECT_URI": "http://localhost:5088/oauth/callback",
     "P0_VC_OAUTH_SCOPES": "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly",
-    # Restrict who may run /vcauth //vccode (space/comma open_ids). Empty = anyone (a non-admin's
-    # token simply won't clear 121005, so it's low-risk, but restricting is recommended).
+    # REQUIRED to use /vcauth //vccode: space/comma-separated admin open_ids allowed to authorize
+    # (the stored token is shared, so a stray authorize would clobber it). Empty = nobody
+    # (fail-closed); run /vcauth once and the bot replies with your open_id — set it here + restart.
     "P0_VC_ADMIN_OPEN_IDS": "",
 }
 
@@ -9655,6 +9656,28 @@ def _p0_try_handle_meeting(
 
 _p0_vc_tok_lock = threading.Lock()
 _p0_vc_refresh_lock = threading.Lock()  # serialize refresh (refresh_token is single-use / rotating)
+_p0_vc_state_lock = threading.Lock()
+_p0_vc_states: Dict[str, float] = {}  # issued OAuth state -> created (monotonic); for callback CSRF
+
+
+def _p0_vc_state_issue() -> str:
+    s = os.urandom(12).hex()
+    with _p0_vc_state_lock:
+        now = time.monotonic()
+        for k in [k for k, t in _p0_vc_states.items() if now - t > 600]:
+            _p0_vc_states.pop(k, None)
+        _p0_vc_states[s] = now
+    return s
+
+
+def _p0_vc_state_check(s: str) -> bool:
+    """Consume a previously-issued state (single-use, 10-min TTL). False if unknown/expired."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    with _p0_vc_state_lock:
+        t = _p0_vc_states.pop(s, None)
+    return t is not None and (time.monotonic() - t) <= 600
 
 
 def _p0_vc_token_path() -> str:
@@ -9690,13 +9713,20 @@ def _p0_vc_token_save(d: Dict[str, Any]) -> None:
         try:
             path = _p0_vc_token_path()
             tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(d, f)
+            # Create owner-only from the outset (post-hoc chmod is racy on POSIX and a no-op
+            # on Windows). Fall back to a plain open on platforms without O_CREAT mode support.
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(d, f)
+            except Exception:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f)
             os.replace(tmp, path)
             try:
                 os.chmod(path, 0o600)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("p0 vc token chmod skipped (%s)", e)
         except Exception:
             logger.exception("p0 vc token save failed")
 
@@ -9716,7 +9746,7 @@ def _p0_vc_oauth_authorize_url() -> str:
         "client_id": str(APP_ID or "").strip(),
         "redirect_uri": _p0_vc_redirect_uri(),
         "scope": _p0_vc_oauth_scopes(),
-        "state": os.urandom(9).hex(),
+        "state": _p0_vc_state_issue(),
     }
     return f"{_p0_vc_oauth_accounts_host()}/open-apis/authen/v1/authorize?{urlencode(params, quote_via=quote)}"
 
@@ -9728,7 +9758,11 @@ def _p0_vc_oauth_store_response(j: Dict[str, Any]) -> None:
     d["expires_at"] = now + float(j.get("expires_in") or 0)
     if j.get("refresh_token"):
         d["refresh_token"] = j.get("refresh_token")
-        d["refresh_expires_at"] = now + float(j.get("refresh_token_expires_in") or 0)
+        rexp = j.get("refresh_token_expires_in")
+        if rexp:
+            d["refresh_expires_at"] = now + float(rexp)
+        else:
+            d.pop("refresh_expires_at", None)  # unknown → don't mark the fresh token pre-expired
     d["scope"] = j.get("scope") or d.get("scope", "")
     d["obtained_at"] = now
     _p0_vc_token_save(d)
@@ -9746,6 +9780,8 @@ def _p0_vc_oauth_post(body: Dict[str, Any]) -> Tuple[bool, str]:
     except Exception as e:
         logger.exception("p0 vc oauth token request failed")
         return False, f"network error: {e.__class__.__name__}: {e}"
+    if not isinstance(j, dict):
+        return False, f"unexpected token response type: {type(j).__name__}"
     if int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1) != 0 or not j.get("access_token"):
         return False, f"code={j.get('code')} error={j.get('error')} desc={j.get('error_description') or j.get('msg')}"
     _p0_vc_oauth_store_response(j)
@@ -9810,7 +9846,9 @@ def _p0_vc_admin_allowed(open_id: str) -> bool:
         if p.strip()
     }
     if not allow:
-        return True  # open: a non-admin's token just won't clear 121005, so low-risk
+        # Fail closed: an unconfigured allowlist must not let anyone authorize, since a stored
+        # token is shared and a non-admin's token would clobber a working admin token (DoS).
+        return False
     return (open_id or "").strip() in allow
 
 
@@ -9886,7 +9924,11 @@ def _p0_try_handle_vcauth(
     )
     kind = "auth" if is_auth else "code"
     processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
-    debounce_key = f"{(chat_id or '').strip()}\n__p0_vcauth_{kind}__"
+    # Key /vccode on the code so two distinct codes don't collide; /vcauth on chat only.
+    if kind == "code":
+        debounce_key = f"{(chat_id or '').strip()}\n__p0_vcauth_code__\n{(code_body or '').strip()[:120]}"
+    else:
+        debounce_key = f"{(chat_id or '').strip()}\n__p0_vcauth_auth__"
     with _monitoring_reply_dispatch_lock:
         if im_event_id and im_event_id in _processed_lark_im_event_ids:
             return True
@@ -9907,12 +9949,26 @@ def _p0_try_handle_vcauth(
         def _deny() -> None:
             try:
                 if rt and rv:
-                    _lark_send_text_auto(rt, rv, "仅授权管理员可执行此命令 / this command is restricted to configured admins.")
+                    _lark_send_text_auto(
+                        rt,
+                        rv,
+                        "仅授权管理员可执行此命令 / restricted to configured admins.\n"
+                        f"你的 open_id / your open_id: {open_id or '(unknown)'}\n"
+                        "把它加入 .env 的 P0_VC_ADMIN_OPEN_IDS 后重启即可 / add it to "
+                        "P0_VC_ADMIN_OPEN_IDS in .env and restart.",
+                    )
+            except Exception:
+                logger.exception("p0 vcauth deny reply failed")
             finally:
                 with _monitoring_reply_dispatch_lock:
                     _monitoring_inflight_keys.discard(debounce_key)
 
-        threading.Thread(target=_deny, daemon=True, name="p0-vcauth-deny").start()
+        try:
+            threading.Thread(target=_deny, daemon=True, name="p0-vcauth-deny").start()
+        except Exception:
+            logger.exception("p0 vcauth deny thread failed to start")
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key)
         return True
 
     arg = "" if is_auth else (code_body or "")
@@ -11279,6 +11335,13 @@ def _p0_oauth_callback():
         return (
             f"No authorization code (error={err or 'none'}). "
             "If you see code=… in the address bar, send it to the bot: /vccode <code>",
+            400,
+        )
+    # CSRF: only complete an auto-exchange for a state this bot issued (single-use).
+    if not _p0_vc_state_check(request.args.get("state", "")):
+        return (
+            "Invalid or expired state. Start over with /vcauth in Lark, "
+            "or copy code=… from the address bar and send /vccode <code>.",
             400,
         )
     ok, msg = _p0_vc_oauth_exchange(code)
