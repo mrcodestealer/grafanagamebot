@@ -368,6 +368,12 @@ _CFG: Dict[str, Any] = {
     # (the stored token is shared, so a stray authorize would clobber it). Empty = nobody
     # (fail-closed); run /vcauth once and the bot replies with your open_id — set it here + restart.
     "P0_VC_ADMIN_OPEN_IDS": "",
+    # ---- Group members: "/members" in a group lists who's IN THE CHAT GROUP (not the video call) ----
+    # Works with the bot's own token + im:chat:readonly; the bot only needs to be a MEMBER of the group.
+    "P0_MEMBERS_ENABLE": "1",
+    "P0_MEMBERS_TRIGGER": "/members",
+    "P0_MEMBERS_CARD_TEMPLATE": "blue",
+    "P0_MEMBERS_MAX_ROWS": "500",
 }
 
 
@@ -9203,6 +9209,7 @@ def _p0_try_handle_doc_qa(
         or _im_command_matches(text_clean, MONITORING_MUTE_TRIGGER)
         or _im_command_matches(text_clean, MONITORING_CANCELMUTE_TRIGGER)
         or _p0_command_body(text_clean, _p0_meeting_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_members_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
     )
@@ -9639,6 +9646,181 @@ def _p0_try_handle_meeting(
         ).start()
     except Exception:
         logger.exception("p0 meeting worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# p0bot — group members ("/members")
+#
+# Lists who is in the CHAT GROUP (not the video call). Works with the bot's own
+# tenant token + im:chat:readonly; the bot only needs to be a MEMBER of the group
+# (it need not have created it). This is the "can a bot see who's in the group"
+# capability — distinct from VC meeting participants (admin-only report).
+# ---------------------------------------------------------------------------
+
+def _p0_members_enabled() -> bool:
+    return _lark_env_truthy("P0_MEMBERS_ENABLE")
+
+
+def _p0_members_trigger() -> str:
+    return _cfg_str("P0_MEMBERS_TRIGGER", "/members").strip() or "/members"
+
+
+def _p0_chat_members(chat_id: str) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    """(members, meta). members is None on API error; meta carries code/msg or member_total."""
+    members: List[Dict[str, Any]] = []
+    page = ""
+    total: Any = None
+    cap = max(20, _cfg_int("P0_MEMBERS_MAX_ROWS", 500))
+    base = f"{_lark_api_domain()}/open-apis/im/v1/chats/{chat_id}/members"
+    try:
+        tok = _lark_tenant_access_token_string()
+    except Exception as e:
+        return None, {"code": -1, "msg": f"token error: {e.__class__.__name__}"}
+    for _ in range(50):
+        params: Dict[str, Any] = {"member_id_type": "open_id", "page_size": 100}
+        if page:
+            params["page_token"] = page
+        try:
+            r = requests.get(
+                base,
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                params=params,
+                timeout=20,
+            )
+            j = r.json()
+        except Exception as e:
+            logger.exception("p0 members request failed chat=%s", chat_id[:12])
+            return None, {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+        if not isinstance(j, dict):
+            return None, {"code": f"HTTP {getattr(r, 'status_code', '?')}", "msg": "unexpected response"}
+        code = int(j.get("code", -1) if str(j.get("code", "")).lstrip("-").isdigit() else -1)
+        if code != 0:
+            return None, {"code": j.get("code", code), "msg": j.get("msg") or str(j)}
+        data = j.get("data") or {}
+        for it in data.get("items") or []:
+            if isinstance(it, dict):
+                members.append(it)
+        if data.get("member_total") is not None:
+            total = data.get("member_total")
+        if len(members) >= cap or not data.get("has_more"):
+            break
+        page = str(data.get("page_token") or "")
+        if not page:
+            break
+    return members[:cap], {"member_total": total}
+
+
+def _p0_members_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -> None:
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+    template = _cfg_str("P0_MEMBERS_CARD_TEMPLATE", "blue").strip() or "blue"
+
+    def _card(title: str, tmpl: str, lines: List[str]) -> None:
+        if not rt:
+            return
+        card = {
+            "schema": "2.0",
+            "config": {"update_multi": True, "wide_screen_mode": True},
+            "header": {"template": tmpl, "title": {"tag": "plain_text", "content": title[:190]}},
+            "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines) if lines else "-"}]},
+        }
+        try:
+            _lark_send_interactive_card(rt, rv, card)
+        except Exception:
+            logger.exception("p0 members card failed; text fallback")
+            try:
+                _lark_send_text_auto(rt, rv, f"{title}\n" + "\n".join(lines))
+            except Exception:
+                logger.exception("p0 members text fallback failed")
+
+    try:
+        if not (chat_id or "").strip():
+            if rt:
+                try:
+                    _lark_send_text_auto(rt, rv, "请在群里发送 /members / run /members inside a group chat.")
+                except Exception:
+                    logger.exception("p0 members dm-notice failed")
+            return
+        rows, meta = _p0_chat_members(chat_id)
+        if rows is None:
+            code = meta.get("code")
+            msg = meta.get("msg")
+            hint = ""
+            if str(code) == "232011" or "out of the chat" in str(msg).lower() or "not in" in str(msg).lower():
+                hint = "\n提示：请先把机器人拉进本群 / add the bot to this group first."
+            elif "permission" in str(msg).lower() or "access" in str(msg).lower() or "forbidden" in str(msg).lower():
+                hint = "\n提示：应用需开通 im:chat:readonly 权限 / grant the app the im:chat:readonly scope."
+            _card("⚠️ 查询失败 / Lookup failed", "red", [f"`code={code}  msg={msg}`{hint}"])
+            return
+        names: List[str] = []
+        for r in rows:
+            nm = _lark_dict_pick_str(r, "name")
+            if not nm:
+                oid = _lark_dict_pick_str(r, "member_id", "open_id", "openId")
+                nm = f"用户 / user …{oid[-6:]}" if oid else "?"
+            names.append(nm)
+        total = meta.get("member_total") or len(rows)
+        lines = [f"**共 {total} 人（不含机器人）/ {total} members (bots excluded)**", ""] + [f"• {n}" for n in names]
+        _card("👥 群成员 / Group members", template, lines)
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_members(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle "/members" — list the current group's chat members. Returns True when handled."""
+    if not _p0_members_enabled():
+        return False
+    if _p0_command_body((clean or "").strip(), _p0_members_trigger()) is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_members__"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    logger.info("p0 members lookup accepted chat=%s", bool(chat_id))
+    try:
+        threading.Thread(
+            target=_p0_members_worker,
+            args=(chat_id or "", open_id or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-members",
+        ).start()
+    except Exception:
+        logger.exception("p0 members worker thread failed to start")
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
     return True
@@ -10613,6 +10795,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         open_id=open_id or "",
         sender=sender,
         send_wrap=send_wrap,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/members" → who is in this CHAT GROUP (bot's own token; needs to be in the group).
+    if _p0_try_handle_members(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,

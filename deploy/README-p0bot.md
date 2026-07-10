@@ -55,6 +55,18 @@ journalctl -u p0bot -f          # watch: "Lark WebSocket client starting", "p0 d
 sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
 ```
 
+## Group members ("/members") — the easy "who's in it"
+
+Lists who is in the **chat group** (not a video call). In any group the bot is a member of,
+send **`/members`** → it posts a card of everyone in the group (names + count, bots excluded).
+
+Needs only scope **`im:chat:readonly`** (add + publish in the Developer Console) and the bot
+to be **added to the group** — no admin role, no OAuth, uses the bot's own token. On by default
+(`P0_MEMBERS_ENABLE=1`). Error `232011` in the card means the bot isn't in that group yet.
+
+This is distinct from meeting attendance below: `/members` = chat-group membership (works);
+`/meeting` = video-call participants (admin-only, usually blocked).
+
 ## Meeting attendance (optional, Mode C)
 
 A bot **cannot join a call** and **cannot read a meeting it doesn't own** — so there's no
