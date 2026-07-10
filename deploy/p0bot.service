@@ -1,0 +1,26 @@
+[Unit]
+Description=p0bot - Lark wiki doc Q&A bot (long connection / WebSocket)
+Documentation=https://github.com/mrcodestealer/grafanagamebot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change to a non-root service user if you prefer. Whatever user runs this must
+# be able to reach Ollama at P0_QA_OLLAMA_URL (default http://localhost:11434).
+User=root
+WorkingDirectory=/opt/p0bot
+# Required: the env file holds p0bot's APP_ID/APP_SECRET + P0_* config.
+# (No leading '-', so a missing/renamed .env fails loudly instead of running as the wrong bot.)
+EnvironmentFile=/opt/p0bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/p0bot/venv/bin/python /opt/p0bot/main.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
