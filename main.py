@@ -345,6 +345,18 @@ _CFG: Dict[str, Any] = {
     "P0_CARD_TEMPLATE": "blue",
     # Per-card body budget; a longer answer is split across multiple cards (part n/N)
     "P0_CARD_MAX_CHARS": "8000",
+    # ---- p0bot meeting attendance (Mode C: on-demand attendance report by meeting no.) ----
+    # A bot can only see meetings it OWNS, so live "who joined" for arbitrary meetings is not
+    # possible. Instead, "/meeting <link-or-number>" pulls the attendance report for that
+    # 9-digit meeting number via GET /vc/v1/participant_list (works for ongoing + ended
+    # meetings) and posts a card. Requires the app to hold the VC meeting-management report
+    # permission (admin-granted); some tenants require a user_access_token for this endpoint.
+    "P0_MEETING_ENABLE": "0",
+    "P0_MEETING_TRIGGER": "/meeting",
+    # Look-back window for the report; capped to 24h (Lark caps end-start to 1 day).
+    "P0_MEETING_LOOKBACK_HOURS": "6",
+    "P0_MEETING_MAX_ROWS": "200",
+    "P0_MEETING_CARD_TEMPLATE": "turquoise",
 }
 
 
@@ -9173,12 +9185,13 @@ def _p0_try_handle_doc_qa(
     reload_trigger = _cfg_str("P0_RELOAD_TRIGGER", "/reload").strip() or "/reload"
     text_clean = (clean or "").strip()
 
-    # Never swallow the monitoring commands (/mo, /m, /c) — let them fall through so the
-    # monitoring handlers still work when both features share a process.
+    # Never swallow other commands as doc questions: monitoring (/mo, /m, /c) must fall
+    # through to their handlers, and /meeting is handled by _p0_try_handle_meeting.
     is_monitoring_cmd = (
         _im_command_matches(text_clean, MONITORING_TRIGGER)
         or _im_command_matches(text_clean, MONITORING_MUTE_TRIGGER)
         or _im_command_matches(text_clean, MONITORING_CANCELMUTE_TRIGGER)
+        or _p0_command_body(text_clean, _p0_meeting_trigger()) is not None
     )
 
     kind = ""
@@ -9302,6 +9315,260 @@ def _p0_start_doc_preload_if_enabled() -> None:
                 _p0_doc_reload()
 
     threading.Thread(target=_boot, daemon=True, name="p0-doc-preload").start()
+
+
+# ---------------------------------------------------------------------------
+# p0bot — meeting attendance (Mode C)
+#
+# A Lark app can only read meetings it OWNS, so there is no way to watch "who is
+# inside" an arbitrary meeting live. Mode C is on-demand: "/meeting <link-or-no>"
+# pulls the attendance report for that 9-digit meeting number via
+# GET /open-apis/vc/v1/participant_list (supports ongoing + ended meetings, and
+# returns participant_name directly) and posts a card. Needs the app to hold the
+# VC meeting-management report permission (enterprise-admin granted); some tenants
+# require a user_access_token for this endpoint.
+# ---------------------------------------------------------------------------
+
+_P0_MEETING_STATUS_LABEL = {
+    "1": "进行中 / ongoing",
+    "2": "已结束 / ended",
+    "3": "已预约 / scheduled",
+}
+
+
+def _p0_meeting_enabled() -> bool:
+    return _lark_env_truthy("P0_MEETING_ENABLE")
+
+
+def _p0_meeting_trigger() -> str:
+    return _cfg_str("P0_MEETING_TRIGGER", "/meeting").strip() or "/meeting"
+
+
+def _p0_parse_meeting_no(text: str) -> str:
+    """Extract a 9-digit Lark meeting number from raw text or a meeting link."""
+    compact = re.sub(r"[\s\-]", "", text or "")
+    m = re.search(r"\d{9}", compact)
+    return m.group(0) if m else ""
+
+
+def _p0_meeting_participant_rows(
+    meeting_no: str, start: int, end: int, status: Optional[str]
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    """(rows, error). rows is None on API error; error carries the Lark code/msg for the user."""
+    rows: List[Dict[str, Any]] = []
+    page = ""
+    cap = max(20, _cfg_int("P0_MEETING_MAX_ROWS", 200))
+    for _ in range(40):
+        params: Dict[str, Any] = {
+            "meeting_no": meeting_no,
+            "meeting_start_time": str(int(start)),
+            "meeting_end_time": str(int(end)),
+            "page_size": 100,
+            "user_id_type": "open_id",
+        }
+        if status:
+            params["meeting_status"] = status
+        if page:
+            params["page_token"] = page
+        try:
+            j = _p0_lark_get_json("/open-apis/vc/v1/participant_list", params)
+        except Exception:
+            logger.exception("p0 meeting participant_list request failed no=%s", meeting_no)
+            return None, {"code": -1, "msg": "request failed (see server logs)"}
+        if int(j.get("code", -1)) != 0:
+            return None, j
+        data = j.get("data") or {}
+        items = data.get("participants")
+        if not isinstance(items, list):
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+        rows.extend(items)
+        if len(rows) >= cap or not data.get("has_more"):
+            break
+        page = str(data.get("page_token") or "")
+        if not page:
+            break
+    return rows[:cap], None
+
+
+def _p0_meeting_row_line(row: Dict[str, Any]) -> str:
+    name = (
+        _lark_dict_pick_str(row, "participant_name", "participantName")
+        or _lark_dict_pick_str(row, "name")
+        or "?"
+    )
+    dept = _lark_dict_pick_str(row, "department")
+    join = _lark_dict_pick_str(row, "join_time", "joinTime")
+    leave = _lark_dict_pick_str(row, "leave_time", "leaveTime")
+    who = f"**{name}**"
+    if dept:
+        who += f" · {dept}"
+    if join and not leave:
+        who += " — 🟢 在会中 / in meeting"
+    elif join and leave:
+        who += f" — {join} → {leave}"
+    elif join:
+        who += f" — {join}"
+    return f"• {who}"
+
+
+def _p0_meeting_send_card(rt: str, rv: str, meeting_no: str, template: str, title: str, lines: List[str]) -> None:
+    if not rt or not rv:
+        return
+    card = {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title[:190]},
+            "subtitle": {"tag": "plain_text", "content": (f"会议号 / No. {meeting_no}" if meeting_no else "")[:190]},
+        },
+        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines) if lines else "-"}]},
+    }
+    try:
+        _lark_send_interactive_card(rt, rv, card)
+    except Exception:
+        logger.exception("p0 meeting card send failed; falling back to text")
+        try:
+            _lark_send_text_auto(rt, rv, f"{title}\n" + "\n".join(lines))
+        except Exception:
+            logger.exception("p0 meeting text fallback failed")
+
+
+def _p0_meeting_worker(chat_id: str, open_id: str, meeting_no: str, mid: str, debounce_key: str) -> None:
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    template = _cfg_str("P0_MEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise"
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = (
+        _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK")
+        if react
+        else None
+    )
+    try:
+        now = int(time.time())
+        lookback_h = max(1, min(24, _cfg_int("P0_MEETING_LOOKBACK_HOURS", 6)))
+        start = now - lookback_h * 3600
+        # Ongoing first (who is inside NOW), then ended (who attended) if none ongoing.
+        rows, err = _p0_meeting_participant_rows(meeting_no, start, now, "1")
+        status_used = "1"
+        if rows is not None and not rows:
+            rows2, err2 = _p0_meeting_participant_rows(meeting_no, start, now, "2")
+            if rows2:
+                rows, err, status_used = rows2, None, "2"
+        if rows is None:
+            code = err.get("code") if isinstance(err, dict) else "?"
+            msg = err.get("msg") if isinstance(err, dict) else str(err)
+            hint = ""
+            if "permission" in str(msg).lower() or "access" in str(msg).lower() or "denied" in str(msg).lower():
+                hint = (
+                    "\n\n提示 / Hint: 本应用需要「视频会议-会议管理」报表权限（企业管理员在后台授予）；"
+                    "部分租户此接口仅支持 user_access_token。 The app needs the VC "
+                    "'Meeting Management' report permission (granted by an enterprise admin); "
+                    "some tenants require a user_access_token for this endpoint."
+                )
+            _p0_meeting_send_card(
+                rt, rv, meeting_no, "red", "⚠️ 查询失败 / Lookup failed",
+                [f"无法读取会议 {meeting_no} 的参会信息 / Could not read participants.", f"`code={code}  msg={msg}`{hint}"],
+            )
+            return
+        if not rows:
+            _p0_meeting_send_card(
+                rt, rv, meeting_no, template, "🔍 无记录 / No participants",
+                [
+                    f"最近 {lookback_h}h 内未找到会议 {meeting_no} 的参会记录。",
+                    f"No attendance for meeting {meeting_no} in the last {lookback_h}h.",
+                    "（会议号是否正确？会议是否在时间窗内？/ correct number & within the window?）",
+                ],
+            )
+            return
+        lines = [_p0_meeting_row_line(r) for r in rows]
+        head = f"**{_P0_MEETING_STATUS_LABEL.get(status_used, '')}** · 参会者 / Participants: **{len(rows)}**"
+        _p0_meeting_send_card(
+            rt, rv, meeting_no, template, "🎥 会议参会情况 / Meeting attendance", [head, ""] + lines
+        )
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_meeting(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle "/meeting <link-or-number>". Returns True when handled."""
+    if not _p0_meeting_enabled():
+        return False
+    body = _p0_command_body((clean or "").strip(), _p0_meeting_trigger())
+    if body is None:
+        return False
+    meeting_no = _p0_parse_meeting_no(body)
+
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_meeting__\n{meeting_no or 'help'}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    if not meeting_no:
+        def _usage() -> None:
+            try:
+                rt, rv = (
+                    ("chat_id", chat_id)
+                    if (chat_id or "").strip()
+                    else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+                )
+                if rt and rv:
+                    _lark_send_text_auto(
+                        rt,
+                        rv,
+                        f"用法 / Usage: {_p0_meeting_trigger()} <会议号或会议链接 / meeting number or link>\n"
+                        "例 / e.g. /meeting 123456789",
+                    )
+            finally:
+                with _monitoring_reply_dispatch_lock:
+                    _monitoring_inflight_keys.discard(debounce_key)
+
+        threading.Thread(target=_usage, daemon=True, name="p0-meeting-usage").start()
+        return True
+
+    logger.info("p0 meeting lookup accepted no=%s chat=%s", meeting_no, bool(chat_id))
+    try:
+        threading.Thread(
+            target=_p0_meeting_worker,
+            args=(chat_id or "", open_id or "", meeting_no, mid or "", debounce_key),
+            daemon=True,
+            name="p0-meeting",
+        ).start()
+    except Exception:
+        logger.exception("p0 meeting worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
 
 
 def _monitoring_watchdog_loop() -> None:
@@ -9931,6 +10198,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         open_id=open_id or "",
         sender=sender,
         send_wrap=send_wrap,
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/meeting <link-or-number>" → attendance report (before doc Q&A).
+    if _p0_try_handle_meeting(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
         mid=mid,
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,

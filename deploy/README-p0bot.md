@@ -55,6 +55,24 @@ journalctl -u p0bot -f          # watch: "Lark WebSocket client starting", "p0 d
 sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
 ```
 
+## Meeting attendance (optional, Mode C)
+
+A bot **cannot join a call** and **cannot read a meeting it doesn't own** — so there's no
+"who's in this link" for arbitrary meetings. Mode C is an **on-demand attendance report**:
+in chat, `/meeting <meeting-number-or-link>` → the bot pulls the participant report for that
+9-digit meeting number and posts a card. It works for **ongoing** meetings (who's in now,
+🟢) and **ended** meetings (who attended, with join→leave times); participant names are
+included by the API.
+
+Enable in `.env`: `P0_MEETING_ENABLE=1` (optional `P0_MEETING_TRIGGER`, `P0_MEETING_LOOKBACK_HOURS`).
+Use it: DM the bot `/meeting 123456789`, or in a group `@p0bot /meeting <link>`.
+
+**Permission (the catch):** the report API `GET /open-apis/vc/v1/participant_list` needs the
+app to hold the enterprise **VC "Meeting Management" report permission** (granted by an admin
+in the Lark admin console). On some tenants this endpoint only accepts a `user_access_token`
+(admin OAuth) rather than the bot's tenant token — if so, the bot replies with the exact
+permission error so you know to arrange it. Look-back window is capped at 24h (Lark limit).
+
 ## Prerequisites / gotchas
 
 - **Ollama** running on the server with the model pulled: `ollama pull qwen3.6:35b-a3b`.
@@ -62,12 +80,12 @@ sudo git -C /opt/p0bot pull origin main && sudo systemctl restart p0bot
 - **Lark console → Events & Callbacks →** subscription mode **"Use long connection"**,
   subscribe to event **`im.message.receive_v1`**. Do NOT also set a Request URL.
 - **Scopes** (add + publish a version): `im:message`, `wiki:wiki:readonly`,
-  `docx:document:readonly`, and (for the 👌/✅ reactions) `im:message.reaction`.
-  Then **share the wiki space/doc with the app**, or it can't read it.
+  `docx:document:readonly`. Then **share the wiki space/doc with the app**, or it can't read it.
 - **Reactions**: p0bot reacts 👌 (`P0_REACT_ACK_EMOJI=OK`) while Qwen is thinking and ✅
-  (`P0_REACT_DONE_EMOJI=DONE`) when the answer is sent. Reactions are best-effort — if the
-  reaction scope is missing they just don't appear; the answer still sends. Disable with
-  `P0_REACT_ENABLE=0`.
+  (`P0_REACT_DONE_EMOJI=DONE`) when the answer is sent — in DMs and on group @-mentions.
+  Reactions use the `im:message` scope (already granted for sending), so no extra scope is
+  needed. `OK`/`DONE` are valid Lark emoji keys. Best-effort — a failure just skips the
+  reaction, the answer still sends. Disable with `P0_REACT_ENABLE=0`.
 - `python3 -m venv` needs `python3-venv` (`sudo apt install python3-venv`) on Debian/Ubuntu.
 - Startup logs `p0 bot open_id=ou_…` — optionally set that as `P0_BOT_OPEN_ID` in `.env`
   for the most reliable group @-mention detection (DMs and `/ask` work without it).
