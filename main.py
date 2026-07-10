@@ -157,8 +157,8 @@ _CFG: Dict[str, Any] = {
     "MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW": "0",
     # 1=日志打印 primary @ / mentions / explicit_ids 解析（排查 @ 错 Platform）
     "MONITORING_LOG_PRIMARY_AT": "1",
-    # 1=/mo 被 @ 门控拒绝时给用户发一句英文说明（避免静默忽略）
-    "MONITORING_AT_GATE_USER_FEEDBACK": "1",
+    # 已移除：/mo 被 @ 门控拒绝时不再给用户发「/mo skipped: ...」说明（代码里已硬关，此项无效）
+    "MONITORING_AT_GATE_USER_FEEDBACK": "0",
     # 1=sole mention 的 open_id 落在 peer，但正文仅有 @_user_N、无 <at user_id>，且 mention.name 命中 SUBSTRINGS 时把 primary 纠正为本 bot（默认关；子串要独特）
     "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_FALLBACK": "0",
     "MONITORING_PLACEHOLDER_PEER_PRIMARY_NAME_SUBSTRINGS": "",
@@ -910,7 +910,9 @@ MONITORING_AT_MENTION_ENABLE = _lark_env_truthy("MONITORING_AT_MENTION_ENABLE")
 MONITORING_AT_MENTION_ANY_TEXT = _lark_env_truthy("MONITORING_AT_MENTION_ANY_TEXT")
 MONITORING_TRIGGER_REQUIRES_AT_BOT = _lark_env_truthy("MONITORING_TRIGGER_REQUIRES_AT_BOT")
 MONITORING_LOG_PRIMARY_AT = _lark_env_truthy("MONITORING_LOG_PRIMARY_AT")
-MONITORING_AT_GATE_USER_FEEDBACK = _lark_env_truthy("MONITORING_AT_GATE_USER_FEEDBACK")
+# Feature removed: never send the "/mo skipped: ..." @-gate feedback reply.
+# Hard-disabled in code so it stays off even if systemd sets the env var.
+MONITORING_AT_GATE_USER_FEEDBACK = False
 _monitoring_at_gate_tls = threading.local()
 MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER = _lark_env_truthy_or_default(
     "MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER",
