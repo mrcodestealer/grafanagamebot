@@ -9235,6 +9235,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, _p0_om_end_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
+        or _p0_command_body(text_clean, "/whoami") is not None
     )
 
     kind = ""
@@ -10667,6 +10668,63 @@ def _p0_om_dispatch(kind: str, chat_id: str, open_id: str, clean: str, mid: str,
     return True
 
 
+def _p0_any_feature_enabled() -> bool:
+    return _p0_qa_enabled() or _p0_meeting_enabled() or _p0_members_enabled() or _p0_om_enabled()
+
+
+def _p0_try_handle_whoami(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time, im_chat_type) -> bool:
+    """`/whoami` → reply the sender's p0bot-namespace open_id + chat_id (open_id is per-app)."""
+    if not _p0_any_feature_enabled():
+        return False
+    if _p0_command_body((clean or "").strip(), "/whoami") is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_whoami__\n{(open_id or '')[:20]}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    def _w() -> None:
+        try:
+            rt, rv = ("chat_id", chat_id) if (chat_id or "").strip() else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+            if rt and rv:
+                _lark_send_text_auto(
+                    rt,
+                    rv,
+                    "🪪 p0bot 看到的你 / as p0bot sees you:\n"
+                    f"open_id: {open_id or '(unknown)'}\n"
+                    f"chat_id: {chat_id or '(none)'}\n"
+                    f"chat_type: {im_chat_type or '(?)'}\n"
+                    "open_id 因应用而异——配置 P0_MEETING_HOST_OPEN_ID 请用上面这个值。/ "
+                    "open_id is per-app — use THIS value for P0_MEETING_HOST_OPEN_ID.",
+                )
+        except Exception:
+            logger.exception("p0 whoami reply failed")
+        finally:
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(debounce_key)
+
+    try:
+        threading.Thread(target=_w, daemon=True, name="p0-whoami").start()
+    except Exception:
+        logger.exception("p0 whoami thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
 def _p0_try_handle_openmeeting(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time) -> bool:
     if not _p0_om_enabled():
         return False
@@ -11308,6 +11366,19 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         im_event_id=im_event_id,
         sender_debounce=sender_debounce,
         msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/whoami" → tell the sender their p0bot-namespace open_id (+ chat_id).
+    if _p0_try_handle_whoami(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+        im_chat_type=im_chat_type,
     ):
         return
 
