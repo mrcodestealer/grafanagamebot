@@ -1,0 +1,4 @@
+# Keep shell scripts and unit files LF so they run on Linux servers even when
+# edited/committed from Windows. Scoped intentionally (does not renormalize main.py).
+*.sh text eol=lf
+*.service text eol=lf
