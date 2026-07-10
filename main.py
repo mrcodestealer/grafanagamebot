@@ -9358,6 +9358,7 @@ def _p0_meeting_participant_rows(
     rows: List[Dict[str, Any]] = []
     page = ""
     cap = max(20, _cfg_int("P0_MEETING_MAX_ROWS", 200))
+    base = f"{_lark_api_domain()}/open-apis/vc/v1/participant_list"
     for _ in range(40):
         params: Dict[str, Any] = {
             "meeting_no": meeting_no,
@@ -9370,13 +9371,38 @@ def _p0_meeting_participant_rows(
             params["meeting_status"] = status
         if page:
             params["page_token"] = page
+        # Deliberately do NOT raise_for_status — read the JSON body on any status so the
+        # user sees Lark's real code/msg (e.g. a permission error) instead of a generic one.
         try:
-            j = _p0_lark_get_json("/open-apis/vc/v1/participant_list", params)
+            tok = _lark_tenant_access_token_string()
+            r = requests.get(
+                base,
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                params=params,
+                timeout=20,
+            )
+        except Exception as e:
+            logger.exception("p0 meeting participant_list transport error no=%s", meeting_no)
+            return None, {"code": -1, "msg": f"network error: {e.__class__.__name__}: {e}"}
+        try:
+            j = r.json()
         except Exception:
-            logger.exception("p0 meeting participant_list request failed no=%s", meeting_no)
-            return None, {"code": -1, "msg": "request failed (see server logs)"}
-        if int(j.get("code", -1)) != 0:
-            return None, j
+            snippet = (r.text or "").strip().replace("\n", " ")[:200]
+            logger.warning("p0 meeting participant_list HTTP %s non-JSON: %s", r.status_code, snippet)
+            return None, {"code": f"HTTP {r.status_code}", "msg": snippet or "(empty body)"}
+        try:
+            code = int(j.get("code", -1))
+        except (TypeError, ValueError):
+            code = -1
+        if code != 0:
+            msg = j.get("msg") or j.get("message") or str(j)
+            logger.warning(
+                "p0 meeting participant_list code=%s http=%s msg=%s", j.get("code"), r.status_code, msg
+            )
+            return None, {"code": j.get("code", code), "msg": msg}
         data = j.get("data") or {}
         items = data.get("participants")
         if not isinstance(items, list):
@@ -9451,13 +9477,18 @@ def _p0_meeting_worker(chat_id: str, open_id: str, meeting_no: str, mid: str, de
         now = int(time.time())
         lookback_h = max(1, min(24, _cfg_int("P0_MEETING_LOOKBACK_HOURS", 6)))
         start = now - lookback_h * 3600
-        # Ongoing first (who is inside NOW), then ended (who attended) if none ongoing.
-        rows, err = _p0_meeting_participant_rows(meeting_no, start, now, "1")
-        status_used = "1"
-        if rows is not None and not rows:
-            rows2, err2 = _p0_meeting_participant_rows(meeting_no, start, now, "2")
-            if rows2:
-                rows, err, status_used = rows2, None, "2"
+        # Ongoing first (who is inside NOW); fall back to ended (who attended).
+        r1, e1 = _p0_meeting_participant_rows(meeting_no, start, now, "1")
+        if r1:
+            rows, status_used, err = r1, "1", None
+        else:
+            r2, e2 = _p0_meeting_participant_rows(meeting_no, start, now, "2")
+            if r2:
+                rows, status_used, err = r2, "2", None
+            elif r1 is None and r2 is None:
+                rows, status_used, err = None, "", (e2 or e1)  # both attempts errored
+            else:
+                rows, status_used, err = [], "2", None  # succeeded but empty
         if rows is None:
             code = err.get("code") if isinstance(err, dict) else "?"
             msg = err.get("msg") if isinstance(err, dict) else str(err)
