@@ -119,6 +119,17 @@ OAuth**. One-time setup:
 
 If `/meeting` shows a `NO_AUTH` card, run `/vcauth` first. Look-back window is capped at 24h.
 
+## Contact directory (`contacts.csv`) — phone numbers p0bot can answer from
+
+`contacts.csv` in the repo root (`name,team,phone`) is folded into **every** answer's context,
+**on top of** the wiki (it doesn't eat the wiki budget). So p0bot can answer "who do I contact
+for FPMS?" or "what's Jun Chen's number?" even if those people aren't in the wiki.
+
+- Edit the file and `git pull` on the server — it **auto-reloads when the file changes**, no
+  `/reload` needed and no restart.
+- Toggle with `P0_CONTACTS_ENABLE=0`; point elsewhere with `P0_CONTACTS_FILE=/path/to.csv`.
+- ~200 rows ≈ 1.5k tokens, so it fits comfortably inside `P0_QA_NUM_CTX` alongside the wiki.
+
 ## Prerequisites / gotchas
 
 - **Ollama** running on the server with the model pulled: `ollama pull qwen3.6:35b-a3b`.

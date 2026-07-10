@@ -12,6 +12,7 @@ grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_
 
 import base64
 import copy
+import csv
 import hashlib
 import json
 import logging
@@ -264,7 +265,7 @@ _CFG: Dict[str, Any] = {
     "MONITORING_WATCH_QUIET2_END_HOUR": "0",
     "MONITORING_WATCH_QUIET2_END_MINUTE": "15",
     # Tag person / alert group — set via environment.
-    "TARGET_USER_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    "TARGET_USER_OPEN_ID": "",
     # 告警 / 超阈值 /mo 文末仅 @ 此人时追加的说明（空=只 @ 不追加句子）
     "MONITORING_ALERT_AT_USER_NOTE": "It might be event started or false alert kindly check",
     # Person tagging in alerts is DISABLED by default. Set =1 to restore @TARGET_USER_OPEN_ID.
@@ -328,6 +329,12 @@ _CFG: Dict[str, Any] = {
     "P0_DOC_MAX_CHARS": "24000",
     # Re-fetch the doc every N seconds in the background; 0=only on startup + /reload
     "P0_DOC_REFRESH_SECONDS": "0",
+    # ---- Local contact directory (always folded into the Q&A context, on top of the wiki) ----
+    # A CSV of name,team,phone so p0bot can answer "who to contact for <team>" / "<name>'s number"
+    # regardless of the wiki. Reloaded automatically when the file changes; no /reload needed.
+    "P0_CONTACTS_ENABLE": "1",
+    # Path to the CSV; empty = contacts.csv next to main.py (ships in the repo, deploys via git pull).
+    "P0_CONTACTS_FILE": "",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -384,9 +391,9 @@ _CFG: Dict[str, Any] = {
     "P0_OPENMEETING_TRIGGER": "/openmeeting",
     "P0_ENDMEETING_TRIGGER": "/endmeeting",
     # Meeting owner + assigned host + recording recipient — a real Lark user open_id (REQUIRED).
-    "P0_MEETING_HOST_OPEN_ID": "ou_d7bc33724e2d6ced4050c944c2ca5650",
+    "P0_MEETING_HOST_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
     # Where joins/leaves/end are announced; empty = the chat where /openmeeting was run.
-    "P0_OPENMEETING_ANNOUNCE_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
+    "P0_OPENMEETING_ANNOUNCE_CHAT_ID": "oc_ad9b5bdbb2826ba2ee9730920ef25432",
     "P0_OPENMEETING_AUTO_RECORD": "1",
     "P0_OPENMEETING_TOPIC": "p0bot meeting",
     "P0_OPENMEETING_DURATION_HOURS": "4",
@@ -8683,9 +8690,70 @@ _p0_doc_text: str = ""
 _p0_doc_fetched_at: float = 0.0
 _p0_doc_meta: str = ""
 
+_p0_contacts_lock = threading.Lock()
+_p0_contacts_cache: str = ""
+_p0_contacts_mtime: float = -1.0
+
 
 def _p0_qa_enabled() -> bool:
     return _lark_env_truthy("P0_DOC_QA_ENABLE")
+
+
+def _p0_contacts_file() -> str:
+    """Path to the local contacts CSV (name,team,phone). Defaults to contacts.csv beside main.py."""
+    p = _cfg_str("P0_CONTACTS_FILE", "").strip()
+    if p:
+        return p
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = "."
+    return os.path.join(base, "contacts.csv")
+
+
+def _p0_contacts_text() -> str:
+    """Formatted contact directory from contacts.csv, reloaded when the file changes.
+
+    Returns "" when disabled (P0_CONTACTS_ENABLE=0) or the file is absent/empty. This block is
+    always folded into the Q&A context so p0bot can answer "who do I contact for <team>" or
+    "<person>'s number" from local data even when the wiki doesn't list them.
+    """
+    global _p0_contacts_cache, _p0_contacts_mtime
+    if not _lark_env_truthy_or_default("P0_CONTACTS_ENABLE", default=True):
+        return ""
+    path = _p0_contacts_file()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""
+    with _p0_contacts_lock:
+        if _p0_contacts_cache and mtime == _p0_contacts_mtime:
+            return _p0_contacts_cache
+    lines: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("name") or "").strip()
+                team = (row.get("team") or "").strip()
+                phone = (row.get("phone") or "").strip()
+                if not name and not phone:
+                    continue
+                lines.append(f"- {name} | {team or '-'} | {phone or '-'}")
+    except Exception:
+        logger.exception("p0 contacts load failed: %s", path)
+        return ""
+    if not lines:
+        return ""
+    block = (
+        "CONTACT DIRECTORY — team members and phone numbers (format: name | team | phone). "
+        "Use this to answer who to contact for a team, or a person's phone number.\n"
+        + "\n".join(lines)
+    )
+    with _p0_contacts_lock:
+        _p0_contacts_cache = block
+        _p0_contacts_mtime = mtime
+    logger.info("p0 contacts loaded: %d entries from %s", len(lines), path)
+    return block
 
 
 def _p0_wiki_node_token() -> str:
@@ -8969,6 +9037,14 @@ def _p0_ai_answer(question: str, doc_text: str) -> str:
     temp = _cfg_float("P0_QA_TEMPERATURE", 0.2)
     max_chars = max(1000, _cfg_int("P0_DOC_MAX_CHARS", 24000))
     context = _p0_select_doc_context(doc_text, question, max_chars)
+    # Always fold in the local contact directory (on top of the wiki budget) so contact
+    # questions are answerable regardless of what the wiki contains or how it's truncated.
+    contacts = _p0_contacts_text()
+    if contacts:
+        context = (
+            f"----- CONTACTS -----\n{contacts}\n----- END CONTACTS -----\n\n"
+            + (context or "(no wiki content)")
+        )
     system = _cfg_str("P0_QA_SYSTEM_PROMPT", "").strip() or (
         "You are p0bot, a helpful assistant that answers questions using ONLY the "
         "documentation provided below. Rules:\n"
@@ -9180,7 +9256,7 @@ def _p0_qa_worker(
         _ack()
         did_ack = True
         doc = _p0_doc_get_cached()
-        if not doc:
+        if not doc and not _p0_contacts_text():
             _send(
                 "⚠️ 我还没能读取到文档。请确认机器人已获授权访问该 wiki"
                 "（需要 wiki 与 docx 读取权限，且文档/知识库已共享给本应用），然后发送 /reload 重试。\n"
@@ -10207,8 +10283,35 @@ _p0_om_lock = threading.Lock()
 _p0_om_active: Dict[str, Dict[str, Any]] = {}  # meeting_no -> {reserve_id, meeting_id, chat_id, topic, present:set}
 _p0_name_cache: Dict[str, str] = {}
 _p0_name_cache_lock = threading.Lock()
+_p0_contact_warned: set = set()  # dedup keys so a scope/permission problem is logged once, not per-join
+_p0_contact_warned_lock = threading.Lock()
+_p0_chat_name_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}  # chat_id -> (fetched_at, {open_id: name})
+_p0_chat_name_cache_lock = threading.Lock()
 
 _P0_OM_USER_TYPE_LABEL = {"2": "会议室/Room", "6": "电话/Phone", "7": "SIP"}
+
+
+def _p0_contact_warn_once(key: str, msg: str, *args: Any) -> None:
+    """Emit a WARNING at most once per distinct key (avoids one line per meeting join)."""
+    with _p0_contact_warned_lock:
+        if key in _p0_contact_warned:
+            return
+        if len(_p0_contact_warned) > 200:
+            _p0_contact_warned.clear()
+        _p0_contact_warned.add(key)
+    logger.warning(msg, *args)
+
+
+def _p0_ws_ignore_event(ce: Any) -> None:
+    """No-op sink for subscribed events the bot intentionally doesn't act on.
+
+    lark-oapi logs an ERROR ('handle message failed … processor not found') for every event
+    type it receives without a registered processor. The bot adds its own ACK/DONE reactions
+    (which echo back as im.message.reaction.* events) and may be subscribed to
+    vc.meeting.recording_started_v1; registering this no-op keeps the journal clean. To stop
+    receiving them entirely, unsubscribe the event in the Developer Console.
+    """
+    return None
 
 
 def _p0_om_enabled() -> bool:
@@ -10238,54 +10341,115 @@ def _p0_om_allowed(open_id: str) -> bool:
     return (open_id or "").strip() in allow
 
 
-def _p0_contact_name(open_id: str) -> str:
-    oid = (open_id or "").strip()
-    if not oid:
+def _p0_contact_name(user_id: str, id_type: str = "open_id") -> str:
+    """Resolve a Lark user's display name from an id. ``id_type`` ∈ open_id|user_id|union_id.
+
+    Returns "" on any failure; the *reason* (permission vs. out-of-scope) is logged once at
+    WARNING so it is visible in the journal instead of being swallowed silently.
+    """
+    uid = (user_id or "").strip()
+    if not uid:
         return ""
+    it_type = (id_type or "open_id").strip() or "open_id"
+    cache_key = f"{it_type}:{uid}"
     with _p0_name_cache_lock:
-        if oid in _p0_name_cache:
-            return _p0_name_cache[oid]
+        if cache_key in _p0_name_cache:
+            return _p0_name_cache[cache_key]
     name = ""
     try:
         tok = _lark_tenant_access_token_string()
         r = requests.get(
             f"{_lark_api_domain()}/open-apis/contact/v3/users/batch",
             headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
-            params=[("user_ids", oid), ("user_id_type", "open_id")],
+            params=[("user_ids", uid), ("user_id_type", it_type)],
             timeout=15,
         )
         j = r.json()
-        code = int(j.get("code", -1) if isinstance(j, dict) and str(j.get("code", "")).lstrip("-").isdigit() else -1)
+        code = int(j.get("code", -1)) if isinstance(j, dict) and str(j.get("code", "")).lstrip("-").isdigit() else -1
         if isinstance(j, dict) and code == 0:
-            for it in (j.get("data") or {}).get("items") or []:
-                if isinstance(it, dict) and _lark_dict_pick_str(it, "open_id", "openId") == oid:
+            items = (j.get("data") or {}).get("items") or []
+            for it in items:
+                if isinstance(it, dict):
                     name = _lark_dict_pick_str(it, "name", "en_name", "enName", "nickname")
-                    break
+                    if name:
+                        break
+            if not name:
+                _p0_contact_warn_once(
+                    f"noname:{it_type}",
+                    "p0 contact name: API returned ok (code=0) but no name for %s=%s (items=%d). The app can "
+                    "call contact but cannot see this user — add scope 'contact:user.base:readonly', put the "
+                    "user inside the app's availability scope (通讯录权限范围/可用范围), and PUBLISH a new version.",
+                    it_type, uid[:14], len(items),
+                )
         elif isinstance(j, dict):
-            logger.info(
-                "p0 contact name lookup code=%s msg=%s — grant the app 'contact:contact.base:readonly' "
-                "(and publish a version) to show real names instead of open_id.",
-                j.get("code"),
-                j.get("msg"),
+            _p0_contact_warn_once(
+                f"code:{j.get('code')}",
+                "p0 contact name lookup failed code=%s msg=%s — grant 'contact:contact.base:readonly' + "
+                "'contact:user.base:readonly' and PUBLISH a version to show real names instead of open_id.",
+                j.get("code"), j.get("msg"),
             )
     except Exception:
-        logger.debug("p0 contact name lookup failed for %s", oid[:10])
+        logger.debug("p0 contact name lookup failed for %s", uid[:10])
     if name:
         with _p0_name_cache_lock:
-            _p0_name_cache[oid] = name
+            _p0_name_cache[cache_key] = name
             if len(_p0_name_cache) > 2000:
                 _p0_name_cache.clear()
     return name
 
 
-def _p0_om_display(op: Dict[str, Any]) -> str:
+def _p0_chat_name_map(chat_id: str) -> Dict[str, str]:
+    """open_id -> display name for a chat's members (uses im:chat:readonly; cached ~5 min).
+
+    This lets meeting join/leave announcements show real names WITHOUT any Contacts scope, as long
+    as the participant is a member of the announce chat — the bot already has im:chat:readonly.
+    """
+    cid = (chat_id or "").strip()
+    if not cid:
+        return {}
+    now = time.time()
+    with _p0_chat_name_cache_lock:
+        hit = _p0_chat_name_cache.get(cid)
+        if hit and (now - hit[0]) < 300:
+            return hit[1]
+    mapping: Dict[str, str] = {}
+    try:
+        rows, _meta = _p0_chat_members(cid)
+        for it in rows or []:
+            oid = _lark_dict_pick_str(it, "member_id", "memberId", "open_id", "openId")
+            nm = _lark_dict_pick_str(it, "name")
+            if oid and nm:
+                mapping[oid] = nm
+    except Exception:
+        logger.debug("p0 chat name map failed for %s", cid[:12])
+    with _p0_chat_name_cache_lock:
+        _p0_chat_name_cache[cid] = (now, mapping)
+        if len(_p0_chat_name_cache) > 100:
+            _p0_chat_name_cache.clear()
+    return mapping
+
+
+def _p0_om_display(op: Dict[str, Any], chat_id: str = "") -> str:
     idobj = op.get("id") if isinstance(op.get("id"), dict) else {}
     oid = _lark_dict_pick_str(idobj, "open_id", "openId") or _lark_dict_pick_str(op, "open_id", "openId")
-    nm = _p0_contact_name(oid)
-    if nm:
-        return nm
+    uuid_ = _lark_dict_pick_str(idobj, "user_id", "userId") or _lark_dict_pick_str(op, "user_id", "userId")
+    unid = _lark_dict_pick_str(idobj, "union_id", "unionId") or _lark_dict_pick_str(op, "union_id", "unionId")
+    # 1) Contacts API — needs a contact scope (contact:user.base:readonly) + the user inside the
+    #    app's availability range + a PUBLISHED version. Try whichever id the event carries.
+    for _id, _t in ((oid, "open_id"), (uuid_, "user_id"), (unid, "union_id")):
+        if _id:
+            nm = _p0_contact_name(_id, _t)
+            if nm:
+                return nm
+    # 2) Fallback: announce-chat membership — only needs im:chat:readonly (already granted), no
+    #    contact scope and no app re-publish. Works when the participant is in the announce chat.
+    if oid and chat_id:
+        nm = _p0_chat_name_map(chat_id).get(oid)
+        if nm:
+            return nm
     ut = str(op.get("user_type") if op.get("user_type") is not None else op.get("userType") or "").strip()
-    return _P0_OM_USER_TYPE_LABEL.get(ut) or (f"用户/user …{oid[-6:]}" if oid else "someone")
+    tail = oid or uuid_ or unid
+    return _P0_OM_USER_TYPE_LABEL.get(ut) or (f"用户/user …{tail[-6:]}" if tail else "someone")
 
 
 def _p0_om_op_open_id(op: Dict[str, Any]) -> str:
@@ -10492,14 +10656,19 @@ def _p0_om_on_join(ce: Any) -> None:
         with _p0_om_lock:
             rec = _p0_om_active.get(mno)
             if rec is None:
-                return  # not a meeting this bot opened — ignore tenant-wide events
+                # Only meetings the bot reserved via /openmeeting are tracked; the map is in-memory
+                # and cleared on restart, so a join in a pre-restart meeting lands here.
+                logger.info("p0 om join no=%s ignored — not a bot-opened meeting (active=%s)",
+                            mno, sorted(_p0_om_active.keys()))
+                return
             if key and key in rec["present"]:
                 return  # already announced this participant (WS redelivery)
             if key:
                 rec["present"].add(key)
             chat = rec.get("chat_id") or _p0_om_announce_chat_default()
+        logger.info("p0 om join no=%s → announcing to chat=%s", mno, (chat or "")[:12])
         _p0_om_card(chat, "🟢 加入会议 / Joined", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
-                    [f"**{_p0_om_display(op)}** 加入了会议 / joined the meeting"])
+                    [f"**{_p0_om_display(op, chat)}** 加入了会议 / joined the meeting"])
     except Exception:
         logger.exception("p0 openmeeting join handler failed")
 
@@ -10516,14 +10685,17 @@ def _p0_om_on_leave(ce: Any) -> None:
         with _p0_om_lock:
             rec = _p0_om_active.get(mno)
             if rec is None:
-                return  # not a meeting this bot opened
+                logger.info("p0 om leave no=%s ignored — not a bot-opened meeting (active=%s)",
+                            mno, sorted(_p0_om_active.keys()))
+                return
             if key:
                 rec["present"].discard(key)
             chat = rec.get("chat_id") or _p0_om_announce_chat_default()
         reason = str(ev.get("leave_reason") or ev.get("leaveReason") or "").strip()
         why = {"1": "", "2": "（会议结束/meeting ended）", "3": "（被移出/removed）"}.get(reason, "")
+        logger.info("p0 om leave no=%s reason=%s → announcing to chat=%s", mno, reason or "?", (chat or "")[:12])
         _p0_om_card(chat, "🔴 离开会议 / Left", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
-                    [f"**{_p0_om_display(op)}** 离开了会议 / left the meeting {why}"])
+                    [f"**{_p0_om_display(op, chat)}** 离开了会议 / left the meeting {why}"])
     except Exception:
         logger.exception("p0 openmeeting leave handler failed")
 
@@ -12075,6 +12247,14 @@ def start_lark_ws_client_blocking() -> None:
             continue
         logger.info("Lark WS also registering custom event_type=%r (LARK_WS_EXTRA_IM_TYPES)", t)
         bld = bld.register_p2_customized_event(t, _on_ws_im_message_p2_customized)
+    # Silence lark-oapi's "processor not found" ERROR for events we receive but don't act on.
+    # The bot's own ACK/DONE reactions echo back as reaction events; task/* arrive from other
+    # apps in the tenant. Extend via LARK_WS_IGNORE_EVENTS (comma/;-separated) as needed.
+    _ignore_default = "im.message.reaction.created_v1,im.message.reaction.deleted_v1,task.task.update_tenant_v1"
+    for _ignore_t in _cfg_str("LARK_WS_IGNORE_EVENTS", _ignore_default).replace(";", ",").split(","):
+        _ignore_t = _ignore_t.strip()
+        if _ignore_t:
+            bld = bld.register_p2_customized_event(_ignore_t, _p0_ws_ignore_event)
     if _p0_om_enabled():
         for _et, _h in (
             ("vc.meeting.meeting_started_v1", _p0_om_on_started),
@@ -12084,6 +12264,7 @@ def start_lark_ws_client_blocking() -> None:
             ("vc.meeting.meeting_ended_v1", _p0_om_on_ended),
             ("vc.meeting.all_meeting_ended_v1", _p0_om_on_ended),
             ("vc.meeting.recording_ready_v1", _p0_om_on_recording_ready),
+            ("vc.meeting.recording_started_v1", _p0_ws_ignore_event),  # subscribed but not acted on
         ):
             bld = bld.register_p2_customized_event(_et, _h)
         logger.info(
