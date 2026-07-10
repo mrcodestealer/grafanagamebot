@@ -9492,13 +9492,16 @@ def _p0_meeting_worker(chat_id: str, open_id: str, meeting_no: str, mid: str, de
         if rows is None:
             code = err.get("code") if isinstance(err, dict) else "?"
             msg = err.get("msg") if isinstance(err, dict) else str(err)
+            low = f"{code} {msg}".lower()
             hint = ""
-            if "permission" in str(msg).lower() or "access" in str(msg).lower() or "denied" in str(msg).lower():
+            if any(k in low for k in ("permission", "access", "denied", "forbidden", "403", "99991")):
                 hint = (
-                    "\n\n提示 / Hint: 本应用需要「视频会议-会议管理」报表权限（企业管理员在后台授予）；"
-                    "部分租户此接口仅支持 user_access_token。 The app needs the VC "
-                    "'Meeting Management' report permission (granted by an enterprise admin); "
-                    "some tenants require a user_access_token for this endpoint."
+                    "\n\n提示 / Hint: 本应用需要在【管理后台 admin.larksuite.com】获得"
+                    "「视频会议 · 会议管理」权限，并在开发者后台开通 vc 会议室明细权限；"
+                    "此报表接口在多数租户仅支持 user_access_token（需管理员 OAuth 授权）。\n"
+                    "The app needs the 'Video Conferencing · Meeting Management' permission in the "
+                    "Admin Console, plus the vc room-detail scope; on most tenants this report API "
+                    "only accepts a user_access_token (admin OAuth), not the bot's tenant token."
                 )
             _p0_meeting_send_card(
                 rt, rv, meeting_no, "red", "⚠️ 查询失败 / Lookup failed",
