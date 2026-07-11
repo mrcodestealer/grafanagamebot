@@ -335,6 +335,8 @@ _CFG: Dict[str, Any] = {
     "P0_CONTACTS_ENABLE": "1",
     # Path to the CSV; empty = contacts.csv next to main.py (ships in the repo, deploys via git pull).
     "P0_CONTACTS_FILE": "",
+    # After answering, if the answer names anyone in the directory, append their phone(s). 1=on.
+    "P0_CONTACTS_APPEND_ENABLE": "1",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -8691,7 +8693,8 @@ _p0_doc_fetched_at: float = 0.0
 _p0_doc_meta: str = ""
 
 _p0_contacts_lock = threading.Lock()
-_p0_contacts_cache: str = ""
+_p0_contacts_entries_cache: List[Tuple[str, str, str]] = []  # [(name, team, phone), ...]
+_p0_contacts_text_cache: str = ""
 _p0_contacts_mtime: float = -1.0
 
 
@@ -8711,25 +8714,24 @@ def _p0_contacts_file() -> str:
     return os.path.join(base, "contacts.csv")
 
 
-def _p0_contacts_text() -> str:
-    """Formatted contact directory from contacts.csv, reloaded when the file changes.
+def _p0_contacts_load() -> Tuple[List[Tuple[str, str, str]], str]:
+    """(entries, formatted_block) from contacts.csv, reloaded when the file changes.
 
-    Returns "" when disabled (P0_CONTACTS_ENABLE=0) or the file is absent/empty. This block is
-    always folded into the Q&A context so p0bot can answer "who do I contact for <team>" or
-    "<person>'s number" from local data even when the wiki doesn't list them.
+    Returns ([], "") when disabled (P0_CONTACTS_ENABLE=0) or the file is absent/empty. The block
+    is folded into the Q&A context; the entries also drive contact-lookup on answers.
     """
-    global _p0_contacts_cache, _p0_contacts_mtime
+    global _p0_contacts_entries_cache, _p0_contacts_text_cache, _p0_contacts_mtime
     if not _lark_env_truthy_or_default("P0_CONTACTS_ENABLE", default=True):
-        return ""
+        return [], ""
     path = _p0_contacts_file()
     try:
         mtime = os.path.getmtime(path)
     except OSError:
-        return ""
+        return [], ""
     with _p0_contacts_lock:
-        if _p0_contacts_cache and mtime == _p0_contacts_mtime:
-            return _p0_contacts_cache
-    lines: List[str] = []
+        if _p0_contacts_text_cache and mtime == _p0_contacts_mtime:
+            return _p0_contacts_entries_cache, _p0_contacts_text_cache
+    entries: List[Tuple[str, str, str]] = []
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
@@ -8738,22 +8740,71 @@ def _p0_contacts_text() -> str:
                 phone = (row.get("phone") or "").strip()
                 if not name and not phone:
                     continue
-                lines.append(f"- {name} | {team or '-'} | {phone or '-'}")
+                entries.append((name, team, phone))
     except Exception:
         logger.exception("p0 contacts load failed: %s", path)
-        return ""
-    if not lines:
-        return ""
+        return [], ""
+    if not entries:
+        return [], ""
     block = (
         "CONTACT DIRECTORY — team members and phone numbers (format: name | team | phone). "
         "Use this to answer who to contact for a team, or a person's phone number.\n"
-        + "\n".join(lines)
+        + "\n".join(f"- {n} | {t or '-'} | {p or '-'}" for n, t, p in entries)
     )
     with _p0_contacts_lock:
-        _p0_contacts_cache = block
+        _p0_contacts_entries_cache = entries
+        _p0_contacts_text_cache = block
         _p0_contacts_mtime = mtime
-    logger.info("p0 contacts loaded: %d entries from %s", len(lines), path)
-    return block
+    logger.info("p0 contacts loaded: %d entries from %s", len(entries), path)
+    return entries, block
+
+
+def _p0_contacts_text() -> str:
+    return _p0_contacts_load()[1]
+
+
+def _p0_contacts_lookup(text: str, limit: int = 12) -> List[Tuple[str, str, str]]:
+    """Directory people whose name appears as a whole word/phrase in ``text``.
+
+    Longer names claim their span first, so a full name ("Kelvin Er") doesn't also drag in a
+    shorter same-token contact ("Kelvin"). Single-token names under 4 chars are skipped to avoid
+    false positives on ordinary words/acronyms (Bk, YC, AD, Don, Net, …).
+    """
+    entries, _ = _p0_contacts_load()
+    work = text or ""
+    if not entries or not work.strip():
+        return []
+    matched: List[Tuple[str, str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for name, team, phone in sorted(entries, key=lambda e: len(e[0]), reverse=True):
+        if not name or (" " not in name and len(name) < 4):
+            continue
+        pat = r"(?<!\w)" + re.escape(name) + r"(?!\w)"
+        if re.search(pat, work, flags=re.IGNORECASE):
+            key = (name.lower(), phone)
+            if key not in seen:
+                seen.add(key)
+                matched.append((name, team, phone))
+            # blank out the matched span so shorter overlapping names don't re-match it
+            work = re.sub(pat, lambda m: " " * len(m.group(0)), work, flags=re.IGNORECASE)
+            if len(matched) >= limit:
+                break
+    return matched
+
+
+def _p0_augment_answer_with_contacts(answer: str) -> str:
+    """Append phone numbers for any directory people named in the answer (P0_CONTACTS_APPEND_ENABLE)."""
+    if not _lark_env_truthy_or_default("P0_CONTACTS_APPEND_ENABLE", default=True):
+        return answer
+    try:
+        hits = _p0_contacts_lookup(answer)
+    except Exception:
+        logger.exception("p0 contacts answer-lookup failed")
+        return answer
+    if not hits:
+        return answer
+    lines = [f"- **{n}** · {t or '-'} · `{p or '-'}`" for n, t, p in hits]
+    return answer.rstrip() + "\n\n**📇 相关联系人 / Contacts**\n" + "\n".join(lines)
 
 
 def _p0_wiki_node_token() -> str:
@@ -9088,7 +9139,7 @@ def _p0_ai_answer(question: str, doc_text: str) -> str:
     if not ans:
         logger.warning("p0 QA empty answer payload=%r", data)
         return "⚠️ 模型没有返回内容，请重试。/ The model returned no content — please try again."
-    return ans
+    return _p0_augment_answer_with_contacts(ans)
 
 
 def _p0_bot_open_id() -> str:
