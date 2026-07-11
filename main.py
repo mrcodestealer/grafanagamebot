@@ -9376,12 +9376,21 @@ def _p0_try_handle_doc_qa(
         elif is_monitoring_cmd:
             # A monitoring command that isn't /ask or /reload — hand off to monitoring.
             return False
-        elif (
-            not is_dm
-            and _lark_env_truthy_or_default("P0_QA_AT_MENTION_ENABLE", default=True)
-            and _p0_mentions_contain_bot(mentions)
-        ):
-            kind, question = "mention", text_clean
+        elif not is_dm and _lark_env_truthy_or_default("P0_QA_AT_MENTION_ENABLE", default=True):
+            if _p0_mentions_contain_bot(mentions):
+                kind, question = "mention", text_clean
+            else:
+                # Group @-mention that didn't match this bot's identity — surface the actual ids
+                # so P0_BOT_OPEN_ID can be pinned to the right value (common bot/v3/info mismatch).
+                try:
+                    _mids = [s for s in _lark_iter_mention_scalar_strings(mentions) if s]
+                except Exception:
+                    _mids = ["<parse-failed>"]
+                logger.info(
+                    "p0 doc-qa: group @-mention NOT matched to this bot — mention ids=%r, bot targets "
+                    "open_id=%r app_id=%r. If one of the mention ids IS this bot, set P0_BOT_OPEN_ID to it.",
+                    _mids, _p0_bot_open_id(), str(APP_ID or "").strip(),
+                )
         elif is_dm and _lark_env_truthy_or_default("P0_QA_ANSWER_DM", default=True):
             kind, question = "dm", text_clean
 
@@ -12301,7 +12310,8 @@ def start_lark_ws_client_blocking() -> None:
     # Silence lark-oapi's "processor not found" ERROR for events we receive but don't act on.
     # The bot's own ACK/DONE reactions echo back as reaction events; task/* arrive from other
     # apps in the tenant. Extend via LARK_WS_IGNORE_EVENTS (comma/;-separated) as needed.
-    _ignore_default = "im.message.reaction.created_v1,im.message.reaction.deleted_v1,task.task.update_tenant_v1"
+    _ignore_default = ("im.message.reaction.created_v1,im.message.reaction.deleted_v1,"
+                       "im.message.recalled_v1,task.task.update_tenant_v1")
     for _ignore_t in _cfg_str("LARK_WS_IGNORE_EVENTS", _ignore_default).replace(";", ",").split(","):
         _ignore_t = _ignore_t.strip()
         if _ignore_t:
