@@ -401,6 +401,11 @@ _CFG: Dict[str, Any] = {
     "P0_P0DOCS_USE_LOCAL_ASR": "0",
     # Max transcript characters passed to the fill model (head+tail kept when longer).
     "P0_P0DOCS_TRANSCRIPT_CHARS": "12000",
+    # OSE duty roster (wiki sheet): months in row 1, day numbers in row 2, names in column A,
+    # D/N marks per day. Meeting start 07:00-19:00 → that day's D people; otherwise N (a start
+    # before 07:00 belongs to the previous day's N shift). Fills "OSE On-duty".
+    "P0_DUTY_WIKI_TOKEN": "O4Dfw4DVTiPpFukn801l5z3WgMd",
+    "P0_DUTY_SHEET_ID": "AS33r7",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -10826,32 +10831,126 @@ def _p0_docx_find_sheet_after(items: List[Dict[str, Any]], heading_contains: str
     return ""
 
 
-def _p0_sheet_read_col_a(combined_token: str, max_row: int = 30) -> List[str]:
-    """Column-A values of an embedded sheet (row order, 1-based offsetting left to caller)."""
+def _p0_sheet_read_range(combined_token: str, a1: str) -> List[List[str]]:
+    """Computed cell values (FormattedValue — formulas resolved) of a sheet range."""
     if "_" not in combined_token:
         return []
     stoken, sid = combined_token.split("_", 1)
     for _kind, tok in _p0_minutes_tokens():
         try:
             r = requests.get(
-                f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{stoken}/values/{sid}!A1:A{max_row}",
+                f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{stoken}/values/{sid}!{a1}",
                 headers={"Authorization": f"Bearer {tok}"},
+                params={"valueRenderOption": "FormattedValue"},
                 timeout=30,
             )
             j = r.json()
         except Exception:
             continue
         if int(j.get("code", -1)) != 0:
+            logger.info("p0 sheet read %s failed: code=%s msg=%s", a1, j.get("code"), j.get("msg"))
             continue
         rows = ((j.get("data") or {}).get("valueRange") or {}).get("values") or []
-        out: List[str] = []
+        out: List[List[str]] = []
         for row in rows:
-            v = row[0] if isinstance(row, list) and row else ""
-            if isinstance(v, list):  # rich-text cells arrive as segment lists
-                v = "".join(str((seg or {}).get("text") or "") for seg in v if isinstance(seg, dict))
-            out.append(str(v) if v is not None else "")
+            cells: List[str] = []
+            for v in (row or []):
+                if isinstance(v, list):  # rich-text cells arrive as segment lists
+                    v = "".join(str((seg or {}).get("text") or "") for seg in v if isinstance(seg, dict))
+                cells.append(str(v).strip() if v is not None else "")
+            out.append(cells)
         return out
     return []
+
+
+def _p0_sheet_read_col_a(combined_token: str, max_row: int = 30) -> List[str]:
+    """Column-A values of a sheet (row order, 1-based offsetting left to caller)."""
+    return [(r[0] if r else "") for r in _p0_sheet_read_range(combined_token, f"A1:A{max_row}")]
+
+
+def _p0_col_letter(n: int) -> str:
+    """1-based column index → A1 letter (1→A, 27→AA)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+_p0_duty_sheet_cache: Dict[str, str] = {}
+
+
+def _p0_duty_sheet_token() -> str:
+    """Resolve the duty-roster wiki node to '<spreadsheet>_<sheetid>' (cached)."""
+    wiki = _cfg_str("P0_DUTY_WIKI_TOKEN", "O4Dfw4DVTiPpFukn801l5z3WgMd").strip()
+    sid = _cfg_str("P0_DUTY_SHEET_ID", "AS33r7").strip()
+    if not wiki or not sid:
+        return ""
+    key = f"{wiki}:{sid}"
+    cached = _p0_duty_sheet_cache.get(key)
+    if cached:
+        return cached
+    try:
+        j = _p0_lark_get_json("/open-apis/wiki/v2/spaces/get_node", {"token": wiki, "obj_type": "wiki"})
+        n = (j.get("data") or {}).get("node") or {}
+        if int(j.get("code", -1)) == 0 and n.get("obj_type") == "sheet" and n.get("obj_token"):
+            combined = f"{n['obj_token']}_{sid}"
+            _p0_duty_sheet_cache[key] = combined
+            return combined
+        logger.info("p0 duty roster node unusable: code=%s obj_type=%s", j.get("code"), n.get("obj_type"))
+    except Exception:
+        logger.exception("p0 duty roster resolve failed")
+    return ""
+
+
+def _p0_duty_on(start_epoch: float) -> Tuple[str, List[str]]:
+    """(shift 'D'|'N', names on duty) from the roster at the given moment; ("", []) when unknown.
+
+    Roster layout: month labels in row 1 (first column of each month), day-of-month in row 2,
+    names in column A, one column per day with D/N/* marks. Day shift = 07:00-19:00; a start
+    before 07:00 belongs to the PREVIOUS day's N column (that shift began 19:00 the day before).
+    """
+    if not start_epoch:
+        return "", []
+    lt = time.localtime(start_epoch)
+    if lt.tm_hour < 7:
+        target, shift = time.localtime(start_epoch - 86400), "N"
+    elif lt.tm_hour < 19:
+        target, shift = lt, "D"
+    else:
+        target, shift = lt, "N"
+    tok = _p0_duty_sheet_token()
+    if not tok:
+        return shift, []
+    hdr = _p0_sheet_read_range(tok, f"A1:{_p0_col_letter(400)}2")
+    if len(hdr) < 2:
+        return shift, []
+    months, days = hdr[0], hdr[1]
+    want_month = time.strftime("%B %Y", target).lower()
+    cur = ""
+    col = 0
+    for i in range(1, max(len(months), len(days))):
+        if i < len(months) and months[i]:
+            cur = months[i]
+        d = days[i] if i < len(days) else ""
+        if cur.strip().lower() == want_month and d == str(target.tm_mday):
+            col = i + 1  # 1-based
+            break
+    if not col:
+        logger.info("p0 duty: no roster column for %s day %s", want_month, target.tm_mday)
+        return shift, []
+    letter = _p0_col_letter(col)
+    names_col = _p0_sheet_read_range(tok, "A1:A300")
+    duty_col = _p0_sheet_read_range(tok, f"{letter}1:{letter}300")
+    names: List[str] = []
+    for r_ in range(len(duty_col)):
+        v = (duty_col[r_][0] if duty_col[r_] else "").upper()
+        nm = names_col[r_][0] if (r_ < len(names_col) and names_col[r_]) else ""
+        if nm and v == shift:
+            names.append(nm)
+    logger.info("p0 duty %s col=%s shift=%s -> %d names",
+                time.strftime("%Y/%m/%d", target), letter, shift, len(names))
+    return shift, names
 
 
 def _p0_sheet_batch_write(combined_token: str, ranges: List[Tuple[str, List[List[str]]]]) -> Tuple[bool, Dict[str, Any]]:
@@ -10924,7 +11023,9 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
             continue
         if int(j.get("code", -1)) == 0:
             return True, {}
-        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"), "http": r.status_code}
+        logger.info("p0 p0docs patch block=%s via %s token failed http=%s body=%r",
+                    block_id, kind, r.status_code, (r.text or "")[:200])
     return False, last_err
 
 
@@ -10964,7 +11065,8 @@ def _p0_p0docs_ai_updates(
         "Duration lines when metadata has meeting times, any [YYYY/MM/DD] date placeholder (metadata has "
         "the meeting date), and the '📝 Issue Summary' line (summarize the transcript in 1-2 sentences).\n"
         "4) 'Teams Involved' = the union of the speakers' teams from metadata (skip 'unknown team'). "
-        "NEVER fill the 'OSE On-duty' and 'Message Link' lines — leave them untouched for manual filling.\n"
+        "'OSE On-duty': fill EXACTLY with the metadata value 'OSE on-duty roster' when that metadata is "
+        "present; when absent, leave the line untouched. NEVER fill the 'Message Link' line.\n"
         "5) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
         "placeholder part.\n"
         "6) \"timeline\": a chronological incident log, each entry {\"time\": \"HH:MM:SS\", "
@@ -11129,6 +11231,10 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 start_epoch = time.mktime(time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
         except (ValueError, OverflowError):
             pass
+        if start_epoch:
+            _shift, _duty = _p0_duty_on(start_epoch)
+            if _duty:
+                meta["OSE on-duty roster"] = f"{', '.join(_duty)}（{_shift} 班 / {_shift} shift）"
         # Transcript for the model — timed, and heard LOCALLY when P0_P0DOCS_USE_LOCAL_ASR=1
         # (times from the SRT, text from the local engine). Falls back Lark-timed → Lark-plain.
         transcript = ""
@@ -11176,6 +11282,7 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             else:
                 failc += 1
                 first_err = first_err or perr
+            time.sleep(0.34)  # docx write QPS limit — bursting many patches gets throttled
         tl_count = 0
         if timeline:
             # Stage values must match the sheet dropdown options EXACTLY (no spaces, 调查原因);
