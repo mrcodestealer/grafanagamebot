@@ -136,6 +136,14 @@ Needs: tenant has **Minutes (妙记) enabled**; scope **`minutes:minutes.transcr
 default; the admin must re-run `/vcauth` after the scope is added). A bot cannot join a live
 call — this works on recordings after the meeting ends (wait a few minutes for processing).
 
+**Hybrid LOCAL ASR (optional)** — the bot downloads the recording audio and *hears it itself*
+(SenseVoiceSmall via sherpa-onnx, ~1 GB RAM, CPU-only, built for mixed zh+en) instead of using
+Lark's ASR text; speaker **names + timestamps still come from the Minutes SRT**, so you keep
+`Yang: ...` attribution. Setup once: `sudo bash deploy/setup-whotalk-asr.sh` (installs ffmpeg +
+sherpa-onnx + the model), add scope **`minutes:minutes.media:export`** (+ publish + owner
+re-`/vcauth`), then `P0_WHOTALK_ASR_ENABLE=1` and restart. The "transcript fetched" message
+shows which source was used; any local-ASR failure automatically falls back to Lark's text.
+
 ## Contact directory (`contacts.csv`) — phone numbers p0bot can answer from
 
 `contacts.csv` in the repo root (`name,team,phone`) is folded into **every** answer's context,

@@ -24,9 +24,12 @@ from urllib.parse import urlencode
 from datetime import datetime
 import re
 import shlex
+import shutil
+import tempfile
 import threading
 import time
 import warnings
+import wave
 from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
 import requests
@@ -348,6 +351,25 @@ _CFG: Dict[str, Any] = {
     "P0_WHOTALK_CHUNK_CHARS": "9000",
     # Lookback (hours) when resolving a bare meeting number to its meeting id via list_by_no.
     "P0_WHOTALK_LOOKBACK_HOURS": "72",
+    # ---- /whotalk hybrid LOCAL ASR: the bot downloads the recording audio and transcribes it ----
+    # itself (SenseVoiceSmall via sherpa-onnx) instead of using Lark's ASR text. Speaker names +
+    # timestamps still come from the Minutes SRT export; only the heard TEXT is local. Setup:
+    # deploy/setup-whotalk-asr.sh (installs ffmpeg + sherpa-onnx + the model), then set =1.
+    # Extra scope needed: minutes:minutes.media:export (console + P0_VC_OAUTH_SCOPES + re-/vcauth).
+    # Falls back to the Lark transcript automatically on any failure.
+    "P0_WHOTALK_ASR_ENABLE": "0",
+    # Model dir holding model(.int8).onnx + tokens.txt; empty = <app>/models/sensevoice.
+    "P0_WHOTALK_ASR_MODEL_DIR": "",
+    "P0_WHOTALK_ASR_THREADS": "4",
+    # Padding added around each speaker segment when slicing audio (ms), and max merged-turn length (s).
+    "P0_WHOTALK_ASR_SEG_PAD_MS": "150",
+    "P0_WHOTALK_ASR_MAX_TURN_SECONDS": "28",
+    # Refuse to download recordings larger than this (MB). 0 = no limit.
+    "P0_WHOTALK_ASR_MAX_MEDIA_MB": "1024",
+    # Keep the downloaded media/wav files for debugging (default: delete after use).
+    "P0_WHOTALK_ASR_KEEP_MEDIA": "0",
+    # ffmpeg binary; empty = try <app>/bin/ffmpeg then PATH.
+    "P0_FFMPEG_BIN": "",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -9920,13 +9942,8 @@ def _p0_whotalk_resolve_minute_token(arg: str) -> Tuple[str, str]:
                 "minutes after the meeting ends.")
 
 
-def _p0_minutes_transcript(minute_token: str) -> Tuple[str, Dict[str, Any]]:
-    """(transcript_text, error). Export the Minutes transcript WITH speaker names.
-
-    GET /open-apis/minutes/v1/minutes/{token}/transcript (binary text stream on success).
-    Tries the tenant token first, then the stored /vcauth admin user token — a host-owned
-    minute is often invisible to the tenant token until shared with the app.
-    """
+def _p0_minutes_tokens() -> List[Tuple[str, str]]:
+    """Access tokens to try against the Minutes API: tenant first, then the /vcauth user token."""
     toks: List[Tuple[str, str]] = []
     try:
         toks.append(("tenant", _lark_tenant_access_token_string()))
@@ -9935,13 +9952,18 @@ def _p0_minutes_transcript(minute_token: str) -> Tuple[str, Dict[str, Any]]:
     ut = _p0_vc_user_access_token()
     if ut:
         toks.append(("user", ut))
+    return toks
+
+
+def _p0_minutes_export(minute_token: str, params: Dict[str, Any], what: str) -> Tuple[bytes, Dict[str, Any]]:
+    """(file_bytes, error) from the transcript-export endpoint (binary stream on success)."""
     last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
-    for kind, tok in toks:
+    for kind, tok in _p0_minutes_tokens():
         try:
             r = requests.get(
                 f"{_lark_api_domain()}/open-apis/minutes/v1/minutes/{minute_token}/transcript",
                 headers={"Authorization": f"Bearer {tok}"},
-                params={"need_speaker": "true", "need_timestamp": "false", "file_format": "txt"},
+                params=params,
                 timeout=60,
             )
         except Exception as e:
@@ -9949,19 +9971,264 @@ def _p0_minutes_transcript(minute_token: str) -> Tuple[str, Dict[str, Any]]:
             continue
         ctype = (r.headers.get("Content-Type") or "").lower()
         if r.status_code == 200 and "json" not in ctype:
-            text = r.content.decode("utf-8", "replace").strip()
-            if text:
-                logger.info("p0 whotalk transcript ok via %s token: %d chars", kind, len(text))
-                return text, {}
-            last_err = {"code": "EMPTY", "msg": "transcript export returned an empty file"}
+            if r.content.strip():
+                logger.info("p0 whotalk %s ok via %s token: %d bytes", what, kind, len(r.content))
+                return r.content, {}
+            last_err = {"code": "EMPTY", "msg": f"{what} export returned an empty file"}
             continue
         try:
             j = r.json()
         except Exception:
             j = {"code": f"HTTP {r.status_code}", "msg": (r.text or "")[:200]}
         last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg") or str(j)[:200]}
-        logger.info("p0 whotalk transcript via %s token failed: %s", kind, last_err)
+        logger.info("p0 whotalk %s via %s token failed: %s", what, kind, last_err)
+    return b"", last_err
+
+
+def _p0_minutes_transcript(minute_token: str) -> Tuple[str, Dict[str, Any]]:
+    """(transcript_text, error). Lark's ASR text with speaker names (txt export)."""
+    raw, err = _p0_minutes_export(
+        minute_token,
+        {"need_speaker": "true", "need_timestamp": "false", "file_format": "txt"},
+        "transcript",
+    )
+    return raw.decode("utf-8", "replace").strip() if raw else "", err
+
+
+def _p0_minutes_media_url(minute_token: str) -> Tuple[str, Dict[str, Any]]:
+    """(download_url, error) for the recording's audio/video file (scope minutes:minutes.media:export)."""
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/minutes/v1/minutes/{minute_token}/media",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        code = int(j.get("code", -1)) if isinstance(j, dict) and str(j.get("code", "")).lstrip("-").isdigit() else -1
+        if code == 0:
+            url = _lark_dict_pick_str((j.get("data") or {}), "download_url", "downloadUrl")
+            if url:
+                logger.info("p0 whotalk media url ok via %s token", kind)
+                return url, {}
+            last_err = {"code": "NO_URL", "msg": "media response had no download_url"}
+            continue
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg") or str(j)[:200]}
+        logger.info("p0 whotalk media via %s token failed: %s", kind, last_err)
     return "", last_err
+
+
+_P0_SRT_TS = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})"
+)
+_P0_SRT_SPEAKER = re.compile(r"^\s*([^:：\n]{1,40})[:：]\s*(.*)$")
+
+
+def _p0_srt_turns(srt_text: str) -> List[Dict[str, Any]]:
+    """Parse a Minutes SRT export into speaker turns [{speaker, start, end, text}] (seconds).
+
+    Consecutive entries by the same speaker are merged when the gap is small, capped at
+    P0_WHOTALK_ASR_MAX_TURN_SECONDS so segments stay inside SenseVoice's comfort zone.
+    """
+    max_turn = max(5.0, _cfg_float("P0_WHOTALK_ASR_MAX_TURN_SECONDS", 28.0))
+    entries: List[Dict[str, Any]] = []
+    speaker = "?"
+    for block in re.split(r"\n\s*\n", srt_text or ""):
+        m = _P0_SRT_TS.search(block)
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
+        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+        text_lines = [ln.strip() for ln in block[m.end():].strip().splitlines() if ln.strip()]
+        if not text_lines:
+            continue
+        sm = _P0_SRT_SPEAKER.match(text_lines[0])
+        if sm:
+            speaker = sm.group(1).strip() or speaker
+            text_lines[0] = sm.group(2).strip()
+        entries.append({"speaker": speaker, "start": start, "end": max(end, start),
+                        "text": " ".join(t for t in text_lines if t)})
+    turns: List[Dict[str, Any]] = []
+    for e in entries:
+        last = turns[-1] if turns else None
+        if (last is not None and last["speaker"] == e["speaker"]
+                and e["start"] - last["end"] <= 1.5
+                and e["end"] - last["start"] <= max_turn):
+            last["end"] = e["end"]
+            last["text"] = (last["text"] + " " + e["text"]).strip()
+        else:
+            turns.append(dict(e))
+    return turns
+
+
+def _p0_ffmpeg_bin() -> str:
+    p = _cfg_str("P0_FFMPEG_BIN", "").strip()
+    if p:
+        return p
+    try:
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "ffmpeg")
+        if os.path.isfile(local):
+            return local
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+def _p0_whotalk_asr_enabled() -> bool:
+    return _lark_env_truthy("P0_WHOTALK_ASR_ENABLE")
+
+
+def _p0_whotalk_asr_model_paths() -> Tuple[str, str]:
+    """(model_path, tokens_path) for the SenseVoice onnx model, or ("", "") if not installed."""
+    d = _cfg_str("P0_WHOTALK_ASR_MODEL_DIR", "").strip()
+    if not d:
+        try:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sensevoice")
+        except Exception:
+            return "", ""
+    tokens = os.path.join(d, "tokens.txt")
+    for name in ("model.int8.onnx", "model.onnx"):
+        model = os.path.join(d, name)
+        if os.path.isfile(model) and os.path.isfile(tokens):
+            return model, tokens
+    return "", ""
+
+
+_p0_asr_recognizer: Any = None
+_p0_asr_lock = threading.Lock()
+
+
+def _p0_whotalk_recognizer() -> Any:
+    """Lazy-loaded, process-wide SenseVoice recognizer (~1 GB resident once loaded)."""
+    global _p0_asr_recognizer
+    with _p0_asr_lock:
+        if _p0_asr_recognizer is not None:
+            return _p0_asr_recognizer
+        model, tokens = _p0_whotalk_asr_model_paths()
+        if not model:
+            raise RuntimeError(
+                "SenseVoice model not found — run deploy/setup-whotalk-asr.sh (or set P0_WHOTALK_ASR_MODEL_DIR)"
+            )
+        import sherpa_onnx  # deferred: only needed when local ASR is enabled
+
+        _p0_asr_recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model,
+            tokens=tokens,
+            num_threads=max(1, _cfg_int("P0_WHOTALK_ASR_THREADS", 4)),
+            use_itn=True,
+            language="auto",
+        )
+        logger.info("p0 whotalk ASR loaded: %s", model)
+        return _p0_asr_recognizer
+
+
+def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
+    """(transcript_text, error). Hybrid local ASR:
+
+    speaker names + timestamps from the Minutes SRT export; the TEXT of each turn is
+    re-transcribed from the actual recording audio by local SenseVoice (sherpa-onnx).
+    """
+    import numpy as np  # deferred: only needed when local ASR is enabled
+
+    srt_raw, err = _p0_minutes_export(
+        minute_token,
+        {"need_speaker": "true", "need_timestamp": "true", "file_format": "srt"},
+        "srt",
+    )
+    if not srt_raw:
+        return "", f"SRT export failed: code={err.get('code')} msg={err.get('msg')}"
+    turns = _p0_srt_turns(srt_raw.decode("utf-8", "replace"))
+    if not turns:
+        return "", "SRT parsed to zero speaker turns"
+    media_url, merr = _p0_minutes_media_url(minute_token)
+    if not media_url:
+        return "", (f"media download-url failed: code={merr.get('code')} msg={merr.get('msg')} "
+                    "(scope minutes:minutes.media:export granted+published? re-/vcauth after adding it)")
+    workdir = tempfile.mkdtemp(prefix="p0whotalk_")
+    media_path = os.path.join(workdir, "media.bin")
+    wav_path = os.path.join(workdir, "audio.wav")
+    try:
+        max_mb = _cfg_int("P0_WHOTALK_ASR_MAX_MEDIA_MB", 1024)
+        # Try the URL as presigned first; if the CDN insists on auth, retry with our tokens.
+        auth_headers: List[Dict[str, str]] = [{}]
+        auth_headers += [{"Authorization": f"Bearer {tok}"} for _kind, tok in _p0_minutes_tokens()]
+        written = 0
+        last_status = "?"
+        for hdrs in auth_headers:
+            with requests.get(media_url, headers=hdrs, stream=True, timeout=120) as r:
+                last_status = str(r.status_code)
+                if r.status_code in (401, 403):
+                    continue
+                r.raise_for_status()
+                clen = int(r.headers.get("Content-Length") or 0)
+                if max_mb and clen and clen > max_mb * 1024 * 1024:
+                    return "", f"recording too large ({clen // (1024 * 1024)} MB > {max_mb} MB limit)"
+                written = 0
+                with open(media_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+                        written += len(chunk)
+                        if max_mb and written > max_mb * 1024 * 1024:
+                            return "", f"recording exceeded the {max_mb} MB download limit"
+            break
+        if not written:
+            return "", f"media download denied (HTTP {last_status}) with and without auth"
+        logger.info("p0 whotalk media downloaded: %d bytes", written)
+        proc = subprocess.run(
+            [_p0_ffmpeg_bin(), "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000",
+             "-c:a", "pcm_s16le", "-f", "wav", wav_path],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode != 0 or not os.path.isfile(wav_path):
+            tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+            return "", f"ffmpeg failed (rc={proc.returncode}): {tail}"
+        rec = _p0_whotalk_recognizer()
+        with wave.open(wav_path, "rb") as wf:
+            sr = wf.getframerate()
+            nch = wf.getnchannels()
+            pcm = wf.readframes(wf.getnframes())
+        if nch != 1:
+            return "", f"unexpected channel count {nch} after ffmpeg"
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        total_s = len(samples) / float(sr)
+        pad = max(0.0, _cfg_float("P0_WHOTALK_ASR_SEG_PAD_MS", 150.0)) / 1000.0
+        lines: List[str] = []
+        t0 = time.time()
+        for i, turn in enumerate(turns, 1):
+            a = max(0.0, float(turn["start"]) - pad)
+            b = min(total_s, float(turn["end"]) + pad)
+            if b - a < 0.2:
+                continue
+            seg = samples[int(a * sr):int(b * sr)]
+            stream = rec.create_stream()
+            stream.accept_waveform(sr, seg)
+            rec.decode_stream(stream)
+            text = (stream.result.text or "").strip()
+            if text:
+                lines.append(f"{turn['speaker']}: {text}")
+            elif turn.get("text"):
+                # local ASR heard nothing — keep Lark's text rather than dropping the turn
+                lines.append(f"{turn['speaker']}: {turn['text']}")
+        logger.info("p0 whotalk local ASR done: %d turns, %.1fs audio, %.1fs compute",
+                    len(lines), total_s, time.time() - t0)
+        if not lines:
+            return "", "local ASR produced no text"
+        return "\n".join(lines), ""
+    except subprocess.TimeoutExpired:
+        return "", "ffmpeg timed out"
+    except Exception as e:
+        logger.exception("p0 whotalk local ASR failed")
+        return "", f"{e.__class__.__name__}: {e}"
+    finally:
+        if not _lark_env_truthy("P0_WHOTALK_ASR_KEEP_MEDIA"):
+            shutil.rmtree(workdir, ignore_errors=True)
+        else:
+            logger.info("p0 whotalk media kept at %s (P0_WHOTALK_ASR_KEEP_MEDIA=1)", workdir)
 
 
 def _p0_whotalk_ai(transcript: str) -> str:
@@ -10039,7 +10306,21 @@ def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_
                    "",
                    f"用法 / Usage: `{_p0_whotalk_trigger()} [妙记链接 | 会议链接 | 9位会议号]`（留空=最近一次机器人录制的会议 / empty = last bot-recorded meeting）"])
             return
-        transcript, terr = _p0_minutes_transcript(token)
+        transcript = ""
+        src = "Lark ASR"
+        if _p0_whotalk_asr_enabled():
+            transcript, aerr = _p0_whotalk_local_transcribe(token)
+            if transcript:
+                src = "本地识别 local ASR"
+            else:
+                logger.warning("p0 whotalk local ASR failed — falling back to Lark transcript: %s", aerr)
+                if rt and rv:
+                    _lark_send_text_auto(rt, rv,
+                                         f"⚠️ 本地语音识别失败，改用 Lark 转写 / local ASR failed, falling back to "
+                                         f"Lark transcript:\n{aerr}")
+        terr: Dict[str, Any] = {}
+        if not transcript:
+            transcript, terr = _p0_minutes_transcript(token)
         if not transcript:
             hint = ""
             low = f"{terr.get('code')} {terr.get('msg')}".lower()
@@ -10055,8 +10336,8 @@ def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_
             return
         if rt and rv:
             _lark_send_text_auto(rt, rv,
-                                 f"🎧 转写已取得（{len(transcript)} 字符），Qwen 正在整理，请稍候…\n"
-                                 f"Transcript fetched ({len(transcript)} chars) — Qwen is cleaning it up, please wait…")
+                                 f"🎧 转写已取得（{len(transcript)} 字符，来源/source: {src}），Qwen 正在整理，请稍候…\n"
+                                 f"Transcript fetched ({len(transcript)} chars via {src}) — Qwen is cleaning it up, please wait…")
         cleaned = _p0_whotalk_ai(transcript)
         _p0_send_answer(rt, rv, f"{_p0_whotalk_trigger()} — 谁说了什么 / who said what", cleaned)
     except Exception:
@@ -10340,7 +10621,8 @@ def _p0_vc_oauth_scopes() -> str:
     return _cfg_str(
         "P0_VC_OAUTH_SCOPES",
         "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly "
-        "contact:user.employee_id:readonly minutes:minutes.transcript:export",
+        "contact:user.employee_id:readonly minutes:minutes.transcript:export "
+        "minutes:minutes.media:export",
     ).strip()
 
 
