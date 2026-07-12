@@ -11285,12 +11285,15 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             time.sleep(0.34)  # docx write QPS limit — bursting many patches gets throttled
         tl_count = 0
         if timeline:
-            # Stage values must match the sheet dropdown options EXACTLY (no spaces, 调查原因);
-            # anything unmapped is written blank so the dropdown never gets an invalid value.
+            # Stage values must match the sheet's data-validation options EXACTLY — read live from
+            # the template: emoji prefix included, and "Detection" has a REAL trailing space.
+            # Anything unmapped is written blank so the dropdown never gets an invalid value.
             stage_label = {
-                "detection": "Detection(发现问题)", "investigation": "Investigation(调查原因)",
-                "mitigation": "Mitigation(执行修复)", "recovery": "Recovery(验证恢复)",
-                "closed": "Closed(事件关闭)",
+                "detection": "🔴 Detection(发现问题) ",
+                "investigation": "🟡 Investigation(调查原因)",
+                "mitigation": "🟠 Mitigation(执行修复)",
+                "recovery": "🔵 Recovery(验证恢复)",
+                "closed": "✅ Closed(事件关闭)",
             }
             # Preferred: append real rows into the Incident Log embedded sheet (Time|Stage|Event|Attachment).
             sheet_tok = _p0_docx_find_sheet_after(items, "Incident Log")
