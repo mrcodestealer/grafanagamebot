@@ -10953,7 +10953,7 @@ def _p0_p0docs_ai_updates(
         "Duration lines when metadata has meeting times, any [YYYY/MM/DD] date placeholder (metadata has "
         "the meeting date), and the '📝 Issue Summary' line (summarize the transcript in 1-2 sentences).\n"
         "4) 'Teams Involved' = the union of the speakers' teams from metadata (skip 'unknown team'). "
-        "NEVER fill the 'OSE On-duty' line — leave it untouched for manual filling.\n"
+        "NEVER fill the 'OSE On-duty' and 'Message Link' lines — leave them untouched for manual filling.\n"
         "5) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
         "placeholder part.\n"
         "6) \"timeline\": 3-15 KEY chronological events (detection, escalation, findings, fix actions, "
