@@ -10145,6 +10145,10 @@ def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
     turns = _p0_srt_turns(srt_raw.decode("utf-8", "replace"))
     if not turns:
         return "", "SRT parsed to zero speaker turns"
+    if not any(t.get("speaker") and t["speaker"] != "?" for t in turns):
+        # SRT layout is undocumented; if this export carries no recognizable speaker labels,
+        # a local transcript would lose all names — prefer the Lark text path (names known-good).
+        return "", "SRT export carried no speaker labels — using Lark transcript to keep names"
     media_url, merr = _p0_minutes_media_url(minute_token)
     if not media_url:
         return "", (f"media download-url failed: code={merr.get('code')} msg={merr.get('msg')} "
