@@ -10363,11 +10363,15 @@ def _p0_whotalk_ai(transcript: str) -> str:
         "You will receive a RAW speech-to-text meeting transcript with speaker names. "
         "It mixes Chinese and English and contains recognition errors.\n"
         "1) Fix obvious speech-recognition errors from context; NEVER invent content.\n"
-        "2) Keep strictly the turn format `Name: text`, one turn per line, preserving order "
-        "and every speaker.\n"
-        "3) If a line is (partly) Chinese, append an English translation on the same line as "
-        "`  ⇒ EN: ...`. Leave pure-English lines unchanged.\n"
-        "4) Output ONLY the cleaned transcript lines — no preamble, no summary, no commentary."
+        "2) For EACH speaker turn output EXACTLY this 3-line block, followed by ONE blank line:\n"
+        "<Speaker Name>\n"
+        "CN : <the utterance in Chinese>\n"
+        "EN: <the utterance in English>\n"
+        "3) The line matching the spoken language keeps the original wording (errors fixed); "
+        "the other line is your faithful translation. If a sentence mixes both languages, the "
+        "CN line keeps the inline English words as spoken.\n"
+        "4) Preserve turn order and every speaker; do not merge or drop turns.\n"
+        "5) Output ONLY these blocks — no preamble, no summary, no commentary."
     )
     lines = (transcript or "").splitlines()
     chunks: List[str] = []
