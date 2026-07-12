@@ -9914,6 +9914,20 @@ def _p0_minute_token_from_text(text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _p0_whotalk_last_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".p0_whotalk_last.json")
+
+
+def _p0_whotalk_last_load() -> Dict[str, Any]:
+    """Last-recording stash persisted across restarts (best-effort)."""
+    try:
+        with open(_p0_whotalk_last_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 def _p0_whotalk_resolve_minute_token(arg: str) -> Tuple[str, str]:
     """(minute_token, error). Resolve from a minutes link, meeting link/no, or the last recording."""
     a = (arg or "").strip()
@@ -9925,15 +9939,18 @@ def _p0_whotalk_resolve_minute_token(arg: str) -> Tuple[str, str]:
     url = ""
     with _p0_om_lock:
         last = dict(_p0_whotalk_last)
-        if not mno and last.get("meeting_no"):
-            mno = str(last.get("meeting_no") or "")
-            mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
-        elif mno and str(last.get("meeting_no") or "") == mno:
-            mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
-        if mno and not mid_:
+    if not last.get("meeting_no"):
+        last = _p0_whotalk_last_load()  # in-memory stash is wiped by restarts — fall back to disk
+    if not mno and last.get("meeting_no"):
+        mno = str(last.get("meeting_no") or "")
+        mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
+    elif mno and str(last.get("meeting_no") or "") == mno:
+        mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
+    if mno and not mid_:
+        with _p0_om_lock:
             rec = _p0_om_active.get(mno)
-            if rec:
-                mid_ = str(rec.get("meeting_id") or "")
+        if rec:
+            mid_ = str(rec.get("meeting_id") or "")
     if url:
         t = _p0_minute_token_from_text(url)
         if t:
@@ -12447,6 +12464,12 @@ def _p0_om_on_recording_ready(ce: Any) -> None:
         # Remember the last ready recording so a bare /whotalk can target "the last meeting".
         with _p0_om_lock:
             _p0_whotalk_last.update({"meeting_no": mno, "meeting_id": mid, "url": url, "ts": time.time()})
+            _last_snap = dict(_p0_whotalk_last)
+        try:  # persist across restarts (best-effort)
+            with open(_p0_whotalk_last_path(), "w", encoding="utf-8") as f:
+                json.dump(_last_snap, f)
+        except Exception:
+            logger.debug("p0 whotalk last-recording persist failed")
         host = _p0_om_host_open_id()
         if url and host:
             try:

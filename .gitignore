@@ -10,6 +10,7 @@ __pycache__/
 !.env.example
 # Stored admin OAuth user token for the /meeting report
 .p0_vc_token.json
+.p0_whotalk_last.json
 .p0_vc_token.json.tmp
 
 # Editor / OS
