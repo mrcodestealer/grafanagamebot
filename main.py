@@ -11284,6 +11284,7 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 first_err = first_err or perr
             time.sleep(0.34)  # docx write QPS limit — bursting many patches gets throttled
         tl_count = 0
+        tl_dup = 0
         if timeline:
             # Stage values must match the sheet's data-validation options EXACTLY — read live from
             # the template: emoji prefix included, and "Detection" has a REAL trailing space.
@@ -11297,15 +11298,26 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             }
             # Preferred: append real rows into the Incident Log embedded sheet (Time|Stage|Event|Attachment).
             sheet_tok = _p0_docx_find_sheet_after(items, "Incident Log")
+            handled_in_sheet = False
             if sheet_tok:
-                rows = [[t.get("time", ""), stage_label.get((t.get("stage") or "").strip().lower(), ""),
-                         t.get("event", ""), ""] for t in timeline]
-                ok, serr = _p0_sheet_append_rows(sheet_tok, rows)
-                if ok:
-                    tl_count = len(rows)
+                # Idempotency: a re-run on an already-filled doc must not duplicate rows.
+                existing_times = {r[0] for r in _p0_sheet_read_range(sheet_tok, "A1:A300") if r and r[0]}
+                fresh = [t for t in timeline if not (t.get("time") and t["time"] in existing_times)]
+                tl_dup = len(timeline) - len(fresh)
+                if tl_dup:
+                    logger.info("p0 p0docs timeline: %d rows already in the sheet — skipped", tl_dup)
+                if fresh:
+                    rows = [[t.get("time", ""), stage_label.get((t.get("stage") or "").strip().lower(), ""),
+                             t.get("event", ""), ""] for t in fresh]
+                    ok, serr = _p0_sheet_append_rows(sheet_tok, rows)
+                    if ok:
+                        tl_count = len(rows)
+                        handled_in_sheet = True
+                    else:
+                        logger.info("p0 p0docs sheet append failed (falling back to text lines): %s", serr)
                 else:
-                    logger.info("p0 p0docs sheet append failed (falling back to text lines): %s", serr)
-            if not tl_count:
+                    handled_in_sheet = True  # everything already present — nothing to append
+            if not handled_in_sheet:
                 # Fallback: text lines under the heading.
                 lines = []
                 for t in timeline:
@@ -11337,28 +11349,41 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                         logger.info("p0 p0docs metrics write failed: %s", merr2)
             else:
                 logger.info("p0 p0docs: no Response Metrics sheet found")
-        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d metrics=%d",
-                    document_id[:12], okc, failc, tl_count, mt_count)
-        tl_note = (f"，时间线 **{tl_count}** 条 / + **{tl_count}** timeline rows" if tl_count else "")
+        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d (dup-skipped=%d) metrics=%d",
+                    document_id[:12], okc, failc, tl_count, tl_dup, mt_count)
+        notes: List[str] = []
+        if okc:
+            notes.append(f"字段 **{okc}** 个 / **{okc}** fields")
+        if tl_count:
+            notes.append(f"时间线 **{tl_count}** 条 / **{tl_count}** timeline rows")
+        if tl_dup:
+            notes.append(f"时间线 {tl_dup} 条已存在（跳过）/ {tl_dup} timeline rows already present (skipped)")
         if mt_count:
-            tl_note += f"，指标 **{mt_count}** 项 / + **{mt_count}** metrics"
-        if okc and not failc:
-            _card("✅ 文档已填写 / doc filled", "green",
-                  [f"已填写 **{okc}** 个字段{tl_note}（不确定的字段保持原样）。/ Filled **{okc}** fields"
-                   f"{tl_note} (unknown fields left untouched).", f"[打开文档 / open the doc]({doc_link})"])
-        elif okc:
-            _card("⚠️ 部分填写 / partially filled", "orange",
-                  [f"成功 {okc}{tl_note}，失败 {failc}：`code={first_err.get('code')} msg={first_err.get('msg')}`",
-                   f"[打开文档 / open the doc]({doc_link})"])
-        else:
-            # nothing written — likely no edit permission; deliver the content in chat instead
+            notes.append(f"指标 **{mt_count}** 项 / **{mt_count}** metrics")
+        wrote_any = bool(okc or tl_count or mt_count)
+        if failc and not wrote_any:
+            # every write genuinely failed — permissions are the usual cause
             hint = ("应用需要 `docx:document`（编辑）权限并发布版本，且文档/知识库需以 **可编辑** 共享给应用。\n"
                     "Grant + publish the `docx:document` (edit) scope and share the doc/wiki with the app as EDITABLE.")
             _card("⚠️ 无法写入文档 / could not write doc", "red",
-                  [f"`code={first_err.get('code')}  msg={first_err.get('msg')}`", hint,
-                   "以下是生成的内容，可手动粘贴 / generated content below for manual paste:"])
+                  [f"`code={first_err.get('code')}  msg={first_err.get('msg')}  http={first_err.get('http')}`",
+                   hint, "以下是生成的内容，可手动粘贴 / generated content below for manual paste:"])
             filled = "\n".join(f"{u['text']}" for u in updates)
             _p0_send_answer(rt, rv, f"{_p0_p0docs_trigger()} — 填写内容 / filled fields", filled)
+        elif wrote_any:
+            _card("✅ 文档已填写 / doc filled" if not failc else "⚠️ 部分填写 / partially filled",
+                  "green" if not failc else "orange",
+                  ["已写入：" + "，".join(notes) + "（不确定的字段保持原样）。/ Written: " + ", ".join(notes)
+                   + " (unknown fields left untouched)."]
+                  + ([f"失败 {failc}：`code={first_err.get('code')} msg={first_err.get('msg')}`"] if failc else [])
+                  + [f"[打开文档 / open the doc]({doc_link})"])
+        else:
+            _card("ℹ️ 文档已是最新 / already up to date", "blue",
+                  ["模型给出的值与文档现有内容相同，没有需要写入的改动 — 是否在同一份文档上重复运行了？"
+                   + (f"（时间线 {tl_dup} 条已存在）" if tl_dup else ""),
+                   "The model's values match what's already in the doc — nothing to write. Did you re-run "
+                   "on an already-filled doc?" + (f" ({tl_dup} timeline rows already present)" if tl_dup else ""),
+                   f"[打开文档 / open the doc]({doc_link})"])
     except Exception:
         logger.exception("p0 p0docs worker failed")
         _card("⚠️ 内部错误 / internal error", "red", ["请查看服务器日志 / check the server logs."])
