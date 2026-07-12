@@ -10043,11 +10043,14 @@ def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_
         if not transcript:
             hint = ""
             low = f"{terr.get('code')} {terr.get('msg')}".lower()
-            if "permission" in low or "forbidden" in low or "99991" in low or "1655" in low:
-                hint = ("\n提示：应用需开通并发布 `minutes:minutes.transcript:export` 权限；若妙记归主持人所有，"
-                        "请把该权限加进 P0_VC_OAUTH_SCOPES 后由管理员重新 /vcauth。\n"
-                        "Grant + publish the `minutes:minutes.transcript:export` scope; for host-owned minutes, add it "
-                        "to P0_VC_OAUTH_SCOPES and have the admin re-run /vcauth.")
+            if "2091005" in low or "permission" in low or "forbidden" in low or "99991" in low or "1655" in low:
+                hint = ("\n提示：妙记**不支持**把权限分享给应用/机器人（与云文档不同），租户 token 永远无法访问 — "
+                        "必须由妙记**所有者（会议主持人）**完成 /vcauth → /vccode 授权。"
+                        "若已授权仍报错：检查该篇妙记的「谁可以下载视频、导出妙记」设置（所有者不受限制）。\n"
+                        "Minutes can NOT be shared to an app/bot (unlike cloud docs) — the tenant token can never access "
+                        "them. The minute's **owner (the meeting host)** must authorize once via /vcauth → /vccode. "
+                        "If already authorized and still denied: check the minute's \"who can download/export\" setting "
+                        "(the owner is always allowed).")
             _fail([f"导出转写失败 / transcript export failed: `code={terr.get('code')}  msg={terr.get('msg')}`{hint}"])
             return
         if rt and rv:
