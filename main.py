@@ -348,7 +348,10 @@ _CFG: Dict[str, Any] = {
     # Extra/override instruction for the model (empty = built-in bilingual cleanup prompt).
     "P0_WHOTALK_PROMPT": "",
     # Max transcript characters per model pass; longer transcripts are processed in chunks.
-    "P0_WHOTALK_CHUNK_CHARS": "9000",
+    # A pass that times out is automatically split in half and retried before falling back to raw.
+    "P0_WHOTALK_CHUNK_CHARS": "6000",
+    # Timeout per /whotalk cleanup pass (regenerating text + translations is slower than Q&A).
+    "P0_WHOTALK_QA_TIMEOUT_SECONDS": "900",
     # Lookback (hours) when resolving a bare meeting number to its meeting id via list_by_no.
     "P0_WHOTALK_LOOKBACK_HOURS": "72",
     # ---- /whotalk hybrid LOCAL ASR: the bot downloads the recording audio and transcribes it ----
@@ -10316,9 +10319,13 @@ def _p0_whotalk_ai(transcript: str) -> str:
     append an English translation to Chinese lines. Chunked to fit the context window."""
     url = _p0_qa_ollama_url()
     model = _p0_qa_model()
-    timeout = max(10.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))
+    timeout = max(
+        10.0,
+        _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
+                   max(900.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))),
+    )
     num_ctx = max(2048, _cfg_int("P0_QA_NUM_CTX", 16384))
-    chunk_chars = max(2000, _cfg_int("P0_WHOTALK_CHUNK_CHARS", 9000))
+    chunk_chars = max(2000, _cfg_int("P0_WHOTALK_CHUNK_CHARS", 6000))
     style = _cfg_str("P0_WHOTALK_PROMPT", "").strip() or (
         "You will receive a RAW speech-to-text meeting transcript with speaker names. "
         "It mixes Chinese and English and contains recognition errors.\n"
@@ -10341,26 +10348,50 @@ def _p0_whotalk_ai(transcript: str) -> str:
         size += len(ln) + 1
     if cur:
         chunks.append("\n".join(cur))
-    outs: List[str] = []
-    for i, ch in enumerate(chunks, 1):
+    def _pass(text_in: str) -> str:
         body: Dict[str, Any] = {
             "model": model,
             "stream": False,
             "messages": [
                 {"role": "system", "content": style},
-                {"role": "user", "content": ch},
+                {"role": "user", "content": text_in},
             ],
             "options": {"temperature": 0.1, "num_ctx": num_ctx},
             "think": False,
         }
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        return _p0_clean_answer(_monitoring_ai_extract_ollama_text(r.json()))
+
+    raw_banner = "⚠️（本段模型处理失败，以下为原文 / model failed on this section — raw text）\n"
+    outs: List[str] = []
+    for i, ch in enumerate(chunks, 1):
+        t = ""
         try:
-            r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
-            r.raise_for_status()
-            t = _p0_clean_answer(_monitoring_ai_extract_ollama_text(r.json()))
+            t = _pass(ch)
         except Exception:
             logger.exception("p0 whotalk model pass %d/%d failed", i, len(chunks))
-            t = "⚠️（本段模型处理失败，以下为原文 / model failed on this section — raw text）\n" + ch
-        outs.append(t or ch)
+        if not t and len(ch) > 2500:
+            # Usually a timeout on a long generation — halve the chunk and retry each part once.
+            mid = ch.rfind("\n", 0, len(ch) // 2)
+            if mid <= 0:
+                mid = len(ch) // 2
+            logger.info("p0 whotalk pass %d/%d: retrying as two halves (%d + %d chars)",
+                        i, len(chunks), mid, len(ch) - mid)
+            parts: List[str] = []
+            for half in (ch[:mid], ch[mid:]):
+                half = half.strip()
+                if not half:
+                    continue
+                try:
+                    parts.append(_pass(half) or half)
+                except Exception:
+                    logger.exception("p0 whotalk half-retry failed")
+                    parts.append(raw_banner + half)
+            t = "\n".join(parts)
+        if not t:
+            t = raw_banner + ch
+        outs.append(t)
         if len(chunks) > 1:
             logger.info("p0 whotalk model pass %d/%d done", i, len(chunks))
     return "\n".join(outs).strip()
