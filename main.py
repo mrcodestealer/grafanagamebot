@@ -377,7 +377,10 @@ _CFG: Dict[str, Any] = {
     # bilingual initial prompt that locks Whisper into mixed zh+en transcription.
     "P0_WHOTALK_WHISPER_MODEL": "medium",
     "P0_WHOTALK_WHISPER_LANG": "zh",
-    "P0_WHOTALK_WHISPER_PROMPT": "Hello, please transcribe this audio exactly as it is spoken. 这段音频包含英文和中文普通话混合，请准确记录下来。",
+    # Chinese-DOMINANT prompt with a code-switch example: keeps output in 汉字 for Chinese speech
+    # (an English-leading prompt makes Whisper translate instead of transcribe) while allowing
+    # inline English words.
+    "P0_WHOTALK_WHISPER_PROMPT": "以下是一段中英混合的工作会议对话，请按原话记录：中文写汉字，英文单词保留英文。例如：我们现在 check 一下这个 server 的 status，然后 update 给大家。",
     # Refuse to download recordings larger than this (MB). 0 = no limit.
     "P0_WHOTALK_ASR_MAX_MEDIA_MB": "1024",
     # Keep the downloaded media/wav files for debugging (default: delete after use).
@@ -10191,6 +10194,16 @@ def _p0_whotalk_engine_warm() -> None:
         _p0_whotalk_recognizer()
 
 
+# Signature Whisper silence-hallucinations (YouTube outro boilerplate, subtitle credits) and
+# echoes of our own initial prompt. A match means the segment was silence/noise — treat as empty
+# so the caller falls back to Lark's text for that turn.
+_P0_WHISPER_JUNK = re.compile(
+    r"(?i)(please like,? subscribe|like, subscribe, share|明镜|點點|点点栏目|不吝点赞|请点赞|"
+    r"订阅.{0,8}转发|thank you (so much )?for watching|字幕由|amara\.org|打赏支持|"
+    r"transcribe this audio|record it accurately|按原话记录|中英混合的(工作会议)?对话)"
+)
+
+
 def _p0_whotalk_decode(seg: Any, sr: int) -> str:
     """Transcribe one audio segment (float32 numpy) with the configured engine."""
     if _p0_whotalk_asr_engine() == "whisper":
@@ -10198,8 +10211,8 @@ def _p0_whotalk_decode(seg: Any, sr: int) -> str:
         lang = _cfg_str("P0_WHOTALK_WHISPER_LANG", "zh").strip() or None
         prompt = _cfg_str(
             "P0_WHOTALK_WHISPER_PROMPT",
-            "Hello, please transcribe this audio exactly as it is spoken. "
-            "这段音频包含英文和中文普通话混合，请准确记录下来。",
+            "以下是一段中英混合的工作会议对话，请按原话记录：中文写汉字，英文单词保留英文。"
+            "例如：我们现在 check 一下这个 server 的 status，然后 update 给大家。",
         ).strip() or None
         segments, _info = m.transcribe(
             seg,
@@ -10208,8 +10221,13 @@ def _p0_whotalk_decode(seg: Any, sr: int) -> str:
             initial_prompt=prompt,
             beam_size=5,
             condition_on_previous_text=False,  # reduces hallucination loops on short segments
+            vad_filter=True,  # skip silence — Whisper hallucinates YouTube boilerplate on it
         )
-        return "".join(s.text for s in segments).strip()
+        text = "".join(s.text for s in segments).strip()
+        if text and _P0_WHISPER_JUNK.search(text):
+            logger.info("p0 whotalk whisper junk suppressed: %r", text[:100])
+            return ""
+        return text
     rec = _p0_whotalk_recognizer()
     stream = rec.create_stream()
     stream.accept_waveform(sr, seg)
