@@ -10771,6 +10771,76 @@ def _p0_transcript_speaker_teams(transcript: str) -> List[str]:
     return out
 
 
+def _p0_srt_timed_transcript(minute_token: str, start_epoch: float) -> str:
+    """Speaker transcript with wall-clock [HH:MM:SS] markers from the SRT export; "" if unavailable.
+    Relative offsets are used when the meeting start time is unknown."""
+    raw, _err = _p0_minutes_export(
+        minute_token,
+        {"need_speaker": "true", "need_timestamp": "true", "file_format": "srt"},
+        "srt(p0docs)",
+    )
+    if not raw:
+        return ""
+    turns = _p0_srt_turns(raw.decode("utf-8", "replace"))
+    if not turns:
+        return ""
+    lines: List[str] = []
+    for t in turns:
+        if start_epoch:
+            ts = time.strftime("%H:%M:%S", time.localtime(start_epoch + float(t["start"])))
+        else:
+            s = int(t["start"])
+            ts = f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        lines.append(f"[{ts}] {t['speaker']}: {t['text']}")
+    return "\n".join(lines)
+
+
+def _p0_docx_find_sheet_after(items: List[Dict[str, Any]], heading_contains: str) -> str:
+    """Combined token ('<spreadsheet>_<sheetid>') of the first sheet block after the heading."""
+    seen_heading = False
+    for b in items:
+        if not seen_heading:
+            _k, txt = _p0_docx_block_text(b)
+            if txt and heading_contains.lower() in txt.lower():
+                seen_heading = True
+            continue
+        try:
+            btype = int(b.get("block_type") or 0)
+        except (TypeError, ValueError):
+            btype = 0
+        if btype == 30:  # embedded sheet
+            tok = str((b.get("sheet") or {}).get("token") or "")
+            if tok:
+                return tok
+    return ""
+
+
+def _p0_sheet_append_rows(combined_token: str, rows: List[List[str]]) -> Tuple[bool, Dict[str, Any]]:
+    """Append rows to an embedded sheet (scope sheets:spreadsheet; doc must be editable)."""
+    if "_" not in combined_token:
+        return False, {"code": "BAD_TOKEN", "msg": f"unexpected sheet token {combined_token!r}"}
+    stoken, sid = combined_token.split("_", 1)
+    body = {"valueRange": {"range": f"{sid}!A:D", "values": rows}}
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.post(
+                f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{stoken}/values_append",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True, {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+        logger.info("p0 p0docs sheet append via %s token failed: %s", kind, last_err)
+    return False, last_err
+
+
 def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tuple[bool, Dict[str, Any]]:
     body = {"update_text_elements": {"elements": [{"text_run": {"content": new_text}}]}}
     last_err: Dict[str, Any] = {}
@@ -10794,8 +10864,8 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
 
 
 def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
-                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], List[str], str]:
-    """([{id, text}], timeline_lines, error). Ask Qwen which blocks to fill; unknown fields omitted."""
+                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], str]:
+    """([{id, text}], [{time, stage, event}], error). Ask Qwen which blocks to fill; unknown omitted."""
     url = _p0_qa_ollama_url()
     model = _p0_qa_model()
     timeout = max(10.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
@@ -10831,10 +10901,13 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         "'OSE On-duty' = the speakers whose team contains 'OSE'.\n"
         "5) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
         "placeholder part.\n"
-        "6) \"timeline\": 3-10 short chronological entries of the incident, each starting with the fitting "
-        "stage emoji — 🔴 Detection, 🟡 Investigation, 🟠 Mitigation, 🔵 Recovery, 🟢 Closed — e.g. "
-        "\"🟡 Investigation — Reynold: SDK 资源加载 100ms 内失败，怀疑网络供应商限制域名\". "
-        "Name the people involved. Empty list if the transcript is too unclear.\n"
+        "6) \"timeline\": 3-15 KEY chronological events (detection, escalation, findings, fix actions, "
+        "verification — not every sentence), each as an object "
+        "{\"time\": \"HH:MM:SS\", \"stage\": \"<Detection|Investigation|Mitigation|Recovery|Closed>\", "
+        "\"event\": \"<who did/said what>\"}. Take the time from the [HH:MM:SS] marker of the transcript "
+        "line the event comes from. Name the people involved, e.g. "
+        "{\"time\": \"22:03:15\", \"stage\": \"Investigation\", \"event\": \"Reynold: SDK 资源加载 100ms 内"
+        "失败，怀疑网络供应商限制域名\"}. Empty list if the transcript is too unclear.\n"
         "7) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
         "as the transcript dictates).\n"
         "8) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
@@ -10862,9 +10935,16 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
     except Exception:
         logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
         return [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
-    timeline: List[str] = []
+    timeline: List[Dict[str, str]] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("timeline"), list):
-        timeline = [str(t).strip() for t in parsed["timeline"] if str(t or "").strip()][:15]
+        for t in parsed["timeline"][:15]:
+            if isinstance(t, dict):
+                ev = str(t.get("event") or t.get("text") or "").strip()
+                if ev:
+                    timeline.append({"time": str(t.get("time") or "").strip(),
+                                     "stage": str(t.get("stage") or "").strip(), "event": ev})
+            elif isinstance(t, str) and t.strip():
+                timeline.append({"time": "", "stage": "", "event": t.strip()})
     if isinstance(parsed, dict) and isinstance(parsed.get("updates"), list):
         ups = parsed["updates"]
     elif isinstance(parsed, list):
@@ -10968,12 +11048,21 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
         teams = _p0_transcript_speaker_teams(transcript)
         if teams:
             meta["speakers and their teams (from contact directory)"] = "; ".join(teams)
+        # Prefer the SRT-timed transcript so the model can put real times on timeline rows.
+        start_epoch = 0.0
+        try:
+            if meta.get("meeting start time"):
+                start_epoch = time.mktime(time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
+        except (ValueError, OverflowError):
+            pass
+        timed = _p0_srt_timed_transcript(token, start_epoch)
+        model_transcript = timed or transcript
         if rt and rv:
             _lark_send_text_auto(rt, rv,
                                  f"📝 转写已取得（{len(transcript)} 字符），Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
                                  f"Transcript fetched ({len(transcript)} chars) — Qwen is filling the doc "
                                  f"({len(blocks)} blocks), please wait…")
-        updates, timeline, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
+        updates, timeline, uerr = _p0_p0docs_ai_updates(blocks, model_transcript, meta)
         if uerr:
             _card("⚠️ 填写失败 / fill failed", "red", [uerr])
             return
@@ -10993,9 +11082,32 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 first_err = first_err or perr
         tl_count = 0
         if timeline:
-            tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", timeline)
+            stage_label = {
+                "detection": "Detection (发现问题)", "investigation": "Investigation (调查分析)",
+                "mitigation": "Mitigation (执行修复)", "recovery": "Recovery (验证恢复)",
+                "closed": "Closed (事件关闭)",
+            }
+            # Preferred: append real rows into the Incident Log embedded sheet (Time|Stage|Event|Attachment).
+            sheet_tok = _p0_docx_find_sheet_after(items, "Incident Log")
+            if sheet_tok:
+                rows = [[t.get("time", ""), stage_label.get((t.get("stage") or "").lower(), t.get("stage", "")),
+                         t.get("event", ""), ""] for t in timeline]
+                ok, serr = _p0_sheet_append_rows(sheet_tok, rows)
+                if ok:
+                    tl_count = len(rows)
+                else:
+                    logger.info("p0 p0docs sheet append failed (falling back to text lines): %s", serr)
             if not tl_count:
-                logger.info("p0 p0docs timeline insert failed: %s", tlerr)
+                # Fallback: text lines under the heading.
+                lines = []
+                for t in timeline:
+                    parts = [p for p in (f"[{t['time']}]" if t.get("time") else "",
+                                         stage_label.get((t.get("stage") or "").lower(), t.get("stage", "")),
+                                         t.get("event", "")) if p]
+                    lines.append(" ".join(parts))
+                tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", lines)
+                if not tl_count:
+                    logger.info("p0 p0docs timeline insert failed: %s", tlerr)
         logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d",
                     document_id[:12], okc, failc, tl_count)
         tl_note = (f"，时间线 **{tl_count}** 条 / + **{tl_count}** timeline entries" if tl_count else "")
