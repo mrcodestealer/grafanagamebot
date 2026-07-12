@@ -10235,12 +10235,22 @@ def _p0_whotalk_decode(seg: Any, sr: int) -> str:
     return (stream.result.text or "").strip()
 
 
-def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
+def _p0_whotalk_local_transcribe(minute_token: str, with_times: bool = False,
+                                 start_epoch: float = 0.0) -> Tuple[str, str]:
     """(transcript_text, error). Hybrid local ASR:
 
     speaker names + timestamps from the Minutes SRT export; the TEXT of each turn is
-    re-transcribed from the actual recording audio by local SenseVoice (sherpa-onnx).
+    re-transcribed from the actual recording audio by the local engine. With ``with_times``,
+    each line is prefixed [HH:MM:SS] (wall clock when ``start_epoch`` is known, else relative).
     """
+
+    def _tprefix(turn_start: float) -> str:
+        if not with_times:
+            return ""
+        if start_epoch:
+            return "[" + time.strftime("%H:%M:%S", time.localtime(start_epoch + turn_start)) + "] "
+        s = int(turn_start)
+        return f"[{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}] "
     import numpy as np  # deferred: only needed when local ASR is enabled
 
     srt_raw, err = _p0_minutes_export(
@@ -10321,15 +10331,15 @@ def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
             if b - a < 0.2:
                 # window vanished (fully overlapped cross-talk) — keep Lark's text, don't drop the turn
                 if turn.get("text"):
-                    lines.append(f"{turn['speaker']}: {turn['text']}")
+                    lines.append(f"{_tprefix(float(turn['start']))}{turn['speaker']}: {turn['text']}")
                 continue
             seg = samples[int(a * sr):int(b * sr)]
             text = _p0_whotalk_decode(seg, sr)
             if text:
-                lines.append(f"{turn['speaker']}: {text}")
+                lines.append(f"{_tprefix(float(turn['start']))}{turn['speaker']}: {text}")
             elif turn.get("text"):
                 # local ASR heard nothing — keep Lark's text rather than dropping the turn
-                lines.append(f"{turn['speaker']}: {turn['text']}")
+                lines.append(f"{_tprefix(float(turn['start']))}{turn['speaker']}: {turn['text']}")
         logger.info("p0 whotalk local ASR (%s) done: %d turns, %.1fs audio, %.1fs compute",
                     _p0_whotalk_asr_engine(), len(lines), total_s, time.time() - t0)
         if not lines:
@@ -10740,7 +10750,8 @@ def _p0_transcript_speaker_teams(transcript: str) -> List[str]:
     names: List[str] = []
     seen: Set[str] = set()
     for ln in (transcript or "").splitlines():
-        m = re.match(r"^\s*([^:：\n]{1,40})[:：]", ln)
+        # tolerate a leading [HH:MM:SS] time marker before the speaker name
+        m = re.match(r"^\s*(?:\[[0-9:]{4,10}\]\s*)?([^:：\[\n]{1,40})[:：]", ln)
         if m:
             n = m.group(1).strip()
             if n and n.lower() not in seen:
@@ -11089,16 +11100,6 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
         if not token:
             _card("⚠️ 会议无法解析 / meeting not resolved", "red", [err])
             return
-        transcript = ""
-        if _lark_env_truthy("P0_P0DOCS_USE_LOCAL_ASR") and _p0_whotalk_asr_enabled():
-            transcript, _aerr = _p0_whotalk_local_transcribe(token)
-        if not transcript:
-            transcript, terr = _p0_minutes_transcript(token)
-        if not transcript:
-            _card("⚠️ 无法取得转写 / transcript unavailable", "red",
-                  [f"`code={terr.get('code')}  msg={terr.get('msg')}`",
-                   "参考 /whotalk 的权限要求 / see /whotalk permission requirements"])
-            return
 
         items, berr = _p0_docx_blocks_raw(document_id)
         blocks = _p0_docx_extract_text(items)
@@ -11118,24 +11119,42 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             "today's date": time.strftime("%Y/%m/%d"),
         }
         meta.update(_p0_minutes_meta(token))  # real start/end/duration/title when scope allows
-        teams = _p0_transcript_speaker_teams(transcript)
-        if teams:
-            meta["speakers and their teams (from contact directory)"] = "; ".join(teams)
-        # Prefer the SRT-timed transcript so the model can put real times on timeline rows.
         start_epoch = 0.0
         try:
             if meta.get("meeting start time"):
                 start_epoch = time.mktime(time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
         except (ValueError, OverflowError):
             pass
-        timed = _p0_srt_timed_transcript(token, start_epoch)
-        model_transcript = timed or transcript
+        # Transcript for the model — timed, and heard LOCALLY when P0_P0DOCS_USE_LOCAL_ASR=1
+        # (times from the SRT, text from the local engine). Falls back Lark-timed → Lark-plain.
+        transcript = ""
+        src = "Lark ASR"
+        if _lark_env_truthy("P0_P0DOCS_USE_LOCAL_ASR") and _p0_whotalk_asr_enabled():
+            transcript, aerr = _p0_whotalk_local_transcribe(token, with_times=True, start_epoch=start_epoch)
+            if transcript:
+                src = f"本地识别 local ASR ({_p0_whotalk_asr_engine()})"
+            else:
+                logger.warning("p0 p0docs local ASR failed — falling back to Lark transcript: %s", aerr)
+        if not transcript:
+            transcript = _p0_srt_timed_transcript(token, start_epoch)
+        terr: Dict[str, Any] = {}
+        if not transcript:
+            transcript, terr = _p0_minutes_transcript(token)
+        if not transcript:
+            _card("⚠️ 无法取得转写 / transcript unavailable", "red",
+                  [f"`code={terr.get('code')}  msg={terr.get('msg')}`",
+                   "参考 /whotalk 的权限要求 / see /whotalk permission requirements"])
+            return
+        teams = _p0_transcript_speaker_teams(transcript)
+        if teams:
+            meta["speakers and their teams (from contact directory)"] = "; ".join(teams)
         if rt and rv:
             _lark_send_text_auto(rt, rv,
-                                 f"📝 转写已取得（{len(transcript)} 字符），Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
-                                 f"Transcript fetched ({len(transcript)} chars) — Qwen is filling the doc "
-                                 f"({len(blocks)} blocks), please wait…")
-        updates, timeline, metrics, uerr = _p0_p0docs_ai_updates(blocks, model_transcript, meta)
+                                 f"📝 转写已取得（{len(transcript)} 字符，来源/source: {src}），"
+                                 f"Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
+                                 f"Transcript fetched ({len(transcript)} chars via {src}) — Qwen is filling "
+                                 f"the doc ({len(blocks)} blocks), please wait…")
+        updates, timeline, metrics, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
         if uerr:
             _card("⚠️ 填写失败 / fill failed", "red", [uerr])
             return
