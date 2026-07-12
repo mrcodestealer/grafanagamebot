@@ -10686,14 +10686,20 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         "INPUT 2 is known metadata. INPUT 3 is the raw meeting transcript (mixed Chinese/English, "
         "has speech-recognition errors).\n"
         "Rules:\n"
-        "1) Output ONLY JSON: {\"updates\": [{\"id\": \"<block_id>\", \"text\": \"<full new text for that block>\"}]}.\n"
-        "2) Include a block ONLY when the transcript or metadata clearly answers it — if you do not "
-        "know, DO NOT include that block at all. Never guess or invent facts, names, numbers or links.\n"
-        "3) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
-        "placeholder part, e.g. `🕐 Start Time: 21:05`.\n"
-        "4) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
-        "as the transcript dictates). Timeline entries: short factual lines with the speaker's name.\n"
-        "5) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
+        "1) Output ONLY JSON: {\"updates\": [{\"id\": \"<block_id>\", \"text\": \"<full new text for that block>\"}]}. "
+        "The id must be copied EXACTLY from between the square brackets of INPUT 1, e.g. "
+        "{\"updates\": [{\"id\": \"doxlgwNC3X\", \"text\": \"🕐 Start Time: 21:05\"}]}.\n"
+        "2) Fill every field the transcript or metadata answers, even partially (e.g. teams that were "
+        "clearly involved, a summary of the issue discussed, the fix that was applied). Only omit a "
+        "field when you truly have no information for it. Never invent names, numbers or links.\n"
+        "3) ALWAYS fill when present: the '📹 Meeting Recording' line (metadata has the link), any "
+        "[YYYY/MM/DD] date placeholder (metadata has today's date), and the '📝 Issue Summary' line "
+        "(summarize the transcript in 1-2 sentences).\n"
+        "4) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
+        "placeholder part.\n"
+        "5) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
+        "as the transcript dictates).\n"
+        "6) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
     )
     user = (f"INPUT 1 — DOCUMENT BLOCKS:\n{doc_lines}\n\n"
             f"INPUT 2 — METADATA:\n{meta_lines or '-'}\n\n"
@@ -10715,27 +10721,43 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         return [], "模型调用失败/超时 / model call failed or timed out — check the journal"
     try:
         parsed = json.loads(raw)
-        ups = parsed.get("updates") if isinstance(parsed, dict) else None
-        if not isinstance(ups, list):
-            return [], "模型没有返回 updates 列表 / model returned no updates list"
-        valid_ids = {b["id"]: b for b in blocks if b.get("id")}
-        out: List[Dict[str, str]] = []
-        seen: Set[str] = set()
-        for u in ups:
-            if not isinstance(u, dict):
-                continue
-            bid = str(u.get("id") or "").strip()
-            txt = str(u.get("text") or "").strip()
-            if not bid or not txt or bid not in valid_ids or bid in seen:
-                continue
-            if txt == (valid_ids[bid].get("text") or "").strip():
-                continue  # no-op
-            seen.add(bid)
-            out.append({"id": bid, "text": txt[:2000]})
-        return out, ""
     except Exception:
-        logger.exception("p0 p0docs JSON parse failed: %r", raw[:300])
-        return [], "模型输出不是有效 JSON / model output was not valid JSON"
+        logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
+        return [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+    if isinstance(parsed, dict) and isinstance(parsed.get("updates"), list):
+        ups = parsed["updates"]
+    elif isinstance(parsed, list):
+        ups = parsed
+    elif isinstance(parsed, dict):
+        # tolerate a plain {"<block_id>": "<text>"} mapping
+        ups = [{"id": k, "text": v} for k, v in parsed.items() if isinstance(v, str)]
+    else:
+        ups = []
+    valid_ids = {b["id"]: b for b in blocks if b.get("id")}
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    bad_ids: List[str] = []
+    for u in ups:
+        if not isinstance(u, dict):
+            continue
+        bid = str(u.get("id") or u.get("block_id") or "").strip().strip("[]")
+        txt = str(u.get("text") or u.get("new_text") or "").strip()
+        if not bid or not txt or bid in seen:
+            continue
+        if bid not in valid_ids:
+            bad_ids.append(bid)
+            continue
+        if txt == (valid_ids[bid].get("text") or "").strip():
+            continue  # no-op
+        seen.add(bid)
+        out.append({"id": bid, "text": txt[:2000]})
+    logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s; raw head=%r",
+                len(ups), len(out), len(bad_ids),
+                (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), (raw or "")[:300])
+    if ups and not out and bad_ids:
+        return [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model returned "
+                    f"{len(ups)} updates but no block ids matched — see journal for its raw output")
+    return out, ""
 
 
 def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
