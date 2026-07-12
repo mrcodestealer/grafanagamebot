@@ -358,12 +358,23 @@ _CFG: Dict[str, Any] = {
     # Extra scope needed: minutes:minutes.media:export (console + P0_VC_OAUTH_SCOPES + re-/vcauth).
     # Falls back to the Lark transcript automatically on any failure.
     "P0_WHOTALK_ASR_ENABLE": "0",
+    # Engine: sensevoice (fast, ~1GB) or whisper (faster-whisper; slower, strong MY/SG code-switching).
+    "P0_WHOTALK_ASR_ENGINE": "sensevoice",
     # Model dir holding model(.int8).onnx + tokens.txt; empty = <app>/models/sensevoice.
     "P0_WHOTALK_ASR_MODEL_DIR": "",
     "P0_WHOTALK_ASR_THREADS": "4",
-    # Padding added around each speaker segment when slicing audio (ms), and max merged-turn length (s).
+    # Padding added around each speaker segment when slicing audio (ms) — clamped so segments
+    # never overlap a neighboring turn (prevents one speaker's words leaking into another's line).
     "P0_WHOTALK_ASR_SEG_PAD_MS": "150",
-    "P0_WHOTALK_ASR_MAX_TURN_SECONDS": "28",
+    # Merge consecutive same-speaker subtitles only when the gap is under this (ms), and cap the
+    # merged turn length (s). Smaller values keep rapid exchanges attributed to the right person.
+    "P0_WHOTALK_ASR_MERGE_GAP_MS": "800",
+    "P0_WHOTALK_ASR_MAX_TURN_SECONDS": "15",
+    # faster-whisper settings (engine=whisper): model size/path, forced base language, and the
+    # bilingual initial prompt that locks Whisper into mixed zh+en transcription.
+    "P0_WHOTALK_WHISPER_MODEL": "medium",
+    "P0_WHOTALK_WHISPER_LANG": "zh",
+    "P0_WHOTALK_WHISPER_PROMPT": "Hello, please transcribe this audio exactly as it is spoken. 这段音频包含英文和中文普通话混合，请准确记录下来。",
     # Refuse to download recordings larger than this (MB). 0 = no limit.
     "P0_WHOTALK_ASR_MAX_MEDIA_MB": "1024",
     # Keep the downloaded media/wav files for debugging (default: delete after use).
@@ -10034,7 +10045,8 @@ def _p0_srt_turns(srt_text: str) -> List[Dict[str, Any]]:
     Consecutive entries by the same speaker are merged when the gap is small, capped at
     P0_WHOTALK_ASR_MAX_TURN_SECONDS so segments stay inside SenseVoice's comfort zone.
     """
-    max_turn = max(5.0, _cfg_float("P0_WHOTALK_ASR_MAX_TURN_SECONDS", 28.0))
+    max_turn = max(5.0, _cfg_float("P0_WHOTALK_ASR_MAX_TURN_SECONDS", 15.0))
+    merge_gap = max(0.0, _cfg_float("P0_WHOTALK_ASR_MERGE_GAP_MS", 800.0)) / 1000.0
     entries: List[Dict[str, Any]] = []
     speaker = "?"
     for block in re.split(r"\n\s*\n", srt_text or ""):
@@ -10057,7 +10069,7 @@ def _p0_srt_turns(srt_text: str) -> List[Dict[str, Any]]:
     for e in entries:
         last = turns[-1] if turns else None
         if (last is not None and last["speaker"] == e["speaker"]
-                and e["start"] - last["end"] <= 1.5
+                and e["start"] - last["end"] <= merge_gap
                 and e["end"] - last["start"] <= max_turn):
             last["end"] = e["end"]
             last["text"] = (last["text"] + " " + e["text"]).strip()
@@ -10127,6 +10139,66 @@ def _p0_whotalk_recognizer() -> Any:
         return _p0_asr_recognizer
 
 
+_p0_whisper_model: Any = None
+
+
+def _p0_whotalk_whisper() -> Any:
+    """Lazy-loaded faster-whisper model (engine=whisper). Downloads from HF hub on first use —
+    on networks where huggingface.co is slow/blocked, set HF_ENDPOINT=https://hf-mirror.com in .env."""
+    global _p0_whisper_model
+    with _p0_asr_lock:
+        if _p0_whisper_model is not None:
+            return _p0_whisper_model
+        from faster_whisper import WhisperModel  # deferred: only needed for engine=whisper
+
+        name = _cfg_str("P0_WHOTALK_WHISPER_MODEL", "medium").strip() or "medium"
+        _p0_whisper_model = WhisperModel(
+            name, device="cpu", compute_type="int8",
+            cpu_threads=max(1, _cfg_int("P0_WHOTALK_ASR_THREADS", 4)),
+        )
+        logger.info("p0 whotalk whisper loaded: %s (int8)", name)
+        return _p0_whisper_model
+
+
+def _p0_whotalk_asr_engine() -> str:
+    e = _cfg_str("P0_WHOTALK_ASR_ENGINE", "sensevoice").strip().lower()
+    return e if e in ("sensevoice", "whisper") else "sensevoice"
+
+
+def _p0_whotalk_engine_warm() -> None:
+    """Load the selected engine up-front so a broken install fails fast, before any download."""
+    if _p0_whotalk_asr_engine() == "whisper":
+        _p0_whotalk_whisper()
+    else:
+        _p0_whotalk_recognizer()
+
+
+def _p0_whotalk_decode(seg: Any, sr: int) -> str:
+    """Transcribe one audio segment (float32 numpy) with the configured engine."""
+    if _p0_whotalk_asr_engine() == "whisper":
+        m = _p0_whotalk_whisper()
+        lang = _cfg_str("P0_WHOTALK_WHISPER_LANG", "zh").strip() or None
+        prompt = _cfg_str(
+            "P0_WHOTALK_WHISPER_PROMPT",
+            "Hello, please transcribe this audio exactly as it is spoken. "
+            "这段音频包含英文和中文普通话混合，请准确记录下来。",
+        ).strip() or None
+        segments, _info = m.transcribe(
+            seg,
+            task="transcribe",
+            language=lang,
+            initial_prompt=prompt,
+            beam_size=5,
+            condition_on_previous_text=False,  # reduces hallucination loops on short segments
+        )
+        return "".join(s.text for s in segments).strip()
+    rec = _p0_whotalk_recognizer()
+    stream = rec.create_stream()
+    stream.accept_waveform(sr, seg)
+    rec.decode_stream(stream)
+    return (stream.result.text or "").strip()
+
+
 def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
     """(transcript_text, error). Hybrid local ASR:
 
@@ -10191,7 +10263,7 @@ def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
         if proc.returncode != 0 or not os.path.isfile(wav_path):
             tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
             return "", f"ffmpeg failed (rc={proc.returncode}): {tail}"
-        rec = _p0_whotalk_recognizer()
+        _p0_whotalk_engine_warm()
         with wave.open(wav_path, "rb") as wf:
             sr = wf.getframerate()
             nch = wf.getnchannels()
@@ -10203,23 +10275,27 @@ def _p0_whotalk_local_transcribe(minute_token: str) -> Tuple[str, str]:
         pad = max(0.0, _cfg_float("P0_WHOTALK_ASR_SEG_PAD_MS", 150.0)) / 1000.0
         lines: List[str] = []
         t0 = time.time()
-        for i, turn in enumerate(turns, 1):
-            a = max(0.0, float(turn["start"]) - pad)
-            b = min(total_s, float(turn["end"]) + pad)
+        for i, turn in enumerate(turns):
+            # Clamp the padded window so it never reaches into a neighboring turn — otherwise a
+            # rapid exchange gets transcribed twice and one speaker's words leak into the other's line.
+            prev_end = float(turns[i - 1]["end"]) if i > 0 else 0.0
+            next_start = float(turns[i + 1]["start"]) if i + 1 < len(turns) else total_s
+            a = max(0.0, float(turn["start"]) - pad, prev_end - 0.05)
+            b = min(total_s, float(turn["end"]) + pad, next_start + 0.05)
             if b - a < 0.2:
+                # window vanished (fully overlapped cross-talk) — keep Lark's text, don't drop the turn
+                if turn.get("text"):
+                    lines.append(f"{turn['speaker']}: {turn['text']}")
                 continue
             seg = samples[int(a * sr):int(b * sr)]
-            stream = rec.create_stream()
-            stream.accept_waveform(sr, seg)
-            rec.decode_stream(stream)
-            text = (stream.result.text or "").strip()
+            text = _p0_whotalk_decode(seg, sr)
             if text:
                 lines.append(f"{turn['speaker']}: {text}")
             elif turn.get("text"):
                 # local ASR heard nothing — keep Lark's text rather than dropping the turn
                 lines.append(f"{turn['speaker']}: {turn['text']}")
-        logger.info("p0 whotalk local ASR done: %d turns, %.1fs audio, %.1fs compute",
-                    len(lines), total_s, time.time() - t0)
+        logger.info("p0 whotalk local ASR (%s) done: %d turns, %.1fs audio, %.1fs compute",
+                    _p0_whotalk_asr_engine(), len(lines), total_s, time.time() - t0)
         if not lines:
             return "", "local ASR produced no text"
         return "\n".join(lines), ""
@@ -10315,7 +10391,7 @@ def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_
         if _p0_whotalk_asr_enabled():
             transcript, aerr = _p0_whotalk_local_transcribe(token)
             if transcript:
-                src = "本地识别 local ASR"
+                src = f"本地识别 local ASR ({_p0_whotalk_asr_engine()})"
             else:
                 logger.warning("p0 whotalk local ASR failed — falling back to Lark transcript: %s", aerr)
                 if rt and rv:

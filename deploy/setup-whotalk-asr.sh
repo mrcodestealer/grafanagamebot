@@ -25,15 +25,21 @@ MODEL_URL="${MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/
 echo "==> whotalk ASR setup: APP_DIR=$APP_DIR PY_BIN=$PY_BIN"
 [ -x "$PY_BIN" ] || { echo "FATAL: PY_BIN '$PY_BIN' not executable — pass PY_BIN=<service python>"; exit 1; }
 
-# 1) python deps (the wheel bundles onnxruntime; no torch needed)
-echo "==> pip install sherpa-onnx numpy"
-"$PY_BIN" -m pip install -q --upgrade sherpa-onnx numpy || {
+# 1) python deps (sherpa-onnx bundles onnxruntime; faster-whisper enables the whisper engine;
+#    no torch needed for either)
+echo "==> pip install sherpa-onnx numpy faster-whisper"
+"$PY_BIN" -m pip install -q --upgrade sherpa-onnx numpy faster-whisper || {
   echo "WARN: pip install failed — retrying with aliyun mirror"
-  "$PY_BIN" -m pip install -q -i https://mirrors.aliyun.com/pypi/simple/ --upgrade sherpa-onnx numpy
+  "$PY_BIN" -m pip install -q -i https://mirrors.aliyun.com/pypi/simple/ --upgrade sherpa-onnx numpy faster-whisper
 }
 "$PY_BIN" - <<'PY' || { echo "FATAL: sherpa_onnx/numpy not importable"; exit 1; }
 import numpy, sherpa_onnx
 print("deps OK: sherpa-onnx", getattr(sherpa_onnx, "__version__", "?"))
+try:
+    import faster_whisper
+    print("deps OK: faster-whisper", getattr(faster_whisper, "__version__", "?"))
+except Exception as e:
+    print("NOTE: faster-whisper unavailable (%s) — engine=whisper won't work, sensevoice unaffected" % e)
 PY
 
 # 2) ffmpeg
@@ -102,4 +108,7 @@ echo "  2. Ensure it is in P0_VC_OAUTH_SCOPES, then owner re-runs /vcauth -> /vc
 echo "  3. sed -i 's/^P0_WHOTALK_ASR_ENABLE=.*/P0_WHOTALK_ASR_ENABLE=1/' $APP_DIR/.env"
 echo "     (or add the line), then: systemctl restart p0bot"
 echo "  4. /whotalk — the fetched message should say 来源/source: 本地识别 local ASR"
+echo "  5. Optional: P0_WHOTALK_ASR_ENGINE=whisper switches to faster-whisper (medium, int8)."
+echo "     First whisper run downloads the model from Hugging Face — if blocked/slow, add"
+echo "     HF_ENDPOINT=https://hf-mirror.com to .env first."
 echo "-----------------------------------------------------------------------"
