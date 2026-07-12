@@ -11049,6 +11049,22 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
     return False, last_err
 
 
+def _p0_strip_template_tail(text: str, aggressive: bool) -> str:
+    """Remove trailing template markers ('Template Copy', '副本', …) from a filled value.
+
+    aggressive=True (title/page block) also strips bare trailing 'Template'/'Copy'; other blocks
+    only lose the unambiguous combinations so real content ending in 'copy' isn't damaged."""
+    extra = r"|template|copy" if aggressive else r""
+    pat = re.compile(r"\s*[-–—]?\s*(template\s+copy|template\s*副本|副本" + extra + r")\s*$",
+                     re.IGNORECASE)
+    t = text or ""
+    while True:
+        t2 = pat.sub("", t)
+        if t2 == t:
+            return t.strip()
+        t = t2
+
+
 def _p0_p0docs_ai_updates(
     blocks: List[Dict[str, str]], transcript: str, meta: Dict[str, str],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], str]:
@@ -11303,6 +11319,22 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                   ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence.",
                    "journal 里有模型原始输出 / the model's raw output is in the journal (`p0 p0docs model:`)"])
             return
+        # Deterministic template-marker cleanup — the model keeps 'Template Copy' despite prompt
+        # rules, so enforce in code: clean every filled value, and if the model didn't rewrite the
+        # title at all, synthesize the cleanup ourselves.
+        page_ids = {b["id"] for b in blocks if b.get("kind") == "page"}
+        for u in updates:
+            u["text"] = _p0_strip_template_tail(u["text"], aggressive=(u["id"] in page_ids))
+        updates = [u for u in updates if u["text"]]
+        for b in blocks:
+            if b.get("kind") != "page":
+                continue
+            cur = (b.get("text") or "").strip()
+            cleaned = _p0_strip_template_tail(cur, aggressive=True)
+            if cleaned and cleaned != cur and not any(u["id"] == b["id"] for u in updates):
+                updates.append({"id": b["id"], "text": cleaned})
+            break
+
         okc, failc = 0, 0
         first_err: Dict[str, Any] = {}
         for u in updates:
