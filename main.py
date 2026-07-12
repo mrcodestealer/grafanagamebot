@@ -337,6 +337,17 @@ _CFG: Dict[str, Any] = {
     "P0_CONTACTS_FILE": "",
     # After answering, if the answer names anyone in the directory, append their phone(s). 1=on.
     "P0_CONTACTS_APPEND_ENABLE": "1",
+    # ---- /whotalk — who-said-what transcript of a recorded meeting (Lark Minutes ASR ----
+    # for speaker names + raw text, then the local Qwen cleans zh/en errors and translates;
+    # Lark's own translation is not used). Requires tenant Minutes enabled + minutes scopes.
+    "P0_WHOTALK_ENABLE": "1",
+    "P0_WHOTALK_TRIGGER": "/whotalk",
+    # Extra/override instruction for the model (empty = built-in bilingual cleanup prompt).
+    "P0_WHOTALK_PROMPT": "",
+    # Max transcript characters per model pass; longer transcripts are processed in chunks.
+    "P0_WHOTALK_CHUNK_CHARS": "9000",
+    # Lookback (hours) when resolving a bare meeting number to its meeting id via list_by_no.
+    "P0_WHOTALK_LOOKBACK_HOURS": "72",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -9360,6 +9371,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, _p0_members_trigger()) is not None
         or _p0_command_body(text_clean, _p0_om_open_trigger()) is not None
         or _p0_command_body(text_clean, _p0_om_end_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_whotalk_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
         or _p0_command_body(text_clean, "/whoami") is not None
@@ -9812,6 +9824,301 @@ def _p0_try_handle_meeting(
 
 
 # ---------------------------------------------------------------------------
+# p0bot — "/whotalk": who-said-what transcript of a recorded meeting
+#
+# Lark Minutes does the ASR and knows the real speaker per line (each participant
+# has their own mic stream) — that is the only way to get "Yang: ..." with real
+# names. The RAW zh/en transcript is then cleaned + translated by the LOCAL Qwen
+# (Lark's own translation is deliberately not used).
+#
+# Flow: /whotalk [minutes-link | meeting-link | 9-digit-no | (empty = last
+# recorded bot meeting)] → minute_token → export transcript (need_speaker) →
+# Qwen cleanup → answer cards.
+#
+# Console needs (add + PUBLISH a version): scope `minutes:minutes.transcript:export`
+# (+ existing vc:record:readonly), and the tenant must have Minutes (妙记) enabled.
+# If the tenant token can't access a host-owned minute, the stored /vcauth admin
+# user token is tried as fallback (add the scope to P0_VC_OAUTH_SCOPES and re-auth).
+# ---------------------------------------------------------------------------
+
+def _p0_whotalk_enabled() -> bool:
+    return _lark_env_truthy_or_default("P0_WHOTALK_ENABLE", default=True)
+
+
+def _p0_whotalk_trigger() -> str:
+    return _cfg_str("P0_WHOTALK_TRIGGER", "/whotalk").strip() or "/whotalk"
+
+
+def _p0_minute_token_from_text(text: str) -> str:
+    """Extract a Minutes token from a /minutes/<token> URL (24-char, tolerate variants)."""
+    m = re.search(r"/minutes/([A-Za-z0-9]{16,64})", text or "")
+    return m.group(1) if m else ""
+
+
+def _p0_whotalk_resolve_minute_token(arg: str) -> Tuple[str, str]:
+    """(minute_token, error). Resolve from a minutes link, meeting link/no, or the last recording."""
+    a = (arg or "").strip()
+    t = _p0_minute_token_from_text(a)
+    if t:
+        return t, ""
+    mno = _p0_parse_meeting_no(a)
+    mid_ = ""
+    url = ""
+    with _p0_om_lock:
+        last = dict(_p0_whotalk_last)
+        if not mno and last.get("meeting_no"):
+            mno = str(last.get("meeting_no") or "")
+            mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
+        elif mno and str(last.get("meeting_no") or "") == mno:
+            mid_, url = str(last.get("meeting_id") or ""), str(last.get("url") or "")
+        if mno and not mid_:
+            rec = _p0_om_active.get(mno)
+            if rec:
+                mid_ = str(rec.get("meeting_id") or "")
+    if url:
+        t = _p0_minute_token_from_text(url)
+        if t:
+            return t, ""
+    if not mno and not mid_:
+        return "", ("我还不知道最近的录制会议 — 请带上会议号/会议链接或妙记链接。\n"
+                    "No recent recorded meeting known — pass a meeting number/link or a Minutes link.")
+    if not mid_ and mno:
+        # Resolve meeting_no → meeting_id via list_by_no over a lookback window.
+        end = int(time.time())
+        start = end - 3600 * max(1, _cfg_int("P0_WHOTALK_LOOKBACK_HOURS", 72))
+        try:
+            j = _p0_lark_get_json(
+                "/open-apis/vc/v1/meetings/list_by_no",
+                {"meeting_no": mno, "start_time": str(start), "end_time": str(end), "page_size": 20},
+            )
+            if int(j.get("code", -1)) == 0:
+                briefs = (j.get("data") or {}).get("meeting_briefs") or []
+                if isinstance(briefs, list) and briefs:
+                    mid_ = _lark_dict_pick_str(briefs[-1], "id", "meeting_id", "meetingId")
+            else:
+                return "", f"list_by_no code={j.get('code')} msg={j.get('msg')}"
+        except Exception as e:
+            logger.exception("p0 whotalk list_by_no failed no=%s", mno)
+            return "", f"list_by_no error: {e.__class__.__name__}"
+    if not mid_:
+        return "", (f"找不到会议 {mno} 的会议ID（超出回溯窗口？）— 请直接给我妙记链接。\n"
+                    f"Could not resolve meeting id for No. {mno} — paste the Minutes link instead.")
+    try:
+        j = _p0_lark_get_json(f"/open-apis/vc/v1/meetings/{mid_}/recording")
+    except Exception as e:
+        return "", f"get-recording error: {e.__class__.__name__}"
+    if int(j.get("code", -1)) != 0:
+        return "", f"get-recording code={j.get('code')} msg={j.get('msg')}"
+    u = _lark_dict_pick_str((j.get("data") or {}).get("recording") or {}, "url")
+    t = _p0_minute_token_from_text(u)
+    if t:
+        return t, ""
+    if u:
+        return "", (f"录制链接不含妙记 token（{u[:80]}）— 租户是否开通了妙记/Minutes？\n"
+                    "Recording url has no Minutes token — is Lark Minutes enabled for the tenant?")
+    return "", ("录制还没生成（会议刚结束需等几分钟）。/ Recording not ready yet — try again a few "
+                "minutes after the meeting ends.")
+
+
+def _p0_minutes_transcript(minute_token: str) -> Tuple[str, Dict[str, Any]]:
+    """(transcript_text, error). Export the Minutes transcript WITH speaker names.
+
+    GET /open-apis/minutes/v1/minutes/{token}/transcript (binary text stream on success).
+    Tries the tenant token first, then the stored /vcauth admin user token — a host-owned
+    minute is often invisible to the tenant token until shared with the app.
+    """
+    toks: List[Tuple[str, str]] = []
+    try:
+        toks.append(("tenant", _lark_tenant_access_token_string()))
+    except Exception:
+        logger.exception("p0 whotalk tenant token unavailable")
+    ut = _p0_vc_user_access_token()
+    if ut:
+        toks.append(("user", ut))
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in toks:
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/minutes/v1/minutes/{minute_token}/transcript",
+                headers={"Authorization": f"Bearer {tok}"},
+                params={"need_speaker": "true", "need_timestamp": "false", "file_format": "txt"},
+                timeout=60,
+            )
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code == 200 and "json" not in ctype:
+            text = r.content.decode("utf-8", "replace").strip()
+            if text:
+                logger.info("p0 whotalk transcript ok via %s token: %d chars", kind, len(text))
+                return text, {}
+            last_err = {"code": "EMPTY", "msg": "transcript export returned an empty file"}
+            continue
+        try:
+            j = r.json()
+        except Exception:
+            j = {"code": f"HTTP {r.status_code}", "msg": (r.text or "")[:200]}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg") or str(j)[:200]}
+        logger.info("p0 whotalk transcript via %s token failed: %s", kind, last_err)
+    return "", last_err
+
+
+def _p0_whotalk_ai(transcript: str) -> str:
+    """Local-Qwen pass over the raw transcript: fix zh/en ASR errors, keep 'Name: text' turns,
+    append an English translation to Chinese lines. Chunked to fit the context window."""
+    url = _p0_qa_ollama_url()
+    model = _p0_qa_model()
+    timeout = max(10.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))
+    num_ctx = max(2048, _cfg_int("P0_QA_NUM_CTX", 16384))
+    chunk_chars = max(2000, _cfg_int("P0_WHOTALK_CHUNK_CHARS", 9000))
+    style = _cfg_str("P0_WHOTALK_PROMPT", "").strip() or (
+        "You will receive a RAW speech-to-text meeting transcript with speaker names. "
+        "It mixes Chinese and English and contains recognition errors.\n"
+        "1) Fix obvious speech-recognition errors from context; NEVER invent content.\n"
+        "2) Keep strictly the turn format `Name: text`, one turn per line, preserving order "
+        "and every speaker.\n"
+        "3) If a line is (partly) Chinese, append an English translation on the same line as "
+        "`  ⇒ EN: ...`. Leave pure-English lines unchanged.\n"
+        "4) Output ONLY the cleaned transcript lines — no preamble, no summary, no commentary."
+    )
+    lines = (transcript or "").splitlines()
+    chunks: List[str] = []
+    cur: List[str] = []
+    size = 0
+    for ln in lines:
+        if size + len(ln) + 1 > chunk_chars and cur:
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
+        cur.append(ln)
+        size += len(ln) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    outs: List[str] = []
+    for i, ch in enumerate(chunks, 1):
+        body: Dict[str, Any] = {
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": style},
+                {"role": "user", "content": ch},
+            ],
+            "options": {"temperature": 0.1, "num_ctx": num_ctx},
+            "think": False,
+        }
+        try:
+            r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+            r.raise_for_status()
+            t = _p0_clean_answer(_monitoring_ai_extract_ollama_text(r.json()))
+        except Exception:
+            logger.exception("p0 whotalk model pass %d/%d failed", i, len(chunks))
+            t = "⚠️（本段模型处理失败，以下为原文 / model failed on this section — raw text）\n" + ch
+        outs.append(t or ch)
+        if len(chunks) > 1:
+            logger.info("p0 whotalk model pass %d/%d done", i, len(chunks))
+    return "\n".join(outs).strip()
+
+
+def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+
+    def _fail(lines: List[str]) -> None:
+        if rt and rv:
+            _p0_meeting_send_card(rt, rv, "", "red", "⚠️ /whotalk 失败 / failed", lines)
+
+    try:
+        token, err = _p0_whotalk_resolve_minute_token(arg)
+        if not token:
+            _fail([err,
+                   "",
+                   f"用法 / Usage: `{_p0_whotalk_trigger()} [妙记链接 | 会议链接 | 9位会议号]`（留空=最近一次机器人录制的会议 / empty = last bot-recorded meeting）"])
+            return
+        transcript, terr = _p0_minutes_transcript(token)
+        if not transcript:
+            hint = ""
+            low = f"{terr.get('code')} {terr.get('msg')}".lower()
+            if "permission" in low or "forbidden" in low or "99991" in low or "1655" in low:
+                hint = ("\n提示：应用需开通并发布 `minutes:minutes.transcript:export` 权限；若妙记归主持人所有，"
+                        "请把该权限加进 P0_VC_OAUTH_SCOPES 后由管理员重新 /vcauth。\n"
+                        "Grant + publish the `minutes:minutes.transcript:export` scope; for host-owned minutes, add it "
+                        "to P0_VC_OAUTH_SCOPES and have the admin re-run /vcauth.")
+            _fail([f"导出转写失败 / transcript export failed: `code={terr.get('code')}  msg={terr.get('msg')}`{hint}"])
+            return
+        if rt and rv:
+            _lark_send_text_auto(rt, rv,
+                                 f"🎧 转写已取得（{len(transcript)} 字符），Qwen 正在整理，请稍候…\n"
+                                 f"Transcript fetched ({len(transcript)} chars) — Qwen is cleaning it up, please wait…")
+        cleaned = _p0_whotalk_ai(transcript)
+        _p0_send_answer(rt, rv, f"{_p0_whotalk_trigger()} — 谁说了什么 / who said what", cleaned)
+    except Exception:
+        logger.exception("p0 whotalk worker failed")
+        _fail(["内部错误，请查看服务器日志。/ Internal error — check the server logs."])
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_whotalk(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle "/whotalk [minutes-link|meeting-link|no]". Returns True when handled."""
+    if not _p0_whotalk_enabled():
+        return False
+    body = _p0_command_body((clean or "").strip(), _p0_whotalk_trigger())
+    if body is None:
+        return False
+
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_whotalk__\n{(body or 'last')[:80]}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+
+    logger.info("p0 whotalk accepted arg=%r chat=%s", (body or "")[:60], bool(chat_id))
+    try:
+        threading.Thread(
+            target=_p0_whotalk_worker,
+            args=(chat_id or "", open_id or "", body or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-whotalk",
+        ).start()
+    except Exception:
+        logger.exception("p0 whotalk worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # p0bot — group members ("/members")
 #
 # Lists who is in the CHAT GROUP (not the video call). Works with the bot's own
@@ -10029,7 +10336,8 @@ def _p0_vc_token_path() -> str:
 def _p0_vc_oauth_scopes() -> str:
     return _cfg_str(
         "P0_VC_OAUTH_SCOPES",
-        "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly",
+        "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly "
+        "contact:user.employee_id:readonly minutes:minutes.transcript:export",
     ).strip()
 
 
@@ -10341,6 +10649,8 @@ def _p0_try_handle_vcauth(
 
 _p0_om_lock = threading.Lock()
 _p0_om_active: Dict[str, Dict[str, Any]] = {}  # meeting_no -> {reserve_id, meeting_id, chat_id, topic, present:set}
+# Last bot meeting whose recording became ready — lets a bare /whotalk target "the last meeting".
+_p0_whotalk_last: Dict[str, Any] = {}  # {"meeting_no", "meeting_id", "url", "ts"}
 _p0_name_cache: Dict[str, str] = {}
 _p0_name_cache_lock = threading.Lock()
 _p0_contact_warned: set = set()  # dedup keys so a scope/permission problem is logged once, not per-join
@@ -10803,6 +11113,9 @@ def _p0_om_on_recording_ready(ce: Any) -> None:
                     url = _lark_dict_pick_str((j.get("data") or {}).get("recording") or {}, "url")
             except Exception:
                 logger.exception("p0 openmeeting get-recording fallback failed")
+        # Remember the last ready recording so a bare /whotalk can target "the last meeting".
+        with _p0_om_lock:
+            _p0_whotalk_last.update({"meeting_no": mno, "meeting_id": mid, "url": url, "ts": time.time()})
         host = _p0_om_host_open_id()
         if url and host:
             try:
@@ -11675,6 +11988,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     # p0bot: admin OAuth for the meeting report (/vcauth, /vccode) — before /meeting.
     if _p0_try_handle_vcauth(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/whotalk [minutes-link|meeting-link|no]" → speaker transcript via Minutes + Qwen.
+    if _p0_try_handle_whotalk(
         chat_id=chat_id,
         open_id=open_id or "",
         clean=clean or "",

@@ -119,6 +119,23 @@ OAuth**. One-time setup:
 
 If `/meeting` shows a `NO_AUTH` card, run `/vcauth` first. Look-back window is capped at 24h.
 
+## Who-said-what transcript ("/whotalk")
+
+For a **recorded** meeting, `/whotalk` posts a speaker-attributed transcript like
+`Yang: This is normal` — real names come from **Lark Minutes** (it knows who spoke from each
+participant's own mic stream; no local ASR model can recover names from a mixed track). The
+RAW zh/en Minutes text is then cleaned by the **local Qwen** (fix recognition errors, keep
+`Name: text` turns, append `⇒ EN:` translations) — Lark's own translation is not used.
+
+Usage: `/whotalk` (last bot-recorded meeting) · `/whotalk 123456789` or a meeting link ·
+`/whotalk https://xxx.larksuite.com/minutes/<token>`.
+
+Needs: tenant has **Minutes (妙记) enabled**; scope **`minutes:minutes.transcript:export`**
+(add + publish). A host-owned minute may be invisible to the tenant token — the stored
+`/vcauth` admin user token is tried as fallback (the scope is in `P0_VC_OAUTH_SCOPES` by
+default; the admin must re-run `/vcauth` after the scope is added). A bot cannot join a live
+call — this works on recordings after the meeting ends (wait a few minutes for processing).
+
 ## Contact directory (`contacts.csv`) — phone numbers p0bot can answer from
 
 `contacts.csv` in the repo root (`name,team,phone`) is folded into **every** answer's context,
