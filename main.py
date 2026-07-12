@@ -11156,7 +11156,8 @@ def _p0_p0docs_ai_updates(
         "N/A); TTR = detected → OSE responded / war room created; TTE = war room → escalated to the tech "
         "team; TTM = escalation → fix action started (an actual change, not discussion); TTF = war room "
         "start → issue resolved; Impact Duration = users first affected → service recovered. Include ONLY "
-        "metrics the transcript supports; omit the rest.\n"
+        "metrics the transcript supports. If the issue was NOT resolved by the end of the meeting, set the "
+        "resolution-dependent metrics (TTF, Impact Duration) to time='N/A', duration='N/A'.\n"
         "8) \"categories\": the option(s) under 🔸 Categorization that clearly match the incident's "
         "affected function, copied EXACTLY as written in the document (e.g. [\"Deposit\"] for a deposit/"
         "bank error, [\"Promotion / Voucher\"] for a reward/free-spin issue). Usually 1, at most 2; empty "
@@ -11421,27 +11422,48 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", lines)
                 if not tl_count:
                     logger.info("p0 p0docs timeline insert failed: %s", tlerr)
-        # Response Metrics sheet: write Time (col B) + Duration (col C) into the matching metric row.
+        # Response Metrics sheet: Time (col B) + Duration (col C) per metric row. Cells the model
+        # can't determine become "N/A" (e.g. not yet resolved at meeting end) — but a cell that
+        # already holds a value (manual entry or earlier fill) is NEVER overwritten.
         mt_count = 0
-        if metrics:
-            msheet = _p0_docx_find_sheet_after(items, "Response Metrics")
-            if msheet:
-                col_a = _p0_sheet_read_col_a(msheet)
-                ranges: List[Tuple[str, List[List[str]]]] = []
-                for m_ in metrics:
-                    key = m_["metric"].lower()
-                    for i, cell in enumerate(col_a, 1):
-                        if key and key in (cell or "").lower():
-                            ranges.append((f"B{i}:C{i}", [[m_.get("time", ""), m_.get("duration", "")]]))
-                            break
-                if ranges:
-                    ok, merr2 = _p0_sheet_batch_write(msheet, ranges)
-                    if ok:
-                        mt_count = len(ranges)
-                    else:
-                        logger.info("p0 p0docs metrics write failed: %s", merr2)
-            else:
-                logger.info("p0 p0docs: no Response Metrics sheet found")
+        msheet = _p0_docx_find_sheet_after(items, "Response Metrics")
+        if msheet:
+            canon = ("impact duration", "ttd", "ttr", "tte", "ttm", "ttf")
+
+            def _canon_of(s: str) -> str:
+                sl = (s or "").strip().lower()
+                for k in canon:
+                    if k in sl:
+                        return k
+                return ""
+
+            by_metric: Dict[str, Dict[str, str]] = {}
+            for m_ in metrics:
+                k = _canon_of(m_.get("metric", ""))
+                if k:
+                    by_metric[k] = m_
+            col_a = _p0_sheet_read_col_a(msheet)
+            bc = _p0_sheet_read_range(msheet, f"B1:C{max(len(col_a), 10)}")
+            ranges: List[Tuple[str, List[List[str]]]] = []
+            for i, cell in enumerate(col_a, 1):
+                k = _canon_of(cell)
+                if not k:
+                    continue
+                cur_b = bc[i - 1][0] if i - 1 < len(bc) and len(bc[i - 1]) > 0 else ""
+                cur_c = bc[i - 1][1] if i - 1 < len(bc) and len(bc[i - 1]) > 1 else ""
+                m_ = by_metric.get(k, {})
+                new_b = cur_b or (m_.get("time") or "").strip() or "N/A"
+                new_c = cur_c or (m_.get("duration") or "").strip() or "N/A"
+                if new_b != cur_b or new_c != cur_c:
+                    ranges.append((f"B{i}:C{i}", [[new_b, new_c]]))
+            if ranges:
+                ok, merr2 = _p0_sheet_batch_write(msheet, ranges)
+                if ok:
+                    mt_count = len(ranges)
+                else:
+                    logger.info("p0 p0docs metrics write failed: %s", merr2)
+        else:
+            logger.info("p0 p0docs: no Response Metrics sheet found")
         # Categorization checkboxes: tick todo blocks matching the model's confident categories.
         cat_count = 0
         if categories:
