@@ -11049,6 +11049,29 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
     return False, last_err
 
 
+def _p0_docx_tick_todo(document_id: str, block_id: str) -> Tuple[bool, Dict[str, Any]]:
+    """Tick a todo checkbox block (empirically verified: style.done via fields=[2])."""
+    body = {"update_text_style": {"style": {"done": True}, "fields": [2]}}
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.patch(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True, {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"), "http": r.status_code}
+    return False, last_err
+
+
 def _p0_strip_template_tail(text: str, aggressive: bool) -> str:
     """Remove trailing template markers ('Template Copy', '副本', …) from a filled value.
 
@@ -11067,8 +11090,8 @@ def _p0_strip_template_tail(text: str, aggressive: bool) -> str:
 
 def _p0_p0docs_ai_updates(
     blocks: List[Dict[str, str]], transcript: str, meta: Dict[str, str],
-) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], str]:
-    """([{id, text}], [{time, stage, event}], [{metric, time, duration}], error)."""
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[str], str]:
+    """([{id, text}], [{time, stage, event}], [{metric, time, duration}], categories, error)."""
     url = _p0_qa_ollama_url()
     model = _p0_qa_model()
     timeout = max(10.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
@@ -11134,9 +11157,14 @@ def _p0_p0docs_ai_updates(
         "team; TTM = escalation → fix action started (an actual change, not discussion); TTF = war room "
         "start → issue resolved; Impact Duration = users first affected → service recovered. Include ONLY "
         "metrics the transcript supports; omit the rest.\n"
-        "8) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
+        "8) \"categories\": the option(s) under 🔸 Categorization that clearly match the incident's "
+        "affected function, copied EXACTLY as written in the document (e.g. [\"Deposit\"] for a deposit/"
+        "bank error, [\"Promotion / Voucher\"] for a reward/free-spin issue). Usually 1, at most 2; empty "
+        "list when no option clearly fits. The system ticks the checkbox — you only NAME the options.\n"
+        "9) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
         "as the transcript dictates).\n"
-        "9) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
+        "10) Do not modify instructional lines (填写指引, Tip, Stage 标签说明) and do not put category "
+        "options into \"updates\" — categories go only in the \"categories\" key."
     )
     user = (f"INPUT 1 — DOCUMENT BLOCKS:\n{doc_lines}\n\n"
             f"INPUT 2 — METADATA:\n{meta_lines or '-'}\n\n"
@@ -11155,12 +11183,15 @@ def _p0_p0docs_ai_updates(
         raw = _monitoring_ai_extract_ollama_text(r.json())
     except Exception:
         logger.exception("p0 p0docs model call failed")
-        return [], [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
+        return [], [], [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
     try:
         parsed = json.loads(raw)
     except Exception:
         logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
-        return [], [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+        return [], [], [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+    categories: List[str] = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("categories"), list):
+        categories = [str(c).strip() for c in parsed["categories"][:4] if str(c or "").strip()]
     metrics: List[Dict[str, str]] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("metrics"), list):
         for m_ in parsed["metrics"][:10]:
@@ -11186,7 +11217,7 @@ def _p0_p0docs_ai_updates(
     elif isinstance(parsed, dict):
         # tolerate a plain {"<block_id>": "<text>"} mapping
         ups = [{"id": k, "text": v} for k, v in parsed.items()
-               if isinstance(v, str) and k not in ("timeline", "updates", "metrics")]
+               if isinstance(v, str) and k not in ("timeline", "updates", "metrics", "categories")]
     else:
         ups = []
     valid_ids = {b["id"]: b for b in blocks if b.get("id")}
@@ -11208,14 +11239,14 @@ def _p0_p0docs_ai_updates(
         seen.add(bid)
         out.append({"id": bid, "text": txt[:2000]})
     logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s, %d timeline, "
-                "%d metrics; raw head=%r",
+                "%d metrics, %d categories; raw head=%r",
                 len(ups), len(out), len(bad_ids),
                 (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), len(timeline), len(metrics),
-                (raw or "")[:300])
-    if ups and not out and bad_ids and not timeline and not metrics:
-        return [], [], [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model "
-                            f"returned {len(ups)} updates but no block ids matched — see journal")
-    return out, timeline, metrics, ""
+                len(categories), (raw or "")[:300])
+    if ups and not out and bad_ids and not timeline and not metrics and not categories:
+        return [], [], [], [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model "
+                                f"returned {len(ups)} updates but no block ids matched — see journal")
+    return out, timeline, metrics, categories, ""
 
 
 def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
@@ -11310,11 +11341,11 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                                  f"Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
                                  f"Transcript fetched ({len(transcript)} chars via {src}) — Qwen is filling "
                                  f"the doc ({len(blocks)} blocks), please wait…")
-        updates, timeline, metrics, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
+        updates, timeline, metrics, categories, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
         if uerr:
             _card("⚠️ 填写失败 / fill failed", "red", [uerr])
             return
-        if not updates and not timeline and not metrics:
+        if not updates and not timeline and not metrics and not categories:
             _card("ℹ️ 没有可填写的内容 / nothing fillable", "blue",
                   ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence.",
                    "journal 里有模型原始输出 / the model's raw output is in the journal (`p0 p0docs model:`)"])
@@ -11411,8 +11442,26 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                         logger.info("p0 p0docs metrics write failed: %s", merr2)
             else:
                 logger.info("p0 p0docs: no Response Metrics sheet found")
-        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d (dup-skipped=%d) metrics=%d",
-                    document_id[:12], okc, failc, tl_count, tl_dup, mt_count)
+        # Categorization checkboxes: tick todo blocks matching the model's confident categories.
+        cat_count = 0
+        if categories:
+            raw_by_id = {str(b.get("block_id") or ""): b for b in items}
+            wanted = {c.lower() for c in categories}
+            for blk in blocks:
+                if blk.get("kind") != "todo" or (blk.get("text") or "").strip().lower() not in wanted:
+                    continue
+                raw_item = raw_by_id.get(blk["id"]) or {}
+                if (((raw_item.get("todo") or {}).get("style")) or {}).get("done"):
+                    continue  # already ticked — idempotent re-runs
+                ok, cerr = _p0_docx_tick_todo(document_id, blk["id"])
+                if ok:
+                    cat_count += 1
+                else:
+                    logger.info("p0 p0docs tick %r failed: %s", blk.get("text"), cerr)
+                time.sleep(0.34)
+        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d (dup-skipped=%d) metrics=%d "
+                    "categories=%d",
+                    document_id[:12], okc, failc, tl_count, tl_dup, mt_count, cat_count)
         notes: List[str] = []
         if okc:
             notes.append(f"字段 **{okc}** 个 / **{okc}** fields")
@@ -11422,7 +11471,9 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             notes.append(f"时间线 {tl_dup} 条已存在（跳过）/ {tl_dup} timeline rows already present (skipped)")
         if mt_count:
             notes.append(f"指标 **{mt_count}** 项 / **{mt_count}** metrics")
-        wrote_any = bool(okc or tl_count or mt_count)
+        if cat_count:
+            notes.append(f"分类勾选 **{cat_count}** 项 / **{cat_count}** categories ticked")
+        wrote_any = bool(okc or tl_count or mt_count or cat_count)
         if failc and not wrote_any:
             # every write genuinely failed — permissions are the usual cause
             hint = ("应用需要 `docx:document`（编辑）权限并发布版本，且文档/知识库需以 **可编辑** 共享给应用。\n"
