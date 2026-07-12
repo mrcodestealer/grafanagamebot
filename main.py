@@ -10815,6 +10815,60 @@ def _p0_docx_find_sheet_after(items: List[Dict[str, Any]], heading_contains: str
     return ""
 
 
+def _p0_sheet_read_col_a(combined_token: str, max_row: int = 30) -> List[str]:
+    """Column-A values of an embedded sheet (row order, 1-based offsetting left to caller)."""
+    if "_" not in combined_token:
+        return []
+    stoken, sid = combined_token.split("_", 1)
+    for _kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{stoken}/values/{sid}!A1:A{max_row}",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=30,
+            )
+            j = r.json()
+        except Exception:
+            continue
+        if int(j.get("code", -1)) != 0:
+            continue
+        rows = ((j.get("data") or {}).get("valueRange") or {}).get("values") or []
+        out: List[str] = []
+        for row in rows:
+            v = row[0] if isinstance(row, list) and row else ""
+            if isinstance(v, list):  # rich-text cells arrive as segment lists
+                v = "".join(str((seg or {}).get("text") or "") for seg in v if isinstance(seg, dict))
+            out.append(str(v) if v is not None else "")
+        return out
+    return []
+
+
+def _p0_sheet_batch_write(combined_token: str, ranges: List[Tuple[str, List[List[str]]]]) -> Tuple[bool, Dict[str, Any]]:
+    """Write multiple cell ranges of an embedded sheet in one call."""
+    if "_" not in combined_token or not ranges:
+        return False, {"code": "BAD_TOKEN", "msg": "no sheet token or nothing to write"}
+    stoken, sid = combined_token.split("_", 1)
+    body = {"valueRanges": [{"range": f"{sid}!{a1}", "values": vals} for a1, vals in ranges]}
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.post(
+                f"{_lark_api_domain()}/open-apis/sheets/v2/spreadsheets/{stoken}/values_batch_update",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True, {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+        logger.info("p0 p0docs sheet batch write via %s token failed: %s", kind, last_err)
+    return False, last_err
+
+
 def _p0_sheet_append_rows(combined_token: str, rows: List[List[str]]) -> Tuple[bool, Dict[str, Any]]:
     """Append rows to an embedded sheet (scope sheets:spreadsheet; doc must be editable)."""
     if "_" not in combined_token:
@@ -10863,9 +10917,10 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
     return False, last_err
 
 
-def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
-                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], str]:
-    """([{id, text}], [{time, stage, event}], error). Ask Qwen which blocks to fill; unknown omitted."""
+def _p0_p0docs_ai_updates(
+    blocks: List[Dict[str, str]], transcript: str, meta: Dict[str, str],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], str]:
+    """([{id, text}], [{time, stage, event}], [{metric, time, duration}], error)."""
     url = _p0_qa_ollama_url()
     model = _p0_qa_model()
     timeout = max(10.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
@@ -10908,9 +10963,17 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         "line the event comes from. Name the people involved, e.g. "
         "{\"time\": \"22:03:15\", \"stage\": \"Investigation\", \"event\": \"Reynold: SDK 资源加载 100ms 内"
         "失败，怀疑网络供应商限制域名\"}. Empty list if the transcript is too unclear.\n"
-        "7) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
+        "7) \"metrics\": response-time metrics you can determine from the timed transcript, each "
+        "{\"metric\": \"<TTD|TTR|TTE|TTM|TTF|Impact Duration>\", \"time\": \"<HH:MM:SS when that phase "
+        "happened, or N/A>\", \"duration\": \"<e.g. 12 min>\"}. Definitions: TTD = problem occurred → "
+        "first detected (if detected by alert use the alert time; if a customer reported first, time is "
+        "N/A); TTR = detected → OSE responded / war room created; TTE = war room → escalated to the tech "
+        "team; TTM = escalation → fix action started (an actual change, not discussion); TTF = war room "
+        "start → issue resolved; Impact Duration = users first affected → service recovered. Include ONLY "
+        "metrics the transcript supports; omit the rest.\n"
+        "8) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
         "as the transcript dictates).\n"
-        "8) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
+        "9) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
     )
     user = (f"INPUT 1 — DOCUMENT BLOCKS:\n{doc_lines}\n\n"
             f"INPUT 2 — METADATA:\n{meta_lines or '-'}\n\n"
@@ -10929,12 +10992,20 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         raw = _monitoring_ai_extract_ollama_text(r.json())
     except Exception:
         logger.exception("p0 p0docs model call failed")
-        return [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
+        return [], [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
     try:
         parsed = json.loads(raw)
     except Exception:
         logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
-        return [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+        return [], [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+    metrics: List[Dict[str, str]] = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("metrics"), list):
+        for m_ in parsed["metrics"][:10]:
+            if isinstance(m_, dict):
+                name = str(m_.get("metric") or "").strip()
+                if name:
+                    metrics.append({"metric": name, "time": str(m_.get("time") or "").strip(),
+                                    "duration": str(m_.get("duration") or "").strip()})
     timeline: List[Dict[str, str]] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("timeline"), list):
         for t in parsed["timeline"][:15]:
@@ -10952,7 +11023,7 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
     elif isinstance(parsed, dict):
         # tolerate a plain {"<block_id>": "<text>"} mapping
         ups = [{"id": k, "text": v} for k, v in parsed.items()
-               if isinstance(v, str) and k not in ("timeline", "updates")]
+               if isinstance(v, str) and k not in ("timeline", "updates", "metrics")]
     else:
         ups = []
     valid_ids = {b["id"]: b for b in blocks if b.get("id")}
@@ -10973,13 +11044,15 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
             continue  # no-op
         seen.add(bid)
         out.append({"id": bid, "text": txt[:2000]})
-    logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s, %d timeline lines; raw head=%r",
+    logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s, %d timeline, "
+                "%d metrics; raw head=%r",
                 len(ups), len(out), len(bad_ids),
-                (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), len(timeline), (raw or "")[:300])
-    if ups and not out and bad_ids and not timeline:
-        return [], [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model returned "
-                        f"{len(ups)} updates but no block ids matched — see journal for its raw output")
-    return out, timeline, ""
+                (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), len(timeline), len(metrics),
+                (raw or "")[:300])
+    if ups and not out and bad_ids and not timeline and not metrics:
+        return [], [], [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model "
+                            f"returned {len(ups)} updates but no block ids matched — see journal")
+    return out, timeline, metrics, ""
 
 
 def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
@@ -11062,11 +11135,11 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                                  f"📝 转写已取得（{len(transcript)} 字符），Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
                                  f"Transcript fetched ({len(transcript)} chars) — Qwen is filling the doc "
                                  f"({len(blocks)} blocks), please wait…")
-        updates, timeline, uerr = _p0_p0docs_ai_updates(blocks, model_transcript, meta)
+        updates, timeline, metrics, uerr = _p0_p0docs_ai_updates(blocks, model_transcript, meta)
         if uerr:
             _card("⚠️ 填写失败 / fill failed", "red", [uerr])
             return
-        if not updates and not timeline:
+        if not updates and not timeline and not metrics:
             _card("ℹ️ 没有可填写的内容 / nothing fillable", "blue",
                   ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence.",
                    "journal 里有模型原始输出 / the model's raw output is in the journal (`p0 p0docs model:`)"])
@@ -11108,9 +11181,32 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", lines)
                 if not tl_count:
                     logger.info("p0 p0docs timeline insert failed: %s", tlerr)
-        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d",
-                    document_id[:12], okc, failc, tl_count)
-        tl_note = (f"，时间线 **{tl_count}** 条 / + **{tl_count}** timeline entries" if tl_count else "")
+        # Response Metrics sheet: write Time (col B) + Duration (col C) into the matching metric row.
+        mt_count = 0
+        if metrics:
+            msheet = _p0_docx_find_sheet_after(items, "Response Metrics")
+            if msheet:
+                col_a = _p0_sheet_read_col_a(msheet)
+                ranges: List[Tuple[str, List[List[str]]]] = []
+                for m_ in metrics:
+                    key = m_["metric"].lower()
+                    for i, cell in enumerate(col_a, 1):
+                        if key and key in (cell or "").lower():
+                            ranges.append((f"B{i}:C{i}", [[m_.get("time", ""), m_.get("duration", "")]]))
+                            break
+                if ranges:
+                    ok, merr2 = _p0_sheet_batch_write(msheet, ranges)
+                    if ok:
+                        mt_count = len(ranges)
+                    else:
+                        logger.info("p0 p0docs metrics write failed: %s", merr2)
+            else:
+                logger.info("p0 p0docs: no Response Metrics sheet found")
+        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d metrics=%d",
+                    document_id[:12], okc, failc, tl_count, mt_count)
+        tl_note = (f"，时间线 **{tl_count}** 条 / + **{tl_count}** timeline rows" if tl_count else "")
+        if mt_count:
+            tl_note += f"，指标 **{mt_count}** 项 / + **{mt_count}** metrics"
         if okc and not failc:
             _card("✅ 文档已填写 / doc filled", "green",
                   [f"已填写 **{okc}** 个字段{tl_note}（不确定的字段保持原样）。/ Filled **{okc}** fields"
