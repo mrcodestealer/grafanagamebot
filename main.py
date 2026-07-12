@@ -10594,13 +10594,12 @@ _P0_DOCX_TEXT_KEYS = ("text", "heading1", "heading2", "heading3", "heading4", "h
                       "todo", "quote", "page")
 
 
-def _p0_docx_text_blocks(document_id: str) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
-    """([{id, text}], error). All text-bearing blocks of the doc, in document order."""
-    out: List[Dict[str, str]] = []
-    page = ""
+def _p0_docx_blocks_raw(document_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """(raw block items, error). Full block list of the doc, in document order."""
     last_err: Dict[str, Any] = {}
     for kind, tok in _p0_minutes_tokens():
-        out, page, ok = [], "", True
+        items: List[Dict[str, Any]] = []
+        page, ok = "", True
         for _ in range(40):
             try:
                 r = requests.get(
@@ -10617,27 +10616,159 @@ def _p0_docx_text_blocks(document_id: str) -> Tuple[List[Dict[str, str]], Dict[s
                 last_err, ok = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}, False
                 break
             data = j.get("data") or {}
-            for b in data.get("items") or []:
-                if not isinstance(b, dict):
-                    continue
-                for key in _P0_DOCX_TEXT_KEYS:
-                    body = b.get(key)
-                    if isinstance(body, dict) and isinstance(body.get("elements"), list):
-                        txt = "".join(
-                            (el.get("text_run") or {}).get("content") or ""
-                            for el in body["elements"] if isinstance(el, dict)
-                        )
-                        out.append({"id": str(b.get("block_id") or ""), "text": txt, "kind": key})
-                        break
+            items += [b for b in (data.get("items") or []) if isinstance(b, dict)]
             if not data.get("has_more"):
                 break
             page = str(data.get("page_token") or "")
             if not page:
                 break
         if ok:
-            return out, {}
+            return items, {}
         logger.info("p0 p0docs list blocks via %s token failed: %s", kind, last_err)
     return [], last_err or {"code": "NO_TOKEN", "msg": "no usable token"}
+
+
+def _p0_docx_block_text(b: Dict[str, Any]) -> Tuple[str, str]:
+    """(kind, text) for a text-bearing block, else ("", "")."""
+    for key in _P0_DOCX_TEXT_KEYS:
+        body = b.get(key)
+        if isinstance(body, dict) and isinstance(body.get("elements"), list):
+            return key, "".join(
+                (el.get("text_run") or {}).get("content") or ""
+                for el in body["elements"] if isinstance(el, dict)
+            )
+    return "", ""
+
+
+def _p0_docx_extract_text(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for b in items:
+        kind, txt = _p0_docx_block_text(b)
+        if kind:
+            out.append({"id": str(b.get("block_id") or ""), "text": txt, "kind": kind})
+    return out
+
+
+def _p0_docx_insert_after(document_id: str, items: List[Dict[str, Any]],
+                          heading_contains: str, lines: List[str]) -> Tuple[int, Dict[str, Any]]:
+    """Insert plain-text blocks right after the first block whose text contains ``heading_contains``.
+    Returns (inserted_count, error)."""
+    lines = [ln.strip() for ln in lines if (ln or "").strip()][:20]
+    if not lines:
+        return 0, {}
+    by_id = {str(b.get("block_id") or ""): b for b in items}
+    target = None
+    for b in items:
+        _k, txt = _p0_docx_block_text(b)
+        if txt and heading_contains.lower() in txt.lower():
+            target = b
+            break
+    if target is None:
+        return 0, {"code": "NO_ANCHOR", "msg": f"no block containing {heading_contains!r}"}
+    pid = str(target.get("parent_id") or "")
+    parent = by_id.get(pid)
+    kids = (parent or {}).get("children") or []
+    tid = str(target.get("block_id") or "")
+    idx = (kids.index(tid) + 1) if tid in kids else len(kids)
+    body = {
+        "index": idx,
+        "children": [
+            {"block_type": 2, "text": {"elements": [{"text_run": {"content": ln}}]}}
+            for ln in lines
+        ],
+    }
+    last_err: Dict[str, Any] = {}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.post(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{pid}/children",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return len(lines), {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+    return 0, last_err
+
+
+def _p0_minutes_meta(minute_token: str) -> Dict[str, str]:
+    """Best-effort meeting metadata from the Minutes info API (scope minutes:minutes.basic:read
+    or minutes:minutes:readonly). Empty dict when unavailable — callers treat everything optional."""
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/minutes/v1/minutes/{minute_token}",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=30,
+            )
+            j = r.json()
+        except Exception:
+            continue
+        if int(j.get("code", -1)) != 0:
+            logger.info("p0 p0docs minutes meta via %s token failed: code=%s msg=%s",
+                        kind, j.get("code"), j.get("msg"))
+            continue
+        m = (j.get("data") or {}).get("minute") or {}
+        out: Dict[str, str] = {}
+        try:
+            ct = int(m.get("create_time") or 0) / 1000.0
+            dur = int(m.get("duration") or 0) / 1000.0
+            if ct > 0:
+                out["meeting date"] = time.strftime("%Y/%m/%d", time.localtime(ct))
+                out["meeting start time"] = time.strftime("%Y/%m/%d %H:%M", time.localtime(ct))
+                if dur > 0:
+                    out["meeting end time"] = time.strftime("%Y/%m/%d %H:%M", time.localtime(ct + dur))
+                    out["meeting duration"] = f"{int(dur // 60)} min"
+        except (TypeError, ValueError):
+            pass
+        if m.get("title"):
+            out["meeting title"] = str(m["title"])
+        if m.get("url"):
+            out["meeting minutes/recording link"] = str(m["url"])
+        return out
+    return {}
+
+
+def _p0_transcript_speaker_teams(transcript: str) -> List[str]:
+    """Map transcript speakers to their teams via contacts.csv, e.g. 'Karen CRD = CRD-CS'."""
+    names: List[str] = []
+    seen: Set[str] = set()
+    for ln in (transcript or "").splitlines():
+        m = re.match(r"^\s*([^:：\n]{1,40})[:：]", ln)
+        if m:
+            n = m.group(1).strip()
+            if n and n.lower() not in seen:
+                seen.add(n.lower())
+                names.append(n)
+    entries, _ = _p0_contacts_load()
+    out: List[str] = []
+    for n in names[:30]:
+        nl = n.lower()
+        team = ""
+        for cn, ct, _ph in entries:  # pass 1: exact name
+            if (cn or "").strip().lower() == nl:
+                team = ct
+                break
+        if not team:
+            # pass 2: whole-word containment either way; short names (<4 chars, e.g. "Kh",
+            # "YC") excluded — substring matching on those produces wrong teams.
+            for cn, ct, _ph in entries:
+                cn_s = (cn or "").strip()
+                if len(cn_s) < 4:
+                    continue
+                pat = r"(?<!\w)" + re.escape(cn_s) + r"(?!\w)"
+                rpat = r"(?<!\w)" + re.escape(n) + r"(?!\w)"
+                if re.search(pat, n, re.IGNORECASE) or (len(n) >= 4 and re.search(rpat, cn_s, re.IGNORECASE)):
+                    team = ct
+                    break
+        out.append(f"{n} = {team or 'unknown team'}")
+    return out
 
 
 def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tuple[bool, Dict[str, Any]]:
@@ -10663,8 +10794,8 @@ def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tupl
 
 
 def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
-                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], str]:
-    """([{id, text}], error). Ask Qwen which blocks to fill; unknown fields are omitted."""
+                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], List[str], str]:
+    """([{id, text}], timeline_lines, error). Ask Qwen which blocks to fill; unknown fields omitted."""
     url = _p0_qa_ollama_url()
     model = _p0_qa_model()
     timeout = max(10.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
@@ -10686,20 +10817,27 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         "INPUT 2 is known metadata. INPUT 3 is the raw meeting transcript (mixed Chinese/English, "
         "has speech-recognition errors).\n"
         "Rules:\n"
-        "1) Output ONLY JSON: {\"updates\": [{\"id\": \"<block_id>\", \"text\": \"<full new text for that block>\"}]}. "
-        "The id must be copied EXACTLY from between the square brackets of INPUT 1, e.g. "
-        "{\"updates\": [{\"id\": \"doxlgwNC3X\", \"text\": \"🕐 Start Time: 21:05\"}]}.\n"
+        "1) Output ONLY JSON: {\"updates\": [{\"id\": \"<block_id>\", \"text\": \"<full new text for that "
+        "block>\"}], \"timeline\": [\"<entry>\", ...]}. The id must be copied EXACTLY from between the "
+        "square brackets of INPUT 1, e.g. {\"updates\": [{\"id\": \"doxlgwNC3X\", \"text\": \"🕐 Start "
+        "Time: 2026/07/12 21:05\"}], \"timeline\": [...]}.\n"
         "2) Fill every field the transcript or metadata answers, even partially (e.g. teams that were "
         "clearly involved, a summary of the issue discussed, the fix that was applied). Only omit a "
         "field when you truly have no information for it. Never invent names, numbers or links.\n"
-        "3) ALWAYS fill when present: the '📹 Meeting Recording' line (metadata has the link), any "
-        "[YYYY/MM/DD] date placeholder (metadata has today's date), and the '📝 Issue Summary' line "
-        "(summarize the transcript in 1-2 sentences).\n"
-        "4) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
+        "3) ALWAYS fill when present: the '📹 Meeting Recording' line (metadata has the link), Start/End/"
+        "Duration lines when metadata has meeting times, any [YYYY/MM/DD] date placeholder (metadata has "
+        "the meeting date), and the '📝 Issue Summary' line (summarize the transcript in 1-2 sentences).\n"
+        "4) 'Teams Involved' = the union of the speakers' teams from metadata (skip 'unknown team'); "
+        "'OSE On-duty' = the speakers whose team contains 'OSE'.\n"
+        "5) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
         "placeholder part.\n"
-        "5) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
+        "6) \"timeline\": 3-10 short chronological entries of the incident, each starting with the fitting "
+        "stage emoji — 🔴 Detection, 🟡 Investigation, 🟠 Mitigation, 🔵 Recovery, 🟢 Closed — e.g. "
+        "\"🟡 Investigation — Reynold: SDK 资源加载 100ms 内失败，怀疑网络供应商限制域名\". "
+        "Name the people involved. Empty list if the transcript is too unclear.\n"
+        "7) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
         "as the transcript dictates).\n"
-        "6) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
+        "8) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
     )
     user = (f"INPUT 1 — DOCUMENT BLOCKS:\n{doc_lines}\n\n"
             f"INPUT 2 — METADATA:\n{meta_lines or '-'}\n\n"
@@ -10718,19 +10856,23 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
         raw = _monitoring_ai_extract_ollama_text(r.json())
     except Exception:
         logger.exception("p0 p0docs model call failed")
-        return [], "模型调用失败/超时 / model call failed or timed out — check the journal"
+        return [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
     try:
         parsed = json.loads(raw)
     except Exception:
         logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
-        return [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+        return [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+    timeline: List[str] = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("timeline"), list):
+        timeline = [str(t).strip() for t in parsed["timeline"] if str(t or "").strip()][:15]
     if isinstance(parsed, dict) and isinstance(parsed.get("updates"), list):
         ups = parsed["updates"]
     elif isinstance(parsed, list):
         ups = parsed
     elif isinstance(parsed, dict):
         # tolerate a plain {"<block_id>": "<text>"} mapping
-        ups = [{"id": k, "text": v} for k, v in parsed.items() if isinstance(v, str)]
+        ups = [{"id": k, "text": v} for k, v in parsed.items()
+               if isinstance(v, str) and k not in ("timeline", "updates")]
     else:
         ups = []
     valid_ids = {b["id"]: b for b in blocks if b.get("id")}
@@ -10751,13 +10893,13 @@ def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
             continue  # no-op
         seen.add(bid)
         out.append({"id": bid, "text": txt[:2000]})
-    logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s; raw head=%r",
+    logger.info("p0 p0docs model: %d updates returned, %d valid, %d unknown ids%s, %d timeline lines; raw head=%r",
                 len(ups), len(out), len(bad_ids),
-                (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), (raw or "")[:300])
-    if ups and not out and bad_ids:
-        return [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model returned "
-                    f"{len(ups)} updates but no block ids matched — see journal for its raw output")
-    return out, ""
+                (f" (e.g. {bad_ids[:3]})" if bad_ids else ""), len(timeline), (raw or "")[:300])
+    if ups and not out and bad_ids and not timeline:
+        return [], [], (f"模型返回了 {len(ups)} 个更新，但 block id 都不匹配（如 {bad_ids[:2]}）/ model returned "
+                        f"{len(ups)} updates but no block ids matched — see journal for its raw output")
+    return out, timeline, ""
 
 
 def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
@@ -10805,7 +10947,8 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                    "参考 /whotalk 的权限要求 / see /whotalk permission requirements"])
             return
 
-        blocks, berr = _p0_docx_text_blocks(document_id)
+        items, berr = _p0_docx_blocks_raw(document_id)
+        blocks = _p0_docx_extract_text(items)
         if not blocks:
             _card("⚠️ 读取文档失败 / could not read doc", "red",
                   [f"`code={berr.get('code')}  msg={berr.get('msg')}`",
@@ -10821,18 +10964,23 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             "meeting number": _p0_parse_meeting_no(meeting_arg),
             "today's date": time.strftime("%Y/%m/%d"),
         }
+        meta.update(_p0_minutes_meta(token))  # real start/end/duration/title when scope allows
+        teams = _p0_transcript_speaker_teams(transcript)
+        if teams:
+            meta["speakers and their teams (from contact directory)"] = "; ".join(teams)
         if rt and rv:
             _lark_send_text_auto(rt, rv,
                                  f"📝 转写已取得（{len(transcript)} 字符），Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
                                  f"Transcript fetched ({len(transcript)} chars) — Qwen is filling the doc "
                                  f"({len(blocks)} blocks), please wait…")
-        updates, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
+        updates, timeline, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
         if uerr:
             _card("⚠️ 填写失败 / fill failed", "red", [uerr])
             return
-        if not updates:
+        if not updates and not timeline:
             _card("ℹ️ 没有可填写的内容 / nothing fillable", "blue",
-                  ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence."])
+                  ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence.",
+                   "journal 里有模型原始输出 / the model's raw output is in the journal (`p0 p0docs model:`)"])
             return
         okc, failc = 0, 0
         first_err: Dict[str, Any] = {}
@@ -10843,14 +10991,21 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
             else:
                 failc += 1
                 first_err = first_err or perr
-        logger.info("p0 p0docs done doc=%s filled=%d failed=%d", document_id[:12], okc, failc)
+        tl_count = 0
+        if timeline:
+            tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", timeline)
+            if not tl_count:
+                logger.info("p0 p0docs timeline insert failed: %s", tlerr)
+        logger.info("p0 p0docs done doc=%s filled=%d failed=%d timeline=%d",
+                    document_id[:12], okc, failc, tl_count)
+        tl_note = (f"，时间线 **{tl_count}** 条 / + **{tl_count}** timeline entries" if tl_count else "")
         if okc and not failc:
             _card("✅ 文档已填写 / doc filled", "green",
-                  [f"已填写 **{okc}** 个字段（不确定的字段保持原样）。/ Filled **{okc}** fields "
-                   "(unknown fields left untouched).", f"[打开文档 / open the doc]({doc_link})"])
+                  [f"已填写 **{okc}** 个字段{tl_note}（不确定的字段保持原样）。/ Filled **{okc}** fields"
+                   f"{tl_note} (unknown fields left untouched).", f"[打开文档 / open the doc]({doc_link})"])
         elif okc:
             _card("⚠️ 部分填写 / partially filled", "orange",
-                  [f"成功 {okc}，失败 {failc}：`code={first_err.get('code')} msg={first_err.get('msg')}`",
+                  [f"成功 {okc}{tl_note}，失败 {failc}：`code={first_err.get('code')} msg={first_err.get('msg')}`",
                    f"[打开文档 / open the doc]({doc_link})"])
         else:
             # nothing written — likely no edit permission; deliver the content in chat instead
