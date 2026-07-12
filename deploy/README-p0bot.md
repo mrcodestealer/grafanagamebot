@@ -144,6 +144,19 @@ sherpa-onnx + the model), add scope **`minutes:minutes.media:export`** (+ publis
 re-`/vcauth`), then `P0_WHOTALK_ASR_ENABLE=1` and restart. The "transcript fetched" message
 shows which source was used; any local-ASR failure automatically falls back to Lark's text.
 
+## Fill the P0 incident doc ("/p0docs")
+
+`/p0docs <meeting link|9-digit no|minutes link> <doc link>` — the bot pulls the meeting's
+transcript, reads the target doc's blocks, and has the local Qwen fill in the incident-report
+fields it can answer (start/end time, teams, summary, detection source, fix summary, …).
+**Fields the transcript doesn't answer are left exactly as they are**, tables are skipped, and
+the doc's structure/emoji/labels are preserved — only placeholder lines are patched in place.
+
+Setup: scope **`docx:document`** (edit — add + publish a version) and share the doc/wiki with
+the app as **editable**. If the bot can't write the doc, it posts the filled content in chat
+for manual pasting instead. Order of the two links doesn't matter; leave the meeting part
+empty to use the last bot-recorded meeting.
+
 ## Contact directory (`contacts.csv`) — phone numbers p0bot can answer from
 
 `contacts.csv` in the repo root (`name,team,phone`) is folded into **every** answer's context,

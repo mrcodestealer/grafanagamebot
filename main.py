@@ -384,6 +384,20 @@ _CFG: Dict[str, Any] = {
     "P0_WHOTALK_ASR_KEEP_MEDIA": "0",
     # ffmpeg binary; empty = try <app>/bin/ffmpeg then PATH.
     "P0_FFMPEG_BIN": "",
+    # ---- /p0docs — fill a P0 incident doc from a meeting transcript ----
+    # Usage: /p0docs <meeting link|9-digit no|minutes link> <wiki/docx doc link>
+    # The bot reads the doc's blocks, asks Qwen to fill ONLY the fields the transcript answers
+    # (unknown fields left untouched), and patches those blocks in place.
+    # Needs scope docx:document (edit; add + PUBLISH) and the doc/wiki shared to the app as EDITABLE.
+    "P0_P0DOCS_ENABLE": "1",
+    "P0_P0DOCS_TRIGGER": "/p0docs",
+    # Extra/override instruction for the fill model (empty = built-in).
+    "P0_P0DOCS_PROMPT": "",
+    # Use the local ASR transcript (slow) instead of Lark's text when filling. Default off: doc
+    # filling wants speed; names/times come through fine in Lark's transcript.
+    "P0_P0DOCS_USE_LOCAL_ASR": "0",
+    # Max transcript characters passed to the fill model (head+tail kept when longer).
+    "P0_P0DOCS_TRANSCRIPT_CHARS": "12000",
     # Optional override of this bot's open_id (else resolved via bot/v3/info with these creds)
     "P0_BOT_OPEN_ID": "",
     # Optional custom system prompt for answers; use {doc} where the documentation should be injected
@@ -9408,6 +9422,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, _p0_om_open_trigger()) is not None
         or _p0_command_body(text_clean, _p0_om_end_trigger()) is not None
         or _p0_command_body(text_clean, _p0_whotalk_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_p0docs_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
         or _p0_command_body(text_clean, "/whoami") is not None
@@ -10508,6 +10523,355 @@ def _p0_try_handle_whotalk(
         ).start()
     except Exception:
         logger.exception("p0 whotalk worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# p0bot — "/p0docs": fill a P0 incident doc from a meeting transcript
+#
+# /p0docs <meeting link|9-digit no|minutes link> <wiki/docx link>
+# Reads the target doc's blocks, gives Qwen the block list + the meeting
+# transcript, and patches ONLY the blocks the model filled — fields the
+# transcript doesn't answer are left exactly as they are ("don't know → ignore").
+# Needs scope docx:document (edit) and the doc shared to the app as editable.
+# ---------------------------------------------------------------------------
+
+def _p0_p0docs_enabled() -> bool:
+    return _lark_env_truthy_or_default("P0_P0DOCS_ENABLE", default=True)
+
+
+def _p0_p0docs_trigger() -> str:
+    return _cfg_str("P0_P0DOCS_TRIGGER", "/p0docs").strip() or "/p0docs"
+
+
+def _p0_doc_link_to_document_id(link: str) -> Tuple[str, str]:
+    """(document_id, error). Accepts a /docx/<token> or /wiki/<token> URL (wiki → obj_token)."""
+    m = re.search(r"/docx/([A-Za-z0-9]{10,64})", link or "")
+    if m:
+        return m.group(1), ""
+    m = re.search(r"/wiki(?:/[a-z]{2}-[A-Z]{2})?/([A-Za-z0-9]{10,64})", link or "")
+    if not m:
+        return "", "链接里没有 /wiki/ 或 /docx/ 文档 / no wiki or docx document in the link"
+    try:
+        j = _p0_lark_get_json("/open-apis/wiki/v2/spaces/get_node",
+                              {"token": m.group(1), "obj_type": "wiki"})
+    except Exception as e:
+        return "", f"wiki get_node error: {e.__class__.__name__}"
+    if int(j.get("code", -1)) != 0:
+        return "", f"wiki get_node code={j.get('code')} msg={j.get('msg')}"
+    n = (j.get("data") or {}).get("node") or {}
+    if (n.get("obj_type") or "") != "docx":
+        return "", f"wiki node is {n.get('obj_type')!r}, not a docx document"
+    return _lark_dict_pick_str(n, "obj_token", "objToken"), ""
+
+
+_P0_DOCX_TEXT_KEYS = ("text", "heading1", "heading2", "heading3", "heading4", "heading5",
+                      "heading6", "heading7", "heading8", "heading9", "bullet", "ordered",
+                      "todo", "quote", "page")
+
+
+def _p0_docx_text_blocks(document_id: str) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """([{id, text}], error). All text-bearing blocks of the doc, in document order."""
+    out: List[Dict[str, str]] = []
+    page = ""
+    last_err: Dict[str, Any] = {}
+    for kind, tok in _p0_minutes_tokens():
+        out, page, ok = [], "", True
+        for _ in range(40):
+            try:
+                r = requests.get(
+                    f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks",
+                    headers={"Authorization": f"Bearer {tok}"},
+                    params={"page_size": 500, **({"page_token": page} if page else {})},
+                    timeout=30,
+                )
+                j = r.json()
+            except Exception as e:
+                last_err, ok = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}, False
+                break
+            if int(j.get("code", -1)) != 0:
+                last_err, ok = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}, False
+                break
+            data = j.get("data") or {}
+            for b in data.get("items") or []:
+                if not isinstance(b, dict):
+                    continue
+                for key in _P0_DOCX_TEXT_KEYS:
+                    body = b.get(key)
+                    if isinstance(body, dict) and isinstance(body.get("elements"), list):
+                        txt = "".join(
+                            (el.get("text_run") or {}).get("content") or ""
+                            for el in body["elements"] if isinstance(el, dict)
+                        )
+                        out.append({"id": str(b.get("block_id") or ""), "text": txt, "kind": key})
+                        break
+            if not data.get("has_more"):
+                break
+            page = str(data.get("page_token") or "")
+            if not page:
+                break
+        if ok:
+            return out, {}
+        logger.info("p0 p0docs list blocks via %s token failed: %s", kind, last_err)
+    return [], last_err or {"code": "NO_TOKEN", "msg": "no usable token"}
+
+
+def _p0_docx_patch_block(document_id: str, block_id: str, new_text: str) -> Tuple[bool, Dict[str, Any]]:
+    body = {"update_text_elements": {"elements": [{"text_run": {"content": new_text}}]}}
+    last_err: Dict[str, Any] = {}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.patch(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}",
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True, {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+    return False, last_err
+
+
+def _p0_p0docs_ai_updates(blocks: List[Dict[str, str]], transcript: str,
+                          meta: Dict[str, str]) -> Tuple[List[Dict[str, str]], str]:
+    """([{id, text}], error). Ask Qwen which blocks to fill; unknown fields are omitted."""
+    url = _p0_qa_ollama_url()
+    model = _p0_qa_model()
+    timeout = max(10.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
+                                   max(900.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))))
+    num_ctx = max(2048, _cfg_int("P0_QA_NUM_CTX", 16384))
+    cap = max(3000, _cfg_int("P0_P0DOCS_TRANSCRIPT_CHARS", 12000))
+    tr = transcript or ""
+    if len(tr) > cap:
+        head = int(cap * 0.75)
+        tr = tr[:head] + "\n…(中间省略/omitted)…\n" + tr[-(cap - head):]
+    doc_lines = "\n".join(
+        f"[{b['id']}] {b['text']}" for b in blocks if (b.get("id") and (b.get("text") or "").strip())
+    )
+    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items() if v)
+    style = _cfg_str("P0_P0DOCS_PROMPT", "").strip() or (
+        "You fill a P0 incident report document from a meeting transcript.\n"
+        "INPUT 1 is the document: one line per block as `[block_id] current text`. Lines containing "
+        "[placeholders], 'e.g.', 'Insert', or blanks after a label are fields to fill.\n"
+        "INPUT 2 is known metadata. INPUT 3 is the raw meeting transcript (mixed Chinese/English, "
+        "has speech-recognition errors).\n"
+        "Rules:\n"
+        "1) Output ONLY JSON: {\"updates\": [{\"id\": \"<block_id>\", \"text\": \"<full new text for that block>\"}]}.\n"
+        "2) Include a block ONLY when the transcript or metadata clearly answers it — if you do not "
+        "know, DO NOT include that block at all. Never guess or invent facts, names, numbers or links.\n"
+        "3) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
+        "placeholder part, e.g. `🕐 Start Time: 21:05`.\n"
+        "4) Keep the document's language style (labels stay as-is; filled values may be Chinese or English "
+        "as the transcript dictates). Timeline entries: short factual lines with the speaker's name.\n"
+        "5) Do not modify instructional lines (填写指引, Tip, Stage 标签说明, category option lists)."
+    )
+    user = (f"INPUT 1 — DOCUMENT BLOCKS:\n{doc_lines}\n\n"
+            f"INPUT 2 — METADATA:\n{meta_lines or '-'}\n\n"
+            f"INPUT 3 — TRANSCRIPT:\n{tr}")
+    body: Dict[str, Any] = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [{"role": "system", "content": style}, {"role": "user", "content": user}],
+        "options": {"temperature": 0.1, "num_ctx": num_ctx},
+        "think": False,
+    }
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        raw = _monitoring_ai_extract_ollama_text(r.json())
+    except Exception:
+        logger.exception("p0 p0docs model call failed")
+        return [], "模型调用失败/超时 / model call failed or timed out — check the journal"
+    try:
+        parsed = json.loads(raw)
+        ups = parsed.get("updates") if isinstance(parsed, dict) else None
+        if not isinstance(ups, list):
+            return [], "模型没有返回 updates 列表 / model returned no updates list"
+        valid_ids = {b["id"]: b for b in blocks if b.get("id")}
+        out: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for u in ups:
+            if not isinstance(u, dict):
+                continue
+            bid = str(u.get("id") or "").strip()
+            txt = str(u.get("text") or "").strip()
+            if not bid or not txt or bid not in valid_ids or bid in seen:
+                continue
+            if txt == (valid_ids[bid].get("text") or "").strip():
+                continue  # no-op
+            seen.add(bid)
+            out.append({"id": bid, "text": txt[:2000]})
+        return out, ""
+    except Exception:
+        logger.exception("p0 p0docs JSON parse failed: %r", raw[:300])
+        return [], "模型输出不是有效 JSON / model output was not valid JSON"
+
+
+def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+
+    def _card(title: str, template: str, lines: List[str]) -> None:
+        if rt and rv:
+            _p0_meeting_send_card(rt, rv, "", template, title, lines)
+
+    try:
+        a = (arg or "").strip()
+        # The doc target is the /wiki/ or /docx/ link; everything else is the meeting reference.
+        mdoc = re.search(r"https?://\S*/(?:wiki|docx)/[A-Za-z0-9]+\S*", a)
+        if not mdoc:
+            _card("⚠️ /p0docs 用法 / usage", "red",
+                  [f"`{_p0_p0docs_trigger()} <会议链接|9位会议号|妙记链接> <文档链接(/wiki/ 或 /docx/)>`",
+                   "会议部分留空 = 最近一次机器人录制的会议 / empty meeting part = last bot-recorded meeting"])
+            return
+        doc_link = mdoc.group(0)
+        meeting_arg = (a[:mdoc.start()] + " " + a[mdoc.end():]).strip()
+
+        document_id, derr = _p0_doc_link_to_document_id(doc_link)
+        if not document_id:
+            _card("⚠️ 文档无法访问 / doc not accessible", "red", [derr])
+            return
+
+        token, err = _p0_whotalk_resolve_minute_token(meeting_arg)
+        if not token:
+            _card("⚠️ 会议无法解析 / meeting not resolved", "red", [err])
+            return
+        transcript = ""
+        if _lark_env_truthy("P0_P0DOCS_USE_LOCAL_ASR") and _p0_whotalk_asr_enabled():
+            transcript, _aerr = _p0_whotalk_local_transcribe(token)
+        if not transcript:
+            transcript, terr = _p0_minutes_transcript(token)
+        if not transcript:
+            _card("⚠️ 无法取得转写 / transcript unavailable", "red",
+                  [f"`code={terr.get('code')}  msg={terr.get('msg')}`",
+                   "参考 /whotalk 的权限要求 / see /whotalk permission requirements"])
+            return
+
+        blocks, berr = _p0_docx_text_blocks(document_id)
+        if not blocks:
+            _card("⚠️ 读取文档失败 / could not read doc", "red",
+                  [f"`code={berr.get('code')}  msg={berr.get('msg')}`",
+                   "应用需 docx 读取权限且文档已共享给应用 / grant docx read + share the doc with the app"])
+            return
+
+        host = ""
+        mm = re.search(r"https?://([^/]+)/", doc_link)
+        if mm:
+            host = mm.group(1)
+        meta = {
+            "meeting minutes/recording link": (f"https://{host}/minutes/{token}" if host else ""),
+            "meeting number": _p0_parse_meeting_no(meeting_arg),
+            "today's date": time.strftime("%Y/%m/%d"),
+        }
+        if rt and rv:
+            _lark_send_text_auto(rt, rv,
+                                 f"📝 转写已取得（{len(transcript)} 字符），Qwen 正在填写文档（{len(blocks)} 行），请稍候…\n"
+                                 f"Transcript fetched ({len(transcript)} chars) — Qwen is filling the doc "
+                                 f"({len(blocks)} blocks), please wait…")
+        updates, uerr = _p0_p0docs_ai_updates(blocks, transcript, meta)
+        if uerr:
+            _card("⚠️ 填写失败 / fill failed", "red", [uerr])
+            return
+        if not updates:
+            _card("ℹ️ 没有可填写的内容 / nothing fillable", "blue",
+                  ["模型没有从会议中找到可确定的字段。/ The model found no fields it could fill with confidence."])
+            return
+        okc, failc = 0, 0
+        first_err: Dict[str, Any] = {}
+        for u in updates:
+            ok, perr = _p0_docx_patch_block(document_id, u["id"], u["text"])
+            if ok:
+                okc += 1
+            else:
+                failc += 1
+                first_err = first_err or perr
+        logger.info("p0 p0docs done doc=%s filled=%d failed=%d", document_id[:12], okc, failc)
+        if okc and not failc:
+            _card("✅ 文档已填写 / doc filled", "green",
+                  [f"已填写 **{okc}** 个字段（不确定的字段保持原样）。/ Filled **{okc}** fields "
+                   "(unknown fields left untouched).", f"[打开文档 / open the doc]({doc_link})"])
+        elif okc:
+            _card("⚠️ 部分填写 / partially filled", "orange",
+                  [f"成功 {okc}，失败 {failc}：`code={first_err.get('code')} msg={first_err.get('msg')}`",
+                   f"[打开文档 / open the doc]({doc_link})"])
+        else:
+            # nothing written — likely no edit permission; deliver the content in chat instead
+            hint = ("应用需要 `docx:document`（编辑）权限并发布版本，且文档/知识库需以 **可编辑** 共享给应用。\n"
+                    "Grant + publish the `docx:document` (edit) scope and share the doc/wiki with the app as EDITABLE.")
+            _card("⚠️ 无法写入文档 / could not write doc", "red",
+                  [f"`code={first_err.get('code')}  msg={first_err.get('msg')}`", hint,
+                   "以下是生成的内容，可手动粘贴 / generated content below for manual paste:"])
+            filled = "\n".join(f"{u['text']}" for u in updates)
+            _p0_send_answer(rt, rv, f"{_p0_p0docs_trigger()} — 填写内容 / filled fields", filled)
+    except Exception:
+        logger.exception("p0 p0docs worker failed")
+        _card("⚠️ 内部错误 / internal error", "red", ["请查看服务器日志 / check the server logs."])
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_p0docs(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle "/p0docs <meeting> <doc link>". Returns True when handled."""
+    if not _p0_p0docs_enabled():
+        return False
+    body = _p0_command_body((clean or "").strip(), _p0_p0docs_trigger())
+    if body is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_p0docs__\n{(body or '')[:80]}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    logger.info("p0 p0docs accepted arg=%r chat=%s", (body or "")[:80], bool(chat_id))
+    try:
+        threading.Thread(
+            target=_p0_p0docs_worker,
+            args=(chat_id or "", open_id or "", body or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-p0docs",
+        ).start()
+    except Exception:
+        logger.exception("p0 p0docs worker thread failed to start")
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
     return True
@@ -12388,6 +12752,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     # p0bot: admin OAuth for the meeting report (/vcauth, /vccode) — before /meeting.
     if _p0_try_handle_vcauth(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/p0docs <meeting> <doc link>" → fill the P0 incident doc from the meeting.
+    if _p0_try_handle_p0docs(
         chat_id=chat_id,
         open_id=open_id or "",
         clean=clean or "",
