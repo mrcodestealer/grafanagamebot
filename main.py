@@ -9244,7 +9244,10 @@ def _p0_mentions_contain_bot(mentions: Any) -> bool:
 
 
 def _p0_command_body(text_clean: str, trigger: str) -> Optional[str]:
-    """If ``text_clean`` is ``<trigger>`` or ``<trigger> body``, return body (possibly ''); else None."""
+    """If ``text_clean`` is ``<trigger>`` or ``<trigger> body``, return body (possibly ''); else None.
+
+    Any whitespace may separate trigger and body — pasted link cards often put the body on a
+    new line (``/p0docs\\n<card>``), which must still trigger."""
     c = (text_clean or "").strip()
     t = (trigger or "").strip()
     if not c or not t:
@@ -9253,7 +9256,7 @@ def _p0_command_body(text_clean: str, trigger: str) -> Optional[str]:
     tl = t.lower()
     if cl == tl:
         return ""
-    if cl.startswith(tl + " "):
+    if cl.startswith(tl) and len(c) > len(t) and c[len(t)].isspace():
         return c[len(t):].strip()
     return None
 
