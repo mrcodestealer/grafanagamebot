@@ -10502,6 +10502,10 @@ def _p0_vc_admin_allowed(open_id: str) -> bool:
         # Fail closed: an unconfigured allowlist must not let anyone authorize, since a stored
         # token is shared and a non-admin's token would clobber a working admin token (DoS).
         return False
+    if "*" in allow:
+        # Explicit opt-in to "anyone may authorize". Note the stored token is bot-wide and
+        # last-writer-wins: whoever ran /vcauth most recently is the identity /whotalk uses.
+        return True
     return (open_id or "").strip() in allow
 
 
