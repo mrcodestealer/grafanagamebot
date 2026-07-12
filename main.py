@@ -10956,13 +10956,13 @@ def _p0_p0docs_ai_updates(
         "NEVER fill the 'OSE On-duty' and 'Message Link' lines — leave them untouched for manual filling.\n"
         "5) `text` replaces the whole block line: keep the field's label/emoji prefix and replace the "
         "placeholder part.\n"
-        "6) \"timeline\": 3-15 KEY chronological events (detection, escalation, findings, fix actions, "
-        "verification — not every sentence), each as an object "
-        "{\"time\": \"HH:MM:SS\", \"stage\": \"<Detection|Investigation|Mitigation|Recovery|Closed>\", "
-        "\"event\": \"<who did/said what>\"}. Take the time from the [HH:MM:SS] marker of the transcript "
-        "line the event comes from. Name the people involved, e.g. "
-        "{\"time\": \"22:03:15\", \"stage\": \"Investigation\", \"event\": \"Reynold: SDK 资源加载 100ms 内"
-        "失败，怀疑网络供应商限制域名\"}. Empty list if the transcript is too unclear.\n"
+        "6) \"timeline\": a chronological incident log, each entry {\"time\": \"HH:MM:SS\", "
+        "\"event\": \"<who: what>\"} (no stage field). Include EVERY substantive item: each question "
+        "AND its answer (name both people, e.g. \"Zora War asked whether tonight's event is affected; "
+        "Reynold answered it's fixed once YK's change lands\"), findings, decisions, fix actions, "
+        "verifications. EXCLUDE pure filler — greetings, OK/嗯/好的/thanks, repeats. Take the time from "
+        "the [HH:MM:SS] marker of the source transcript line. A full meeting typically yields 10-40 "
+        "entries.\n"
         "7) \"metrics\": response-time metrics you can determine from the timed transcript, each "
         "{\"metric\": \"<TTD|TTR|TTE|TTM|TTF|Impact Duration>\", \"time\": \"<HH:MM:SS when that phase "
         "happened, or N/A>\", \"duration\": \"<e.g. 12 min>\"}. Definitions: TTD = problem occurred → "
@@ -11008,7 +11008,7 @@ def _p0_p0docs_ai_updates(
                                     "duration": str(m_.get("duration") or "").strip()})
     timeline: List[Dict[str, str]] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("timeline"), list):
-        for t in parsed["timeline"][:15]:
+        for t in parsed["timeline"][:40]:
             if isinstance(t, dict):
                 ev = str(t.get("event") or t.get("text") or "").strip()
                 if ev:
@@ -11155,16 +11155,11 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 first_err = first_err or perr
         tl_count = 0
         if timeline:
-            stage_label = {
-                "detection": "Detection (发现问题)", "investigation": "Investigation (调查分析)",
-                "mitigation": "Mitigation (执行修复)", "recovery": "Recovery (验证恢复)",
-                "closed": "Closed (事件关闭)",
-            }
-            # Preferred: append real rows into the Incident Log embedded sheet (Time|Stage|Event|Attachment).
+            # Preferred: append real rows into the Incident Log embedded sheet
+            # (Time | Stage | Event | Attachment — Stage deliberately left blank for manual tagging).
             sheet_tok = _p0_docx_find_sheet_after(items, "Incident Log")
             if sheet_tok:
-                rows = [[t.get("time", ""), stage_label.get((t.get("stage") or "").lower(), t.get("stage", "")),
-                         t.get("event", ""), ""] for t in timeline]
+                rows = [[t.get("time", ""), "", t.get("event", ""), ""] for t in timeline]
                 ok, serr = _p0_sheet_append_rows(sheet_tok, rows)
                 if ok:
                     tl_count = len(rows)
@@ -11174,9 +11169,7 @@ def _p0_p0docs_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_k
                 # Fallback: text lines under the heading.
                 lines = []
                 for t in timeline:
-                    parts = [p for p in (f"[{t['time']}]" if t.get("time") else "",
-                                         stage_label.get((t.get("stage") or "").lower(), t.get("stage", "")),
-                                         t.get("event", "")) if p]
+                    parts = [p for p in (f"[{t['time']}]" if t.get("time") else "", t.get("event", "")) if p]
                     lines.append(" ".join(parts))
                 tl_count, tlerr = _p0_docx_insert_after(document_id, items, "Incident Log", lines)
                 if not tl_count:
