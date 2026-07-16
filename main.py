@@ -14120,7 +14120,8 @@ def start_lark_ws_client_blocking() -> None:
     # The bot's own ACK/DONE reactions echo back as reaction events; task/* arrive from other
     # apps in the tenant. Extend via LARK_WS_IGNORE_EVENTS (comma/;-separated) as needed.
     _ignore_default = ("im.message.reaction.created_v1,im.message.reaction.deleted_v1,"
-                       "im.message.recalled_v1,task.task.update_tenant_v1")
+                       "im.message.recalled_v1,task.task.update_tenant_v1,"
+                       "vc.meeting.recording_ended_v1")
     for _ignore_t in _cfg_str("LARK_WS_IGNORE_EVENTS", _ignore_default).replace(";", ",").split(","):
         _ignore_t = _ignore_t.strip()
         if _ignore_t:
