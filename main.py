@@ -477,6 +477,9 @@ _CFG: Dict[str, Any] = {
     "P0_OPENMEETING_ENABLE": "0",
     "P0_OPENMEETING_TRIGGER": "/openmeeting",
     "P0_ENDMEETING_TRIGGER": "/endmeeting",
+    # /checkmeeting <name> — search bot-hosted meetings for participants whose name matches,
+    # showing join/leave times (empty name = list everyone currently tracked).
+    "P0_CHECKMEETING_TRIGGER": "/checkmeeting",
     # Meeting owner + assigned host + recording recipient — a real Lark user open_id (REQUIRED).
     "P0_MEETING_HOST_OPEN_ID": "ou_5f660c0fb0769d184aca635d02209272",
     # Where joins/leaves/end are announced; empty = the chat where /openmeeting was run.
@@ -9448,6 +9451,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, _p0_members_trigger()) is not None
         or _p0_command_body(text_clean, _p0_om_open_trigger()) is not None
         or _p0_command_body(text_clean, _p0_om_end_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_checkmeeting_trigger()) is not None
         or _p0_command_body(text_clean, _p0_whotalk_trigger()) is not None
         or _p0_command_body(text_clean, _p0_p0docs_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
@@ -12179,6 +12183,10 @@ def _p0_om_end_trigger() -> str:
     return _cfg_str("P0_ENDMEETING_TRIGGER", "/endmeeting").strip() or "/endmeeting"
 
 
+def _p0_checkmeeting_trigger() -> str:
+    return _cfg_str("P0_CHECKMEETING_TRIGGER", "/checkmeeting").strip() or "/checkmeeting"
+
+
 def _p0_om_host_open_id() -> str:
     return _cfg_str("P0_MEETING_HOST_OPEN_ID", "").strip()
 
@@ -12519,9 +12527,15 @@ def _p0_om_on_join(ce: Any) -> None:
             if key:
                 rec["present"].add(key)
             chat = rec.get("chat_id") or _p0_om_announce_chat_default()
+        name = _p0_om_display(op, chat)  # resolves name (network) — do outside the lock
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is not None:
+                roster = rec.setdefault("roster", {})
+                roster[key or name] = {"name": name, "join_ts": time.time(), "leave_ts": 0.0}
         logger.info("p0 om join no=%s → announcing to chat=%s", mno, (chat or "")[:12])
         _p0_om_card(chat, "🟢 加入会议 / Joined", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
-                    [f"**{_p0_om_display(op, chat)}** 加入了会议 / joined the meeting"])
+                    [f"**{name}** 加入了会议 / joined the meeting"])
     except Exception:
         logger.exception("p0 openmeeting join handler failed")
 
@@ -12544,11 +12558,21 @@ def _p0_om_on_leave(ce: Any) -> None:
             if key:
                 rec["present"].discard(key)
             chat = rec.get("chat_id") or _p0_om_announce_chat_default()
+        name = _p0_om_display(op, chat)  # resolves name (network) — do outside the lock
+        with _p0_om_lock:
+            rec = _p0_om_active.get(mno)
+            if rec is not None:
+                roster = rec.setdefault("roster", {})
+                entry = roster.get(key)
+                if entry is not None:
+                    entry["leave_ts"] = time.time()
+                else:
+                    roster[key or name] = {"name": name, "join_ts": 0.0, "leave_ts": time.time()}
         reason = str(ev.get("leave_reason") or ev.get("leaveReason") or "").strip()
         why = {"1": "", "2": "（会议结束/meeting ended）", "3": "（被移出/removed）"}.get(reason, "")
         logger.info("p0 om leave no=%s reason=%s → announcing to chat=%s", mno, reason or "?", (chat or "")[:12])
         _p0_om_card(chat, "🔴 离开会议 / Left", _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise",
-                    [f"**{_p0_om_display(op, chat)}** 离开了会议 / left the meeting {why}"])
+                    [f"**{name}** 离开了会议 / left the meeting {why}"])
     except Exception:
         logger.exception("p0 openmeeting leave handler failed")
 
@@ -12994,6 +13018,101 @@ def _p0_try_handle_openmeeting(*, chat_id, open_id, clean, mid, im_event_id, sen
     if _p0_command_body((clean or "").strip(), _p0_om_open_trigger()) is not None:
         return _p0_om_dispatch("open", chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time)
     return False
+
+
+def _p0_checkmeeting_worker(chat_id: str, open_id: str, query: str, mid: str, debounce_key: str) -> None:
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+    rt, rv = ("chat_id", chat_id) if (chat_id or "").strip() else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+
+    def _out(title: str, template: str, lines: List[str]) -> None:
+        if rt == "chat_id" and rv:
+            _p0_om_card(rv, title, template, lines)   # _p0_om_card falls back to text on failure
+        elif rt:
+            _lark_send_text_auto(rt, rv, f"{title}\n\n" + "\n\n".join(lines))
+
+    try:
+        q = (query or "").strip().lower()
+        # Snapshot the tracked rosters under the lock; match names against the query.
+        matches: List[Tuple[str, str, float, float]] = []  # (name, meeting_no, join_ts, leave_ts)
+        with _p0_om_lock:
+            for mno, rec in _p0_om_active.items():
+                for entry in (rec.get("roster") or {}).values():
+                    nm = str(entry.get("name") or "")
+                    if q and q not in nm.lower():
+                        continue
+                    matches.append((nm, mno, float(entry.get("join_ts") or 0.0), float(entry.get("leave_ts") or 0.0)))
+        title = f"🔎 会中查找 / In meeting: “{query.strip()}”" if q else "🔎 会中人员 / Meeting roster"
+        if not matches:
+            hint = ((f"当前没有名字含 “{query.strip()}” 的与会者。" if q else "当前没有被跟踪的与会者。")
+                    + "（仅跟踪由 /openmeeting 创建的会议，重启后清空）\n"
+                    + (f"No participant matching “{query.strip()}” right now." if q else "No tracked participants right now.")
+                    + " (Only /openmeeting-created meetings are tracked; cleared on restart.)")
+            _out(title, "orange", [hint])
+            return
+        # In-meeting first, then most recent join; format times in local tz.
+        matches.sort(key=lambda t: (t[3] != 0.0, -(t[2] or 0.0)))
+        lines: List[str] = []
+        for nm, mno, jt, lt in matches:
+            j = time.strftime("%H:%M:%S", time.localtime(jt)) if jt else "—"
+            if lt:
+                status = f"🔴 {j} → {time.strftime('%H:%M:%S', time.localtime(lt))} 离开/left"
+            else:
+                status = f"🟢 {j} 加入，仍在会中 / joined, still in meeting"
+            lines.append(f"**{nm}**（会议号/No. {mno}）\n{status}")
+        _out(title, _cfg_str("P0_OPENMEETING_CARD_TEMPLATE", "turquoise").strip() or "turquoise", lines)
+    except Exception:
+        logger.exception("p0 checkmeeting worker failed")
+        if rt:
+            try:
+                _lark_send_text_auto(rt, rv, "查询失败，请查看日志 / lookup failed — check the server logs.")
+            except Exception:
+                pass
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_checkmeeting(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time) -> bool:
+    """`/checkmeeting <name>` → find matching participants in bot-hosted meetings + join/leave times."""
+    if not _p0_om_enabled():
+        return False
+    body = _p0_command_body((clean or "").strip(), _p0_checkmeeting_trigger())
+    if body is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_checkmeeting__\n{(body or '')[:40].lower()}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    try:
+        threading.Thread(
+            target=_p0_checkmeeting_worker,
+            args=(chat_id or "", open_id or "", body or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-checkmeeting",
+        ).start()
+    except Exception:
+        logger.exception("p0 checkmeeting worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
 
 
 def _monitoring_watchdog_loop() -> None:
@@ -13670,6 +13789,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     # p0bot: bot-hosted meeting (/openmeeting, /endmeeting) — before other commands.
     if _p0_try_handle_openmeeting(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/checkmeeting <name>" → find matching participants + join/leave times.
+    if _p0_try_handle_checkmeeting(
         chat_id=chat_id,
         open_id=open_id or "",
         clean=clean or "",

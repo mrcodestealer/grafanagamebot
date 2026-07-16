@@ -74,6 +74,12 @@ Enable: `P0_OPENMEETING_ENABLE=1` + set `P0_MEETING_HOST_OPEN_ID` (a real Lark u
 `recording_ready_v1`. **Cloud recording must be enabled** for the tenant, and a meeting only
 records if someone actually joins.
 
+**Find someone in the call:** `/checkmeeting <name>` searches the bot-hosted meetings the bot is
+tracking and lists every participant whose name matches, with their join time and (if they've
+left) leave time — e.g. `/checkmeeting jun` → `Jun Chen 🟢 joined 07:17:54, still in meeting` /
+`Jun Hong 🔴 07:10 → 07:18 left`. Empty name lists everyone. Only meetings created via
+`/openmeeting` are tracked (the roster is in-memory and cleared on restart).
+
 **Ending:** the host ends it in the Lark client (always works → bot announces it). `/endmeeting`
 tries the API too, but Lark only lets a **user** end a meeting and only if they're the host *in
 the call* — so `/endmeeting` works only if the host authorized via `/vcauth` and is in the meeting.
