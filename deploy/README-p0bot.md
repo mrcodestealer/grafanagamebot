@@ -144,6 +144,26 @@ sherpa-onnx + the model), add scope **`minutes:minutes.media:export`** (+ publis
 re-`/vcauth`), then `P0_WHOTALK_ASR_ENABLE=1` and restart. The "transcript fetched" message
 shows which source was used; any local-ASR failure automatically falls back to Lark's text.
 
+## "Is this a P0?" keyword detection
+
+Whole-word **"p0"**/"P0" in a watched chat (default: `P0_OPENMEETING_ANNOUNCE_CHAT_ID`) posts a
+card asking to confirm — **reply `/confirmp0`** within the confirm window (default 15 min) if it's
+real. Confirming tags the current on-duty (same D/N roster `/p0docs` uses) and auto-runs
+`/openmeeting`. A card is shown at most once per cooldown window (default 45 min) per chat, so a
+fast-moving conversation repeating "p0" doesn't spam it.
+
+**Why reply instead of clickable Yes/Cancel buttons:** a real button click needs a round-trip back
+to the bot (a "callback" behavior), which requires either the HTTP webhook (this bot runs
+`ENABLE_HTTP=0` — WS-only, no public port, by design) or a `CARD` frame over the long connection.
+The pinned `lark-oapi` client (`v1.7.1`, the newest release on PyPI/GitHub — nothing newer exists
+to fix this) silently discards `CARD` frames in its WS loop before any handler ever sees them
+(verified directly in the SDK source: `ws/client.py` → `elif message_type == MessageType.CARD:
+return`). Confirming by replying uses the same `im.message.receive_v1` pipeline every other
+command already runs on, which is proven to work with no infrastructure change.
+
+Config: `P0_DETECT_ENABLE`, `P0_DETECT_CHAT_IDS` (empty = the openmeeting announce chat),
+`P0_DETECT_COOLDOWN_SECONDS`, `P0_DETECT_CONFIRM_WINDOW_SECONDS`, `P0_DETECT_CONFIRM_TRIGGER`.
+
 ## Fill the P0 incident doc ("/p0docs")
 
 `/p0docs <meeting link|9-digit no|minutes link> <doc link>` — the bot pulls the meeting's

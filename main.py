@@ -354,6 +354,22 @@ _CFG: Dict[str, Any] = {
     "P0_WHOTALK_QA_TIMEOUT_SECONDS": "900",
     # Lookback (hours) when resolving a bare meeting number to its meeting id via list_by_no.
     "P0_WHOTALK_LOOKBACK_HOURS": "72",
+    # ---- "p0" keyword detection: ask "is this a P0?" via a card, confirm by replying ----
+    # Real Yes/Cancel BUTTONS need a callback round-trip to the bot (HTTP webhook, which this
+    # bot doesn't run — ENABLE_HTTP=0, WS-only, no public port — or a CARD frame over the long
+    # connection, which the pinned lark-oapi client v1.7.1, the newest release available, silently
+    # discards in its WS loop before any handler sees it). So confirmation is a plain text reply
+    # over the already-proven IM pipeline: whole-word "p0" in a watched chat -> card asking to
+    # reply P0_DETECT_CONFIRM_TRIGGER within the confirm window -> tags on-duty + auto-/openmeeting.
+    "P0_DETECT_ENABLE": "1",
+    # Comma/semicolon-separated chat_ids to watch; empty = P0_OPENMEETING_ANNOUNCE_CHAT_ID.
+    "P0_DETECT_CHAT_IDS": "",
+    # Don't re-show the card in the same chat within this many seconds of the last one.
+    "P0_DETECT_COOLDOWN_SECONDS": "2700",
+    # How long a shown card stays confirmable via P0_DETECT_CONFIRM_TRIGGER.
+    "P0_DETECT_CONFIRM_WINDOW_SECONDS": "900",
+    "P0_DETECT_CONFIRM_TRIGGER": "/confirmp0",
+    "P0_DETECT_CARD_TEMPLATE": "red",
     # ---- /whotalk hybrid LOCAL ASR: the bot downloads the recording audio and transcribes it ----
     # itself (SenseVoiceSmall via sherpa-onnx) instead of using Lark's ASR text. Speaker names +
     # timestamps still come from the Minutes SRT export; only the heard TEXT is local. Setup:
@@ -9437,6 +9453,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
         or _p0_command_body(text_clean, "/whoami") is not None
+        or _p0_command_body(text_clean, _p0_detect_confirm_trigger()) is not None
     )
 
     kind = ""
@@ -12724,6 +12741,198 @@ def _p0_any_feature_enabled() -> bool:
     return _p0_qa_enabled() or _p0_meeting_enabled() or _p0_members_enabled() or _p0_om_enabled()
 
 
+# ---------------------------------------------------------------------------
+# p0bot — "p0" keyword detection: ask "is this a P0?" via a card, confirm by reply
+#
+# See the P0_DETECT_* config comment for why this is reply-based rather than
+# clickable buttons: card callback clicks need a round-trip to the bot (HTTP
+# webhook, disabled here, or a CARD frame over the long connection, which the
+# pinned lark-oapi WS client discards before any handler sees it). This uses
+# the same im.message.receive_v1 pipeline every other command already runs on.
+# ---------------------------------------------------------------------------
+
+_P0_DETECT_WORD_RE = re.compile(r"(?<![0-9A-Za-z])p0(?![0-9A-Za-z])", re.IGNORECASE)
+
+_p0_detect_lock = threading.Lock()
+_p0_detect_last_fired: Dict[str, float] = {}    # chat_id -> ts of the last card shown (cooldown)
+_p0_detect_pending: Dict[str, float] = {}       # chat_id -> expiry ts for a valid /confirmp0
+_p0_detect_seen_event_ids: Set[str] = set()     # dedup WS redelivery of the same detected message
+
+
+def _p0_detect_enabled() -> bool:
+    return _lark_env_truthy_or_default("P0_DETECT_ENABLE", default=True)
+
+
+def _p0_detect_chat_ids() -> Set[str]:
+    raw = _cfg_str("P0_DETECT_CHAT_IDS", "").strip()
+    ids = {c.strip() for c in re.split(r"[\s,;]+", raw) if c.strip()}
+    if not ids:
+        default = _p0_om_announce_chat_default()
+        if default:
+            ids = {default}
+    return ids
+
+
+def _p0_detect_confirm_trigger() -> str:
+    return _cfg_str("P0_DETECT_CONFIRM_TRIGGER", "/confirmp0").strip() or "/confirmp0"
+
+
+def _p0_detect_confirm_window_seconds() -> float:
+    return max(60.0, _cfg_float("P0_DETECT_CONFIRM_WINDOW_SECONDS", 900.0))
+
+
+def _p0_detect_cooldown_and_arm(chat_id: str) -> bool:
+    """True (and arms a pending /confirmp0 window) if this chat isn't in cooldown."""
+    cool = max(0.0, _cfg_float("P0_DETECT_COOLDOWN_SECONDS", 2700.0))
+    now = time.time()
+    with _p0_detect_lock:
+        last = _p0_detect_last_fired.get(chat_id, 0.0)
+        if now - last < cool:
+            return False
+        _p0_detect_last_fired[chat_id] = now
+        _p0_detect_pending[chat_id] = now + _p0_detect_confirm_window_seconds()
+    return True
+
+
+def _p0_detect_consume_pending(chat_id: str) -> bool:
+    """True (and clears it) if there's a live, unexpired pending confirmation for this chat."""
+    now = time.time()
+    with _p0_detect_lock:
+        exp = _p0_detect_pending.pop(chat_id, 0.0)
+    return now < exp
+
+
+def _p0_detect_maybe_fire(*, chat_id: str, clean: str, mid: str, im_event_id: str,
+                          sender_debounce: str, msg_time: str) -> None:
+    """Passive observer: if the message contains the whole word 'p0' in a watched chat, post a
+    confirm-via-reply card (cooldown-gated). Never consumes the message — normal command
+    dispatch below still runs regardless of what this does."""
+    if not _p0_detect_enabled():
+        return
+    cid = (chat_id or "").strip()
+    if not cid or cid not in _p0_detect_chat_ids():
+        return
+    text = (clean or "").strip()
+    if not text or not _P0_DETECT_WORD_RE.search(text):
+        return
+    ev_key = (im_event_id or "").strip() or _monitoring_processed_stick(mid, im_event_id, cid, sender_debounce, msg_time)
+    if ev_key:
+        with _p0_detect_lock:
+            if ev_key in _p0_detect_seen_event_ids:
+                return
+            _p0_detect_seen_event_ids.add(ev_key)
+            if len(_p0_detect_seen_event_ids) > 2000:
+                _p0_detect_seen_event_ids.clear()
+                _p0_detect_seen_event_ids.add(ev_key)
+    if not _p0_detect_cooldown_and_arm(cid):
+        return
+    trigger = _p0_detect_confirm_trigger()
+    window_min = int(_p0_detect_confirm_window_seconds() // 60)
+    lines = [
+        "检测到消息中提到 **P0**。",
+        f"如果这是一次 P0 事件，请在 **{window_min} 分钟内** 回复 `{trigger}` —— 我会自动开会并 @ 当前值班人员。",
+        "不是的话可以忽略本消息。",
+        "",
+        f"Detected a mention of **P0**. If this is a real P0 incident, reply `{trigger}` within "
+        f"**{window_min} min** — I'll open a meeting and tag the current on-duty. Otherwise ignore this.",
+    ]
+    try:
+        threading.Thread(
+            target=_p0_om_card,
+            args=(cid, "🚨 P0? 确认 / Confirm", _cfg_str("P0_DETECT_CARD_TEMPLATE", "red").strip() or "red", lines),
+            daemon=True,
+            name="p0-detect-card",
+        ).start()
+    except Exception:
+        logger.exception("p0 detect: card send thread failed to start")
+
+
+def _p0_detect_confirm_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -> None:
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+    try:
+        cid = (chat_id or "").strip()
+        rt, rv = ("chat_id", cid) if cid else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+        if not _p0_detect_consume_pending(cid):
+            if rt and rv:
+                _lark_send_text_auto(
+                    rt, rv,
+                    "没有待确认的 P0 提示，或已超时。/ No pending P0 prompt to confirm (or it expired).\n"
+                    f"请先在消息中提到 p0，或直接运行 {_p0_om_open_trigger()}。/ Mention p0 first, or run "
+                    f"{_p0_om_open_trigger()} directly.",
+                )
+            return
+        shift, duty_names = _p0_duty_on(time.time())
+        tag_line = (f"值班 / on-duty（{shift} 班/shift）：" + ", ".join(duty_names)) if duty_names else \
+                   "（未能读取值班表 / could not read the duty roster）"
+        if rt and rv:
+            _lark_send_text_auto(rt, rv, f"✅ 已确认为 P0 / Confirmed as P0.\n{tag_line}")
+        if _p0_om_enabled():
+            om_debounce = f"{cid}\n__p0_om_open__"
+            with _monitoring_reply_dispatch_lock:
+                if om_debounce in _monitoring_inflight_keys:
+                    return
+                _monitoring_inflight_keys.add(om_debounce)
+            try:
+                _p0_om_open_worker(cid, open_id or "", "", om_debounce)
+            except Exception:
+                logger.exception("p0 detect: auto /openmeeting failed")
+                with _monitoring_reply_dispatch_lock:
+                    _monitoring_inflight_keys.discard(om_debounce)
+        elif rt and rv:
+            _lark_send_text_auto(
+                rt, rv,
+                f"提示：{_p0_om_open_trigger()} 未启用（P0_OPENMEETING_ENABLE=0）— 未自动开会。/ "
+                f"{_p0_om_open_trigger()} is disabled — meeting not auto-created.",
+            )
+    except Exception:
+        logger.exception("p0 detect confirm worker failed")
+    finally:
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_confirmp0(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time) -> bool:
+    """`/confirmp0` → consume a pending P0 detection: tag on-duty + auto-run /openmeeting."""
+    if not _p0_detect_enabled():
+        return False
+    if _p0_command_body((clean or "").strip(), _p0_detect_confirm_trigger()) is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_confirmp0__"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    try:
+        threading.Thread(
+            target=_p0_detect_confirm_worker,
+            args=(chat_id or "", open_id or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-confirmp0",
+        ).start()
+    except Exception:
+        logger.exception("p0 confirmp0 worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
 def _p0_try_handle_whoami(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time, im_chat_type) -> bool:
     """`/whoami` → reply the sender's p0bot-namespace open_id + chat_id (open_id is per-app)."""
     if not _p0_any_feature_enabled():
@@ -13433,6 +13642,31 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
         im_chat_type=im_chat_type,
     ):
         return
+
+    # p0bot: "/confirmp0" → consume a pending "is this P0?" detection.
+    if _p0_try_handle_confirmp0(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: passive "p0" keyword watch — never blocks the rest of the dispatch chain.
+    try:
+        _p0_detect_maybe_fire(
+            chat_id=chat_id,
+            clean=clean or "",
+            mid=mid,
+            im_event_id=im_event_id,
+            sender_debounce=sender_debounce,
+            msg_time=msg_time,
+        )
+    except Exception:
+        logger.exception("p0 detect: observer failed")
 
     # p0bot: bot-hosted meeting (/openmeeting, /endmeeting) — before other commands.
     if _p0_try_handle_openmeeting(
