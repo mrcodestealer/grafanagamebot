@@ -370,6 +370,12 @@ _CFG: Dict[str, Any] = {
     "P0_DETECT_CONFIRM_WINDOW_SECONDS": "900",
     "P0_DETECT_CONFIRM_TRIGGER": "/confirmp0",
     "P0_DETECT_CARD_TEMPLATE": "red",
+    # Real 【Confirm】/【Cancel】 BUTTONS on the P0 card. Card-click callbacks arrive as WS "card"
+    # frames, which the pinned lark-oapi client discards (elif MessageType.CARD: return); we re-type
+    # those frames to "event" so the SDK routes them to the registered card.action.trigger handler
+    # and sends the toast/card-update reply back over the WS. REQUIRES the Developer Console
+    # 「事件与回调 → 回调配置 → 使用长连接接收事件」 to be enabled. 0 = buttons off (text /confirmp0 only).
+    "P0_CARD_BUTTONS_ENABLE": "1",
     # ---- /whotalk hybrid LOCAL ASR: the bot downloads the recording audio and transcribes it ----
     # itself (SenseVoiceSmall via sherpa-onnx) instead of using Lark's ASR text. Speaker names +
     # timestamps still come from the Minutes SRT export; only the heard TEXT is local. Setup:
@@ -12851,27 +12857,58 @@ def _p0_detect_maybe_fire(*, chat_id: str, clean: str, mid: str, im_event_id: st
     if not _p0_detect_cooldown_and_arm(cid):
         return
     trigger = _p0_detect_confirm_trigger()
-    window_min = int(_p0_detect_confirm_window_seconds() // 60)
-    lines = [
-        "检测到消息中提到 **P0**。",
-        f"如果这是一次 P0 事件，请在 **{window_min} 分钟内** 回复 `{trigger}` —— 我会自动开会并 @ 当前值班人员。",
-        "不是的话可以忽略本消息。",
-        "",
-        f"Detected a mention of **P0**. If this is a real P0 incident, reply `{trigger}` within "
-        f"**{window_min} min** — I'll open a meeting and tag the current on-duty. Otherwise ignore this.",
-    ]
+    card = _p0_detect_prompt_card(cid)
+
+    def _send() -> None:
+        try:
+            _lark_send_interactive_card("chat_id", cid, card)
+        except Exception:
+            logger.exception("p0 detect card send failed; text fallback")
+            try:
+                _lark_send_text_auto("chat_id", cid,
+                                     f"检测到消息中提到 P0。若确为 P0，请回复 {trigger}。/ "
+                                     f"Detected a P0 mention — reply {trigger} if it's real.")
+            except Exception:
+                logger.exception("p0 detect text fallback failed")
+
     try:
-        threading.Thread(
-            target=_p0_om_card,
-            args=(cid, "🚨 P0? 确认 / Confirm", _cfg_str("P0_DETECT_CARD_TEMPLATE", "red").strip() or "red", lines),
-            daemon=True,
-            name="p0-detect-card",
-        ).start()
+        threading.Thread(target=_send, daemon=True, name="p0-detect-card").start()
     except Exception:
         logger.exception("p0 detect: card send thread failed to start")
 
 
+def _p0_detect_do_confirm(chat_id: str, open_id: str) -> None:
+    """Shared confirm action: tag current on-duty + auto-open a meeting. Used by both /confirmp0
+    and the Confirm button."""
+    cid = (chat_id or "").strip()
+    rt, rv = ("chat_id", cid) if cid else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    shift, duty_names = _p0_duty_on(time.time())
+    tag_line = (f"值班 / on-duty（{shift} 班/shift）：" + ", ".join(duty_names)) if duty_names else \
+               "（未能读取值班表 / could not read the duty roster）"
+    if rt and rv:
+        _lark_send_text_auto(rt, rv, f"✅ 已确认为 P0 / Confirmed as P0.\n{tag_line}")
+    if _p0_om_enabled():
+        om_debounce = f"{cid}\n__p0_om_open__"
+        with _monitoring_reply_dispatch_lock:
+            if om_debounce in _monitoring_inflight_keys:
+                return
+            _monitoring_inflight_keys.add(om_debounce)
+        try:
+            _p0_om_open_worker(cid, open_id or "", "", om_debounce)
+        except Exception:
+            logger.exception("p0 detect: auto /openmeeting failed")
+            with _monitoring_reply_dispatch_lock:
+                _monitoring_inflight_keys.discard(om_debounce)
+    elif rt and rv:
+        _lark_send_text_auto(
+            rt, rv,
+            f"提示：{_p0_om_open_trigger()} 未启用（P0_OPENMEETING_ENABLE=0）— 未自动开会。/ "
+            f"{_p0_om_open_trigger()} is disabled — meeting not auto-created.",
+        )
+
+
 def _p0_detect_confirm_worker(chat_id: str, open_id: str, mid: str, debounce_key: str) -> None:
+    """Text `/confirmp0` path: requires a live pending detection (so it can't fire out of nowhere)."""
     react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
     ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
     try:
@@ -12886,29 +12923,7 @@ def _p0_detect_confirm_worker(chat_id: str, open_id: str, mid: str, debounce_key
                     f"{_p0_om_open_trigger()} directly.",
                 )
             return
-        shift, duty_names = _p0_duty_on(time.time())
-        tag_line = (f"值班 / on-duty（{shift} 班/shift）：" + ", ".join(duty_names)) if duty_names else \
-                   "（未能读取值班表 / could not read the duty roster）"
-        if rt and rv:
-            _lark_send_text_auto(rt, rv, f"✅ 已确认为 P0 / Confirmed as P0.\n{tag_line}")
-        if _p0_om_enabled():
-            om_debounce = f"{cid}\n__p0_om_open__"
-            with _monitoring_reply_dispatch_lock:
-                if om_debounce in _monitoring_inflight_keys:
-                    return
-                _monitoring_inflight_keys.add(om_debounce)
-            try:
-                _p0_om_open_worker(cid, open_id or "", "", om_debounce)
-            except Exception:
-                logger.exception("p0 detect: auto /openmeeting failed")
-                with _monitoring_reply_dispatch_lock:
-                    _monitoring_inflight_keys.discard(om_debounce)
-        elif rt and rv:
-            _lark_send_text_auto(
-                rt, rv,
-                f"提示：{_p0_om_open_trigger()} 未启用（P0_OPENMEETING_ENABLE=0）— 未自动开会。/ "
-                f"{_p0_om_open_trigger()} is disabled — meeting not auto-created.",
-            )
+        _p0_detect_do_confirm(cid, open_id)
     except Exception:
         logger.exception("p0 detect confirm worker failed")
     finally:
@@ -12918,6 +12933,148 @@ def _p0_detect_confirm_worker(chat_id: str, open_id: str, mid: str, debounce_key
                 _p0_lark_remove_reaction(mid, ack_id)
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
+
+
+# ---- Real Confirm/Cancel buttons on the P0 card (card.action.trigger over the long connection) ----
+
+def _p0_card_buttons_enabled() -> bool:
+    return _lark_env_truthy_or_default("P0_CARD_BUTTONS_ENABLE", default=True)
+
+
+_p0_card_seen_lock = threading.Lock()
+_p0_card_seen_msgs: Dict[str, float] = {}   # open_message_id -> ts, to dedup redelivery / double-click
+
+
+def _p0_card_action_dedup(msg_id: str) -> bool:
+    """True the first time this card message's action is seen within a few seconds (dedup)."""
+    if not msg_id:
+        return True
+    now = time.time()
+    with _p0_card_seen_lock:
+        if len(_p0_card_seen_msgs) > 2000:
+            _p0_card_seen_msgs.clear()
+        if now - _p0_card_seen_msgs.get(msg_id, 0.0) < 8.0:
+            return False
+        _p0_card_seen_msgs[msg_id] = now
+    return True
+
+
+def _p0_detect_result_card(state: str, note: str) -> Dict[str, Any]:
+    """Buttonless replacement card shown after Confirm/Cancel."""
+    tmpl = "green" if state == "confirmed" else "grey"
+    title = "✅ 已确认 P0 / Confirmed P0" if state == "confirmed" else "⏹️ 已取消 / Cancelled"
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {"template": tmpl, "title": {"tag": "plain_text", "content": title}},
+        "body": {"elements": [{"tag": "markdown", "content": note}]},
+    }
+
+
+def _p0_detect_prompt_card(cid: str) -> Dict[str, Any]:
+    """The P0 prompt card — with real Confirm/Cancel buttons when P0_CARD_BUTTONS_ENABLE."""
+    trigger = _p0_detect_confirm_trigger()
+    window_min = int(_p0_detect_confirm_window_seconds() // 60)
+    body_md = (
+        "检测到消息中提到 **P0**。这是一次 P0 事件吗？\n"
+        "Detected a mention of **P0**. Is this a real P0 incident?\n\n"
+        f"（也可回复 `{trigger}` 确认；{window_min} 分钟内有效 / or reply `{trigger}` within {window_min} min）"
+    )
+    elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": body_md}]
+    if _p0_card_buttons_enabled():
+        def _btn(text: str, typ: str, v: str) -> Dict[str, Any]:
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": text},
+                "type": typ,
+                "behaviors": [{"type": "callback", "value": {"k": "p0det", "v": v, "cid": cid}}],
+            }
+        elements.append({
+            "tag": "column_set", "flex_mode": "none", "horizontal_spacing": "default",
+            "columns": [
+                {"tag": "column", "width": "weighted", "weight": 1,
+                 "elements": [_btn("✅ 确认 P0 / Confirm", "primary", "confirm")]},
+                {"tag": "column", "width": "weighted", "weight": 1,
+                 "elements": [_btn("✖️ 取消 / Cancel", "default", "cancel")]},
+            ],
+        })
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "header": {"template": _cfg_str("P0_DETECT_CARD_TEMPLATE", "red").strip() or "red",
+                   "title": {"tag": "plain_text", "content": "🚨 P0? 确认 / Confirm"}},
+        "body": {"elements": elements},
+    }
+
+
+def _p0_card_action_handler(data: Any) -> Any:
+    """card.action.trigger handler (reached over WS via the card→event frame patch). Handles the P0
+    Confirm/Cancel buttons: returns a toast + a buttonless updated card, and does the heavy work
+    (roster read + /openmeeting) in a background thread to stay within the ~3s callback window."""
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+    def _resp(toast_type: str, toast_content: str, new_card: Optional[Dict[str, Any]] = None) -> Any:
+        d: Dict[str, Any] = {"toast": {"type": toast_type, "content": (toast_content or "")[:200]}}
+        if new_card is not None:
+            d["card"] = {"type": "raw", "data": new_card}
+        return P2CardActionTriggerResponse(d)
+
+    try:
+        ev = getattr(data, "event", None)
+        action = getattr(ev, "action", None)
+        val = (getattr(action, "value", None) or {}) if action is not None else {}
+        k = str(val.get("k") or "")
+        v = str(val.get("v") or "")
+        ctx = getattr(ev, "context", None)
+        operator = getattr(ev, "operator", None)
+        chat_id = (getattr(ctx, "open_chat_id", "") or "") if ctx is not None else ""
+        msg_id = (getattr(ctx, "open_message_id", "") or "") if ctx is not None else ""
+        open_id = (getattr(operator, "open_id", "") or "") if operator is not None else ""
+        cid = (chat_id or str(val.get("cid") or "")).strip()
+        if k != "p0det":
+            return _resp("info", "")
+        if not _p0_card_action_dedup(msg_id):
+            return _resp("info", "已处理 / already handled")
+        if v == "cancel":
+            with _p0_detect_lock:
+                _p0_detect_pending.pop(cid, None)
+            return _resp("info", "已取消 / Cancelled",
+                         _p0_detect_result_card("cancelled", "已取消，不作为 P0 处理。/ Cancelled — not a P0."))
+        if v == "confirm":
+            with _p0_detect_lock:
+                _p0_detect_pending.pop(cid, None)  # button IS the confirmation; no separate window check
+            debounce_key = f"{cid}\n__p0_confirmp0_btn__"
+            go = False
+            with _monitoring_reply_dispatch_lock:
+                if debounce_key not in _monitoring_inflight_keys:
+                    _monitoring_inflight_keys.add(debounce_key)
+                    go = True
+            if go:
+                def _bg() -> None:
+                    try:
+                        _p0_detect_do_confirm(cid, open_id)
+                    except Exception:
+                        logger.exception("p0 card confirm background failed")
+                    finally:
+                        with _monitoring_reply_dispatch_lock:
+                            _monitoring_inflight_keys.discard(debounce_key)
+                try:
+                    threading.Thread(target=_bg, daemon=True, name="p0-confirmp0-btn").start()
+                except Exception:
+                    logger.exception("p0 card confirm: thread start failed")
+                    with _monitoring_reply_dispatch_lock:
+                        _monitoring_inflight_keys.discard(debounce_key)
+            return _resp("success", "已确认 P0 / Confirmed",
+                         _p0_detect_result_card("confirmed",
+                                                "已确认为 P0，正在开会并 @ 值班人员…\n"
+                                                "Confirmed — opening a meeting and tagging on-duty…"))
+        return _resp("info", "")
+    except Exception:
+        logger.exception("p0 card action handler failed")
+        try:
+            return _resp("error", "内部错误 / internal error")
+        except Exception:
+            return None
 
 
 def _p0_try_handle_confirmp0(*, chat_id, open_id, clean, mid, im_event_id, sender_debounce, msg_time) -> bool:
@@ -14351,6 +14508,46 @@ def _lark_ws_install_recv_frame_method_log(client_cls: Any) -> None:
     _lark_ws_recv_method_log_installed = True
 
 
+_lark_ws_card_action_patched = False
+
+
+def _lark_ws_enable_card_actions(client_cls: Any) -> None:
+    """Make card button clicks work over the long connection.
+
+    The SDK's WS loop discards CARD frames (``elif message_type == MessageType.CARD: return`` in
+    ws/client.py). We re-type the frame's ``type`` header card→event so the ORIGINAL handler takes
+    the EVENT branch and calls ``_do_without_validation(payload)`` — which routes by the PAYLOAD's
+    event_type (``card.action.trigger``) to the handler registered via
+    ``register_p2_card_action_trigger`` and writes its returned toast/card back over the WS.
+    Requires the Developer Console 「事件与回调 → 回调配置 → 使用长连接接收事件」 to be on so Feishu
+    actually pushes these frames. Applied BEFORE the transport-log wrapper so that still logs 'card'.
+    """
+    global _lark_ws_card_action_patched
+    if _lark_ws_card_action_patched or not _p0_card_buttons_enabled():
+        return
+    try:
+        from lark_oapi.ws.const import HEADER_TYPE
+    except Exception:
+        logger.exception("card actions: HEADER_TYPE import failed — card buttons unavailable")
+        return
+    _orig = client_cls._handle_data_frame
+
+    async def _card_aware_handle_data_frame(self: Any, frame: Any) -> None:
+        try:
+            for h in frame.headers:
+                if getattr(h, "key", "") == HEADER_TYPE and getattr(h, "value", "") == "card":
+                    h.value = "event"  # let the SDK's EVENT branch route it through the dispatcher
+                    break
+        except Exception:
+            logger.exception("card actions: frame re-type failed")
+        return await _orig(self, frame)
+
+    client_cls._handle_data_frame = _card_aware_handle_data_frame  # type: ignore[method-assign]
+    _lark_ws_card_action_patched = True
+    logger.info("Lark WS card-action patch applied — card button clicks routed to the dispatcher "
+                "(needs console 回调配置 → 使用长连接接收事件).")
+
+
 def _lark_ws_install_transport_frame_log(client_cls: Any) -> None:
     """
     Log every DATA-frame ``header.type`` (e.g. ``event`` / ``card``). Must patch the **same** ``Client`` class
@@ -14435,6 +14632,7 @@ def start_lark_ws_client_blocking() -> None:
     global _lark_ws_saw_data_frame
     _lark_ws_saw_data_frame = False
     _n_boot = _lark_ws_reset_bootstrap_frame_budget()
+    _lark_ws_enable_card_actions(LarkWsClient)  # before the log wrapper so it still logs 'card'
     _lark_ws_install_transport_frame_log(LarkWsClient)
     _lark_ws_install_recv_frame_method_log(LarkWsClient)
     if _n_boot:
@@ -14509,6 +14707,13 @@ def start_lark_ws_client_blocking() -> None:
             (_p0_om_host_open_id()[:12] or "?"),
             bool(_p0_om_announce_chat_default()),
         )
+    if _p0_card_buttons_enabled():
+        try:
+            bld = bld.register_p2_card_action_trigger(_p0_card_action_handler)
+            logger.info("p0 card buttons enabled — registered card.action.trigger handler "
+                        "(needs console 回调配置 → 使用长连接接收事件).")
+        except Exception:
+            logger.exception("register_p2_card_action_trigger failed — card buttons unavailable")
     handler = bld.build()
     pmap = getattr(handler, "_processorMap", None) or {}
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))

@@ -158,17 +158,20 @@ real. Confirming tags the current on-duty (same D/N roster `/p0docs` uses) and a
 `/openmeeting`. A card is shown at most once per cooldown window (default 45 min) per chat, so a
 fast-moving conversation repeating "p0" doesn't spam it.
 
-**Why reply instead of clickable Yes/Cancel buttons:** a real button click needs a round-trip back
-to the bot (a "callback" behavior), which requires either the HTTP webhook (this bot runs
-`ENABLE_HTTP=0` — WS-only, no public port, by design) or a `CARD` frame over the long connection.
-The pinned `lark-oapi` client (`v1.7.1`, the newest release on PyPI/GitHub — nothing newer exists
-to fix this) silently discards `CARD` frames in its WS loop before any handler ever sees them
-(verified directly in the SDK source: `ws/client.py` → `elif message_type == MessageType.CARD:
-return`). Confirming by replying uses the same `im.message.receive_v1` pipeline every other
-command already runs on, which is proven to work with no infrastructure change.
+**Confirm/Cancel buttons (`P0_CARD_BUTTONS_ENABLE=1`, default on):** the card shows real
+【✅ 确认 P0 / Confirm】 and 【✖️ 取消 / Cancel】 buttons. This works even though the bot is WS-only
+(`ENABLE_HTTP=0`, no public port): a button click arrives as a `CARD` frame over the long
+connection, which the pinned `lark-oapi` client (`v1.7.1`, newest release) normally discards
+(`ws/client.py` → `elif message_type == MessageType.CARD: return`). The bot re-types that frame's
+`type` header `card`→`event` so the SDK's own dispatcher routes the `card.action.trigger` payload
+to the registered handler and sends the toast/updated-card reply back over the WS.
+**One-time console step:** enable **事件与回调 → 回调配置 → 使用长连接接收事件** (save while the bot is
+connected) so Feishu actually pushes card callbacks over the long connection. Replying
+`/confirmp0` still works as a fallback and needs no console change.
 
 Config: `P0_DETECT_ENABLE`, `P0_DETECT_CHAT_IDS` (empty = the openmeeting announce chat),
-`P0_DETECT_COOLDOWN_SECONDS`, `P0_DETECT_CONFIRM_WINDOW_SECONDS`, `P0_DETECT_CONFIRM_TRIGGER`.
+`P0_DETECT_COOLDOWN_SECONDS`, `P0_DETECT_CONFIRM_WINDOW_SECONDS`, `P0_DETECT_CONFIRM_TRIGGER`,
+`P0_CARD_BUTTONS_ENABLE`.
 
 ## Fill the P0 incident doc ("/p0docs")
 
