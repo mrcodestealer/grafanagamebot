@@ -12841,27 +12841,37 @@ def _p0_detect_maybe_fire(*, chat_id: str, clean: str, mid: str, im_event_id: st
         return
     cid = (chat_id or "").strip()
     if not cid or cid not in _p0_detect_chat_ids():
+        logger.info("p0 detect: skip — chat=%r not in watched set %r", cid, _p0_detect_chat_ids())
         return
     text = (clean or "").strip()
     if not text or not _P0_DETECT_WORD_RE.search(text):
-        return
+        return  # not a "p0" mention — normal traffic, no need to log every message
     ev_key = (im_event_id or "").strip() or _monitoring_processed_stick(mid, im_event_id, cid, sender_debounce, msg_time)
     if ev_key:
         with _p0_detect_lock:
             if ev_key in _p0_detect_seen_event_ids:
+                logger.info("p0 detect: skip — duplicate event_id=%r (WS redelivery)", ev_key)
                 return
             _p0_detect_seen_event_ids.add(ev_key)
             if len(_p0_detect_seen_event_ids) > 2000:
                 _p0_detect_seen_event_ids.clear()
                 _p0_detect_seen_event_ids.add(ev_key)
     if not _p0_detect_cooldown_and_arm(cid):
+        with _p0_detect_lock:
+            last = _p0_detect_last_fired.get(cid, 0.0)
+        cool = max(0.0, _cfg_float("P0_DETECT_COOLDOWN_SECONDS", 2700.0))
+        remain = max(0.0, cool - (time.time() - last))
+        logger.info("p0 detect: 'p0' seen in chat=%s but COOLDOWN active — %.0fs remaining "
+                    "(P0_DETECT_COOLDOWN_SECONDS=%.0f); card suppressed", cid[:16], remain, cool)
         return
+    logger.info("p0 detect: 'p0' matched in chat=%s — sending confirm card", cid[:16])
     trigger = _p0_detect_confirm_trigger()
     card = _p0_detect_prompt_card(cid)
 
     def _send() -> None:
         try:
             _lark_send_interactive_card("chat_id", cid, card)
+            logger.info("p0 detect: confirm card sent to chat=%s", cid[:16])
         except Exception:
             logger.exception("p0 detect card send failed; text fallback")
             try:
@@ -14684,7 +14694,7 @@ def start_lark_ws_client_blocking() -> None:
     # apps in the tenant. Extend via LARK_WS_IGNORE_EVENTS (comma/;-separated) as needed.
     _ignore_default = ("im.message.reaction.created_v1,im.message.reaction.deleted_v1,"
                        "im.message.recalled_v1,task.task.update_tenant_v1,"
-                       "vc.meeting.recording_ended_v1")
+                       "vc.meeting.recording_ended_v1,message")
     for _ignore_t in _cfg_str("LARK_WS_IGNORE_EVENTS", _ignore_default).replace(";", ",").split(","):
         _ignore_t = _ignore_t.strip()
         if _ignore_t:
