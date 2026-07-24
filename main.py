@@ -284,7 +284,7 @@ _CFG: Dict[str, Any] = {
     # AI unreachable / undecided: 1=send anyway (no missed alerts), 0=suppress
     "MONITORING_AI_GATE_FAIL_OPEN": "1",
     # fail-open 时在正文末尾追加的说明（空=不追加）
-    "MONITORING_AI_FAIL_OPEN_NOTE": "🤖 AI review unavailable — alert sent without AI explanation.",
+    "MONITORING_AI_FAIL_OPEN_NOTE": "",
     # 自定义判定提示词（留空用内置默认；可用 {alert} 占位符插入告警正文）
     "MONITORING_AI_PROMPT": "",
     "JUNCHEN": "",
@@ -8722,10 +8722,7 @@ def _monitoring_ai_deposit_withdraw_routine_volatility(alert_text: str) -> Optio
 
 
 def _monitoring_ai_fail_open_note() -> str:
-    return _cfg_str(
-        "MONITORING_AI_FAIL_OPEN_NOTE",
-        "🤖 AI review unavailable — alert sent without AI explanation.",
-    ).strip()
+    return _cfg_str("MONITORING_AI_FAIL_OPEN_NOTE", "").strip()
 
 
 def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
