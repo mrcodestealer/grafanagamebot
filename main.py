@@ -8,6 +8,9 @@ grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_
 
 依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）时截图嵌卡片内 — **一条消息**；embed=``0`` 则卡片 + 单独图片两条。``MONITORING_MESSAGE_CARD_BUTTON_ENABLE=1`` 时有 **Resend screenshot**。若 ``MONITORING_MESSAGE_CARD_ENABLE=0`` 则为纯文字 + 独立图。
+告警卡片额外附带 **Mute 30 min / Mute 1 hour** 快捷静音按钮（``MONITORING_ALERT_QUICK_MUTE_ENABLE=1``，只静音本次告警的面板）。
+告警截图默认只截 **触发告警的那个图**（``GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE=1``），并由本地 Qwen **复核两次**
+（``MONITORING_AI_SECOND_REVIEW_ENABLE=1``）都判定 ABNORMAL 后才发出。
 """
 
 import base64
@@ -106,6 +109,10 @@ _CFG: Dict[str, Any] = {
     "GRAFANA_SCREENSHOT_EXPAND_ROWS": "1",
     # 1=告警截图前在对应面板 Ctrl+点击图例，只保留触发告警的序列
     "GRAFANA_SCREENSHOT_ALERT_LEGEND_CLICK_ENABLE": "1",
+    # 1=告警截图**只截触发告警的那个图**（裁剪到该面板外框；多个面板时取并集）；0=整页仪表盘
+    "GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE": "1",
+    # 裁剪外框四周留白（像素）
+    "GRAFANA_SCREENSHOT_ALERT_CROP_PADDING_PX": "10",
     "GRAFANA_SCREENSHOT_RELATIVE_RANGE": "1",
     # 截图 URL 追加 timezone=…（与 Grafana 时间栏一致）；设为 none / - 可省略该参数
     "GRAFANA_SCREENSHOT_TIMEZONE": "browser",
@@ -200,6 +207,8 @@ _CFG: Dict[str, Any] = {
     # 1=在监控卡片底部展示 callback 按钮（实现方式参考 Chatbox/jenkinsupdate 的 card JSON 2.0）
     "MONITORING_MESSAGE_CARD_BUTTON_ENABLE": "1",
     "MONITORING_MESSAGE_CARD_BUTTON_TEXT": "Resend screenshot",
+    # 1=告警卡片底部附带快捷静音按钮（Mute 30 min / Mute 1 hour）；只静音本次告警涉及的面板
+    "MONITORING_ALERT_QUICK_MUTE_ENABLE": "1",
     # 飞书交互卡片正文上限；超出时先发卡片再自动拆成多条文字消息补全（避免只看到 ~10 条序列）
     "MONITORING_MESSAGE_CARD_REPLY_MAX_CHARS": "28000",
     "MONITORING_MESSAGE_CARD_TRUNCATE": "1",
@@ -287,6 +296,15 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AI_FAIL_OPEN_NOTE": "",
     # 自定义判定提示词（留空用内置默认；可用 {alert} 占位符插入告警正文）
     "MONITORING_AI_PROMPT": "",
+    # ---- AI 二次复核（double review）----
+    # 1=第一次判定 ABNORMAL 后，让模型**再复核一次**；两次都 ABNORMAL 才真正发告警
+    "MONITORING_AI_SECOND_REVIEW_ENABLE": "1",
+    # 复核使用的模型（留空=与 MONITORING_AI_MODEL 相同）
+    "MONITORING_AI_SECOND_MODEL": "",
+    # 自定义复核提示词（留空用内置默认；{alert}=告警正文，{first}=第一次的说明）
+    "MONITORING_AI_SECOND_PROMPT": "",
+    # 1=告警正文追加二次复核结论
+    "MONITORING_AI_SECOND_REVIEW_APPEND": "1",
     "JUNCHEN": "",
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
     # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
@@ -4279,6 +4297,26 @@ _MUTE_DURATION_CHOICES: List[Tuple[str, int]] = [
     ("1 day", 86400),
 ]
 
+# Quick-mute buttons rendered directly on an alert card (mute only that alert's own panels).
+_ALERT_QUICK_MUTE_CHOICES: List[Tuple[str, int]] = [
+    ("🔕 Mute 30 min", 1800),
+    ("🔕 Mute 1 hour", 3600),
+]
+
+
+def _mute_duration_human(sec: int) -> str:
+    """Compact human label for a mute duration: 1800→'30 min', 3600→'1 hour'."""
+    s = int(sec)
+    if s % 86400 == 0:
+        n = s // 86400
+        return f"{n} day" if n == 1 else f"{n} days"
+    if s % 3600 == 0:
+        n = s // 3600
+        return f"{n} hour" if n == 1 else f"{n} hours"
+    if s % 60 == 0:
+        return f"{s // 60} min"
+    return f"{s}s"
+
 
 def _monitoring_mutable_channels() -> List[Tuple[str, str]]:
     """(channel_id, display_label) for /m mute; ``http`` = LiveSlots primary payload."""
@@ -4979,6 +5017,44 @@ def _mute_card_action_dispatch(data: Dict[str, Any], val: Dict[str, Any]) -> Opt
     v = _lark_dict_pick_str(val, "v")
     allowed = _monitoring_mutable_channel_ids()
 
+    if v == "quick":
+        # Alert-card quick mute: silence ONLY this alert's own panels (``kinds``) for a fixed duration.
+        try:
+            sec = int(float(_lark_dict_pick_str(val, "sec") or "0"))
+        except (TypeError, ValueError):
+            sec = 0
+        if sec <= 0:
+            return _mute_toast_response("Invalid duration", "warning")
+        kinds = {
+            x.strip() for x in (_lark_dict_pick_str(val, "kinds") or "").split(",") if x.strip()
+        } & allowed
+        if not kinds:
+            return _mute_toast_response("No panel to mute for this alert", "warning")
+        applied = _mute_apply_channels(kinds, float(sec))
+        if not applied:
+            return _mute_toast_response("Could not apply mute", "warning")
+        human = _mute_duration_human(sec)
+        lines = [f"🔕 Alert mute enabled for {len(applied)} monitor(s) — {human}:"]
+        for ch, exp in sorted(applied.items(), key=lambda kv: kv[0]):
+            lines.append(f"- {_mute_channel_display_label(ch)} until {_fmt_ts_short(exp)}")
+        summary = "\n".join(lines)
+        rt_q = (rid_t or "").strip()
+        rv_q = (rid or "").strip()
+        if rt_q in ("chat_id", "open_id") and rv_q:
+            def _send_quick_confirm() -> None:
+                try:
+                    _lark_send_text(rt_q, rv_q, summary)
+                except Exception:
+                    logger.exception("mute: quick-mute confirmation send failed")
+
+            threading.Thread(
+                target=_send_quick_confirm, daemon=True, name="mute-quick-confirm"
+            ).start()
+        logger.info(
+            "alert card quick-mute applied kinds=%s seconds=%s", sorted(applied.keys()), sec
+        )
+        return _mute_toast_response(f"Muted {len(applied)} panel(s) · {human}", "success")
+
     if v == "toggle":
         ch = _lark_dict_pick_str(val, "ch").strip()
         if ch not in allowed:
@@ -5062,13 +5138,78 @@ def _lark_dispatch_card_action(data: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def _lark_card_full_image_element(img_key: str, alt_text: str = "Grafana") -> Dict[str, Any]:
+    """
+    Card image shown in FULL. Feishu's default ``scale_type`` is ``crop_center``, which center-crops
+    the PNG so only a slice is visible until tapped — that would undo the alert-panel crop.
+    ``fit_horizontal`` scales the whole image to the card width; ``preview`` keeps tap-to-zoom.
+    """
+    return {
+        "tag": "img",
+        "img_key": (img_key or "").strip(),
+        "alt": {"tag": "plain_text", "content": alt_text or ""},
+        "scale_type": "fit_horizontal",
+        "preview": True,
+    }
+
+
+def _alert_quick_mute_button_elements(
+    receive_id_type: str, receive_id: str, alert_kinds: List[str]
+) -> List[Dict[str, Any]]:
+    """A row of quick-mute buttons (30 min / 1 hour) that mute only ``alert_kinds`` (this alert's panels)."""
+    kinds = [k for k in alert_kinds if (k or "").strip()]
+    if not kinds:
+        return []
+    rt = (receive_id_type or "").strip()
+    rv = (receive_id or "").strip()
+    base: Dict[str, Any] = {"k": "mute_btn", "v": "quick", "kinds": ",".join(kinds)}
+    if rt in ("chat_id", "open_id") and rv:
+        base["rid_t"] = rt
+        base["rid"] = rv
+    columns: List[Dict[str, Any]] = []
+    for label, secs in _ALERT_QUICK_MUTE_CHOICES:
+        pl = dict(base)
+        pl["sec"] = str(int(secs))
+        columns.append(
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    _monitoring_card_v2_callback_button(
+                        label,
+                        "default",
+                        _monitoring_card_callback_payload_strings(pl),
+                        element_id=f"aqm_{secs}"[:20],
+                    )
+                ],
+            }
+        )
+    return [
+        {"tag": "markdown", "content": "_Mute this alert's panel(s):_"},
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "horizontal_align": "left",
+            "columns": columns,
+        },
+    ]
+
+
 def _monitoring_interactive_card_dict(
     reply: str,
     receive_id_type: str,
     receive_id: str,
     lark_img_key: Optional[str] = None,
+    alert_kinds: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Feishu card JSON v2 — markdown card, optional embedded PNG."""
+    """
+    Feishu card JSON v2 — markdown card, optional embedded PNG.
+
+    ``alert_kinds`` (the channels currently alerting) adds a quick-mute button row at the bottom
+    of alert cards; see :func:`_alert_quick_mute_button_elements`.
+    """
     title = "📊 GRAFANA GAME GRAPH"
     is_alert_card = (reply or "").lstrip().startswith("[ALERT]")
     elements: List[Dict[str, Any]] = [
@@ -5076,12 +5217,10 @@ def _monitoring_interactive_card_dict(
     ]
     ik = (lark_img_key or "").strip()
     if ik:
-        elements.append(
-            {
-                "tag": "img",
-                "img_key": ik,
-                "alt": {"tag": "plain_text", "content": "Grafana"},
-            }
+        elements.append(_lark_card_full_image_element(ik, "Grafana"))
+    if alert_kinds and _lark_env_truthy("MONITORING_ALERT_QUICK_MUTE_ENABLE"):
+        elements.extend(
+            _alert_quick_mute_button_elements(receive_id_type, receive_id, list(alert_kinds))
         )
     if _lark_env_truthy("MONITORING_MESSAGE_CARD_BUTTON_ENABLE"):
         cb_payload: Dict[str, Any] = {"k": "monitoring_btn", "v": "refresh"}
@@ -5140,9 +5279,12 @@ def _lark_send_monitoring_user_message(
     receive_id: str,
     reply: str,
     lark_img_key: Optional[str] = None,
+    alert_kinds: Optional[List[str]] = None,
 ) -> Tuple[bool, bool]:
     """
     Send monitoring summary to the user: interactive card (optional embedded PNG) or plain text.
+
+    ``alert_kinds`` (currently-alerting channels) adds a quick-mute button row on alert cards.
 
     Returns ``(sent_interactive_card_ok, embedded_png_in_card)``.
     """
@@ -5178,7 +5320,7 @@ def _lark_send_monitoring_user_message(
     if MONITORING_MESSAGE_CARD_ENABLE:
         try:
             card = _monitoring_interactive_card_dict(
-                reply_for_card, receive_id_type, rid, lark_img_key
+                reply_for_card, receive_id_type, rid, lark_img_key, alert_kinds=alert_kinds
             )
             _lark_send_interactive_card(receive_id_type, rid, card)
             if overflow_tail.strip():
@@ -6162,6 +6304,110 @@ def _grafana_playwright_click_alert_series_legends(
     return ok
 
 
+_GRAFANA_ALERT_PANEL_CLIP_JS = r"""(panelTitles) => {
+  const norm = (s) => (s || '').replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+  const wanted = (panelTitles || []).map(norm).filter(Boolean);
+  if (!wanted.length) return null;
+  const sx = window.scrollX || window.pageXOffset || 0;
+  const sy = window.scrollY || window.pageYOffset || 0;
+  const hits = [];
+  for (const root of document.querySelectorAll('.react-grid-item, [data-testid="dashboard-panel"]')) {
+    const titleEl = root.querySelector('[data-testid="panel-title"], h2, [class*="panel-title"]');
+    const titleTxt = norm(titleEl && (titleEl.textContent || titleEl.getAttribute('title')));
+    if (!titleTxt) continue;
+    let rank = -1;
+    if (wanted.some(w => titleTxt === w)) rank = 0;
+    else if (wanted.some(w => titleTxt.includes(w) || w.includes(titleTxt))) rank = 1;
+    if (rank < 0) continue;
+    const r = root.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40) continue;
+    hits.push({ rank: rank, title: titleTxt, l: r.left + sx, t: r.top + sy, r: r.right + sx, b: r.bottom + sy });
+  }
+  if (!hits.length) return null;
+  // An exact title match must never be widened by a loose substring match on another panel.
+  const exact = hits.filter(h => h.rank === 0);
+  const use = exact.length ? exact : hits;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const matched = [];
+  for (const h of use) {
+    matched.push(h.title);
+    x0 = Math.min(x0, h.l); y0 = Math.min(y0, h.t);
+    x1 = Math.max(x1, h.r); y1 = Math.max(y1, h.b);
+  }
+  const de = document.documentElement;
+  const bd = document.body;
+  return {
+    x: x0,
+    y: y0,
+    right: x1,
+    bottom: y1,
+    docW: Math.max(de.scrollWidth, bd ? bd.scrollWidth : 0, de.clientWidth),
+    docH: Math.max(de.scrollHeight, bd ? bd.scrollHeight : 0, de.clientHeight),
+    matched: matched,
+  };
+}"""
+
+
+def _grafana_playwright_alert_panel_clip(
+    page: Any, panel_titles: List[str]
+) -> Optional[Dict[str, float]]:
+    """
+    Bounding box (page/document CSS pixels) of the panel(s) that fired, for
+    ``page.screenshot(clip=…)`` — the alert image then shows **only the alerting graph**
+    instead of the whole dashboard. ``None`` = capture the dashboard as before
+    (feature off, panel not in the DOM, or a degenerate box).
+    """
+    titles = [str(t).strip() for t in (panel_titles or []) if str(t or "").strip()]
+    if not titles:
+        return None
+    if not _lark_env_truthy_or_default("GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE", default=True):
+        return None
+    try:
+        info = page.evaluate(_GRAFANA_ALERT_PANEL_CLIP_JS, titles)
+    except Exception as ex:
+        logger.info("Grafana screenshot: alert panel clip lookup failed: %s", ex)
+        return None
+    if not isinstance(info, dict):
+        logger.warning(
+            "Grafana screenshot: alerting panel(s) %r not found in DOM — capturing whole dashboard",
+            titles[:4],
+        )
+        return None
+    pad = max(0, min(200, _cfg_int("GRAFANA_SCREENSHOT_ALERT_CROP_PADDING_PX", 10)))
+    try:
+        x0 = max(0.0, float(info["x"]) - pad)
+        y0 = max(0.0, float(info["y"]) - pad)
+        x1 = float(info["right"]) + pad
+        y1 = float(info["bottom"]) + pad
+        doc_w = float(info.get("docW") or 0.0)
+        doc_h = float(info.get("docH") or 0.0)
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Grafana screenshot: unusable panel clip payload=%r", info)
+        return None
+    if doc_w > 0:
+        x1 = min(x1, doc_w)
+    if doc_h > 0:
+        y1 = min(y1, doc_h)
+    w = x1 - x0
+    h = y1 - y0
+    if w < 80 or h < 80:
+        logger.warning(
+            "Grafana screenshot: alert panel clip too small (%.0fx%.0f) — capturing whole dashboard",
+            w,
+            h,
+        )
+        return None
+    logger.info(
+        "Grafana screenshot: cropping to alerting panel(s) %s — clip %.0fx%.0f at (%.0f,%.0f)",
+        [str(t)[:60] for t in (info.get("matched") or [])][:4],
+        w,
+        h,
+        x0,
+        y0,
+    )
+    return {"x": x0, "y": y0, "width": w, "height": h}
+
+
 def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
     """
     Headless Grafana 有时「面板 ready 统计够了」但 uPlot/canvas 尚未合成进位图；快门前强制置顶、
@@ -6215,6 +6461,7 @@ def _grafana_playwright_render_dashboard_and_png(
     *,
     skip_nav_and_refresh: bool = False,
     legend_targets: Optional[List[Dict[str, str]]] = None,
+    crop_panel_titles: Optional[List[str]] = None,
 ) -> bytes:
     """
     Navigate ``page`` to dashboard ``url`` and return a PNG after the same wait/stabilize path
@@ -6224,6 +6471,9 @@ def _grafana_playwright_render_dashboard_and_png(
     ``skip_nav_and_refresh=True`` (persistent keeper jobs): ``goto`` already loads the target range —
     skip Dock + Refresh + second Dock to avoid redundant work and reload fallbacks.
     Blank-chart recovery paths below still run Refresh/Dock when needed.
+
+    ``crop_panel_titles`` (alert path): capture **only those panels** by clipping to their bounding
+    box instead of the whole dashboard; falls back to the full capture when they cannot be located.
     """
     page.goto(url, wait_until="load", timeout=timeout_ms)
     page.wait_for_timeout(120)
@@ -6291,6 +6541,22 @@ def _grafana_playwright_render_dashboard_and_png(
         _grafana_playwright_click_alert_series_legends(page, legend_targets)
         page.wait_for_timeout(180)
     _grafana_playwright_pre_screenshot_paint_flush(page)
+    # Alert path: clip to the firing panel(s). ``clip`` selects a region of the *captured image*,
+    # so it needs ``full_page=True`` — with a viewport capture Playwright rejects any panel below
+    # the fold ("Clipped area is either empty or outside the resulting image").
+    clip = _grafana_playwright_alert_panel_clip(page, list(crop_panel_titles or []))
+    if clip:
+        try:
+            try:
+                return page.screenshot(
+                    type="png", clip=clip, full_page=True, animations="disabled"
+                )
+            except TypeError:
+                return page.screenshot(type="png", clip=clip, full_page=True)
+        except Exception:
+            logger.exception(
+                "Grafana screenshot: alerting-panel crop capture failed — full dashboard instead"
+            )
     full_page = _lark_env_truthy("GRAFANA_SCREENSHOT_FULL_PAGE")
     try:
         return page.screenshot(type="png", full_page=full_page, animations="disabled")
@@ -6326,6 +6592,7 @@ class GrafanaPlaywrightKeeper:
         timeout_ms: int,
         *,
         legend_targets: Optional[List[Dict[str, str]]] = None,
+        crop_panel_titles: Optional[List[str]] = None,
     ) -> bytes:
         warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
         if not self._ready.wait(timeout=warm_wait):
@@ -6341,6 +6608,7 @@ class GrafanaPlaywrightKeeper:
                 "url": url,
                 "timeout_ms": int(timeout_ms),
                 "legend_targets": legend_targets,
+                "crop_panel_titles": crop_panel_titles,
                 "ev": ev,
                 "box": box,
             }
@@ -6450,6 +6718,7 @@ class GrafanaPlaywrightKeeper:
                         max(5000, jto),
                         skip_nav_and_refresh=True,
                         legend_targets=job.get("legend_targets"),
+                        crop_panel_titles=job.get("crop_panel_titles"),
                     )
                 except Exception as ex:
                     box["err"] = ex
@@ -6501,6 +6770,7 @@ def _grafana_headless_screenshot_png(
     relative_to: Optional[str] = None,
     timezone_param: Optional[str] = None,
     legend_targets: Optional[List[Dict[str, str]]] = None,
+    crop_panel_titles: Optional[List[str]] = None,
 ) -> bytes:
     """
     Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
@@ -6547,7 +6817,12 @@ def _grafana_headless_screenshot_png(
     if k is not None and _grafana_persistent_browser_enabled():
         try:
             logger.info("Grafana screenshot: using persistent Playwright keeper")
-            return k.request_png(url, timeout_ms, legend_targets=legend_targets)
+            return k.request_png(
+                url,
+                timeout_ms,
+                legend_targets=legend_targets,
+                crop_panel_titles=crop_panel_titles,
+            )
         except Exception as e:
             logger.warning(
                 "Grafana persistent keeper screenshot failed (%s); falling back to ephemeral browser",
@@ -6591,7 +6866,11 @@ def _grafana_headless_screenshot_png(
                 page.wait_for_timeout(140)
 
             return _grafana_playwright_render_dashboard_and_png(
-                page, url, timeout_ms, legend_targets=legend_targets
+                page,
+                url,
+                timeout_ms,
+                legend_targets=legend_targets,
+                crop_panel_titles=crop_panel_titles,
             )
         finally:
             browser.close()
@@ -6690,7 +6969,12 @@ def _grafana_monitoring_screenshot_png(
     relative_from: Optional[str] = None,
     relative_to: Optional[str] = None,
 ) -> bytes:
-    """Dashboard screenshot (default **1h** browser range). Alert shots isolate legend series."""
+    """
+    Dashboard screenshot (default **1h** browser range).
+
+    Alert shots isolate the legend series **and** (``GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE=1``,
+    default) crop to the panel(s) that actually fired, so the image is just the alerting graph.
+    """
     su, eu = _monitoring_watch_eval_window_unix()
     rf = (relative_from or "").strip() or (
         _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-1h").strip()
@@ -6704,6 +6988,11 @@ def _grafana_monitoring_screenshot_png(
     ) or "now"
     tz = _cfg_str("GRAFANA_SCREENSHOT_TIMEZONE", "browser").strip()
     targets = _monitoring_collect_alert_legend_targets(payload) if for_alert and payload else None
+    crop_titles: List[str] = []
+    for tgt in targets or []:
+        p = str(tgt.get("panel") or "").strip()
+        if p and p not in crop_titles:
+            crop_titles.append(p)
     return _grafana_headless_screenshot_png(
         session,
         su,
@@ -6712,6 +7001,7 @@ def _grafana_monitoring_screenshot_png(
         relative_to=rt,
         timezone_param=tz or None,
         legend_targets=targets,
+        crop_panel_titles=crop_titles or None,
     )
 
 
@@ -8223,6 +8513,45 @@ def _monitoring_payload_hit_alert(payload: Dict[str, Any]) -> bool:
     return False
 
 
+def _monitoring_alerting_channel_kinds(payload: Optional[Dict[str, Any]]) -> List[str]:
+    """
+    Channel ids currently in an alerting state for this payload, in display order and excluding
+    muted ones. Parallels :func:`_monitoring_payload_hit_alert` but collects **every** hit instead
+    of returning on the first — used for the alert card's quick-mute buttons.
+    """
+    _mute_purge_expired()
+    out: List[str] = []
+    if not isinstance(payload, dict):
+        return out
+    if (
+        MONITORING_HTTP_PRIMARY_ENABLE
+        and not _monitoring_alert_channel_muted("http")
+        and _analysis_aggregate_hit_alert(_http_analysis_for_payload(payload))
+    ):
+        out.append("http")
+    analyzers = {
+        MONITORING_EXTRA_KIND_EGAME_ONLINE: _analysis_for_egame_online_payload,
+        MONITORING_EXTRA_KIND_EGAMES_BET: _analysis_for_egames_bet_payload,
+        MONITORING_EXTRA_KIND_LIVESLOT_BET: _analysis_for_liveslot_bet_payload,
+        MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT: _analysis_for_liveslot_spin_count_payload,
+    }
+    for ex in payload.get("extraPanels") or []:
+        if not isinstance(ex, dict):
+            continue
+        k = (ex.get("kind") or "")
+        logical = _extra_panel_logical_kind(k)
+        analyzer = analyzers.get(logical)
+        if analyzer is None or logical in out or _monitoring_extra_channel_muted(k):
+            continue
+        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
+        try:
+            if _analysis_aggregate_hit_alert(analyzer(p2)):
+                out.append(logical)
+        except Exception:
+            logger.exception("alerting-kinds analysis failed for kind=%r", k)
+    return out
+
+
 def _fmt_ts_short(ts: Any) -> str:
     try:
         ft = _bucket_ts_monitoring_minute(float(ts))
@@ -8558,6 +8887,70 @@ def _monitoring_ai_parse_verdict(raw: str) -> Tuple[Optional[bool], str]:
     return verdict, explanation
 
 
+def _monitoring_ai_ask_ollama_verdict(
+    png_bytes: bytes, prompt: str, *, model: str, pass_label: str
+) -> Tuple[Optional[bool], str]:
+    """
+    One vision review round: POST ``prompt`` + screenshot to Ollama and parse ABNORMAL / NORMAL.
+
+    Returns ``(is_abnormal, explanation)``; ``is_abnormal`` is ``None`` when the model could not
+    be reached or its answer could not be parsed. ``pass_label`` only tags the log lines.
+    """
+    import base64
+
+    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+    timeout = max(5.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 120.0))
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    body: Dict[str, Any] = {
+        "model": model,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+        "options": {"temperature": 0},
+    }
+    # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
+    if "qwen3" in model.casefold():
+        body["think"] = False
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.exception(
+            "monitoring AI gate (%s): Ollama request failed (model=%s url=%s)",
+            pass_label,
+            model,
+            url,
+        )
+        return None, ""
+
+    raw = _monitoring_ai_extract_ollama_text(data)
+    if not raw:
+        logger.warning(
+            "monitoring AI gate (%s): empty response from model=%s payload=%r",
+            pass_label,
+            model,
+            data,
+        )
+        return None, ""
+
+    verdict, explanation = _monitoring_ai_parse_verdict(raw)
+    if verdict is None:
+        logger.warning(
+            "monitoring AI gate (%s): could not parse verdict from response=%r",
+            pass_label,
+            raw[:300],
+        )
+    else:
+        logger.info(
+            "monitoring AI gate (%s): model=%s parsed verdict=%s explanation_len=%s",
+            pass_label,
+            model,
+            "ABNORMAL" if verdict else "NORMAL",
+            len(explanation or ""),
+        )
+    return verdict, explanation
+
+
 def _monitoring_ai_abnormal_verdict(
     png_bytes: bytes, alert_text: str
 ) -> Tuple[Optional[bool], str]:
@@ -8568,11 +8961,7 @@ def _monitoring_ai_abnormal_verdict(
     Returns ``(is_abnormal, explanation)``. ``is_abnormal`` is ``None`` when the AI
     could not be reached / its answer could not be parsed (caller decides fail-open).
     """
-    import base64
-
-    url = _cfg_str("MONITORING_AI_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
     model = _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
-    timeout = max(5.0, _cfg_float("MONITORING_AI_TIMEOUT_SECONDS", 120.0))
     prompt = _cfg_str("MONITORING_AI_PROMPT", "").strip() or (
         "You are an SRE assistant reviewing a Grafana monitoring screenshot. "
         "A threshold rule already detected this change:\n"
@@ -8597,44 +8986,51 @@ def _monitoring_ai_abnormal_verdict(
         "following lines a short explanation (1-3 sentences) in 中文 and English."
     )
     prompt = prompt.replace("{alert}", alert_text or "")
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    body: Dict[str, Any] = {
-        "model": model,
-        "stream": False,
-        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
-        "options": {"temperature": 0},
-    }
-    # Qwen3 reasoning models: prefer direct answer in ``content`` (not only ``thinking``).
-    if "qwen3" in model.casefold():
-        body["think"] = False
-    try:
-        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        logger.exception(
-            "monitoring AI gate: Ollama request failed (model=%s url=%s)", model, url
-        )
-        return None, ""
+    return _monitoring_ai_ask_ollama_verdict(
+        png_bytes, prompt, model=model, pass_label="review 1"
+    )
 
-    raw = _monitoring_ai_extract_ollama_text(data)
-    if not raw:
-        logger.warning("monitoring AI gate: empty response from model=%s payload=%r", model, data)
-        return None, ""
 
-    verdict, explanation = _monitoring_ai_parse_verdict(raw)
-    if verdict is None:
-        logger.warning(
-            "monitoring AI gate: could not parse verdict from response=%r",
-            raw[:300],
-        )
-    else:
-        logger.info(
-            "monitoring AI gate: parsed verdict=%s explanation_len=%s",
-            "ABNORMAL" if verdict else "NORMAL",
-            len(explanation or ""),
-        )
-    return verdict, explanation
+def _monitoring_ai_second_review_verdict(
+    png_bytes: bytes, alert_text: str, first_explanation: str
+) -> Tuple[Optional[bool], str]:
+    """
+    Second, independent review of the same screenshot after review 1 answered ABNORMAL.
+
+    The model is shown its own first-round conclusion and asked to double-check it, so a
+    borderline first call cannot page the group on its own — only ABNORMAL twice sends the alert.
+    Returns ``(confirms_abnormal, explanation)``; ``None`` = unreachable / unparsable.
+    """
+    model = (
+        _cfg_str("MONITORING_AI_SECOND_MODEL", "").strip()
+        or _cfg_str("MONITORING_AI_MODEL", "qwen3.6:35b-a3b").strip()
+    )
+    prompt = _cfg_str("MONITORING_AI_SECOND_PROMPT", "").strip() or (
+        "You are a senior SRE doing a SECOND, independent review before this alert pages the "
+        "on-call group. A threshold rule fired and a first AI review already judged it ABNORMAL:\n"
+        "----- alert -----\n"
+        "{alert}\n"
+        "----- first review -----\n"
+        "{first}\n"
+        "-----\n"
+        "Re-examine the attached screenshot and the alert lines yourself. Do NOT simply agree "
+        "with the first review — your job is to catch a false alarm before it wakes people up.\n"
+        "Rules:\n"
+        "1) Base your decision ONLY on the alert lines and what is visible in the screenshot; "
+        "do not invent numbers or times.\n"
+        "2) Small moves, single-minute jitter, and normal business volatility (e.g. Main Site "
+        "Deposit / Withdrawal sawtooth) are NORMAL — respond NORMAL.\n"
+        "3) Respond ABNORMAL only if you independently confirm a genuine incident worth paging "
+        "on-call (large spike, sustained outage/flatline, or a clearly abnormal pattern).\n"
+        "Reply with the FIRST line being exactly 'ABNORMAL' or 'NORMAL', then on the following "
+        "lines a short explanation (1-3 sentences) in 中文 and English."
+    )
+    prompt = prompt.replace("{alert}", alert_text or "").replace(
+        "{first}", (first_explanation or "").strip() or "(no detail returned)"
+    )
+    return _monitoring_ai_ask_ollama_verdict(
+        png_bytes, prompt, model=model, pass_label="review 2"
+    )
 
 
 def _monitoring_ai_parse_alert_move(line: str) -> Tuple[Optional[float], Optional[float], str]:
@@ -8727,9 +9123,12 @@ def _monitoring_ai_fail_open_note() -> str:
 
 def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[bool, str]:
     """
-    Second gate after threshold detection: only let the alert through if the AI
-    judges the screenshot abnormal. Returns ``(should_send, reply)`` where ``reply``
-    has the AI explanation appended when the alert is allowed through.
+    Gate after threshold detection: only let the alert through if the AI judges the screenshot
+    abnormal. With ``MONITORING_AI_SECOND_REVIEW_ENABLE=1`` (default) an ABNORMAL first round is
+    re-checked by a **second** review round and the alert is sent only when both agree.
+
+    Returns ``(should_send, reply)`` where ``reply`` has the AI explanation(s) appended when the
+    alert is allowed through.
     """
     if not _lark_env_truthy_or_default("MONITORING_AI_GATE_ENABLE", default=True):
         return True, reply
@@ -8764,6 +9163,34 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
             (explanation or "")[:300],
         )
         return False, reply
+
+    # Round 1 said ABNORMAL — have the model review it a second time before paging anyone.
+    if _lark_env_truthy_or_default("MONITORING_AI_SECOND_REVIEW_ENABLE", default=True):
+        verdict2, explanation2 = _monitoring_ai_second_review_verdict(
+            alert_pngs[0], reply, explanation
+        )
+        if verdict2 is None:
+            logger.warning(
+                "monitoring AI gate: second review undecided — %s",
+                "sending anyway (fail-open)" if fail_open else "suppressing (fail-closed)",
+            )
+            if not fail_open:
+                return False, reply
+            if fail_note:
+                reply = f"{reply}\n\n{fail_note}"
+        elif not verdict2:
+            logger.info(
+                "monitoring AI gate: second review judged NORMAL — alert suppressed. explanation=%r",
+                (explanation2 or "")[:300],
+            )
+            return False, reply
+        else:
+            logger.info("monitoring AI gate: second review CONFIRMED ABNORMAL — alert will be sent")
+            if explanation2 and _lark_env_truthy_or_default(
+                "MONITORING_AI_SECOND_REVIEW_APPEND", default=True
+            ):
+                explanation = f"{explanation}\n\n{explanation2}" if explanation else explanation2
+
     logger.info("monitoring AI gate: AI judged ABNORMAL — alert will be sent")
     if explanation:
         reply = f"{reply}\n\n{explanation}"
@@ -13039,6 +13466,32 @@ def _p0_card_action_handler(data: Any) -> Any:
         open_id = (getattr(operator, "open_id", "") or "") if operator is not None else ""
         cid = (chat_id or str(val.get("cid") or "")).strip()
         if k != "p0det":
+            # Not a P0 button — hand it to the same router the HTTP webhook uses so the alert
+            # card's quick-mute buttons (and Resend screenshot) also work over the long connection.
+            hdr = getattr(data, "header", None)
+            ev_id = (getattr(hdr, "event_id", "") or "") if hdr is not None else ""
+            extra: Optional[Dict[str, Any]] = None
+            try:
+                extra = _lark_dispatch_card_action(
+                    {
+                        # event_id only when the frame carries one: falling back to the message id
+                        # would make every later click on the SAME card look like a duplicate.
+                        "event_id": ev_id,
+                        "event": {
+                            "action": {"value": dict(val) if isinstance(val, dict) else {}},
+                            "open_chat_id": chat_id,
+                            "operator": {
+                                "operator_id": {"open_id": open_id},
+                                "open_id": open_id,
+                            },
+                        },
+                    }
+                )
+            except Exception:
+                logger.exception("card action (WS): dispatch to shared router failed k=%r", k)
+            toast = extra.get("toast") if isinstance(extra, dict) else None
+            if isinstance(toast, dict):
+                return _resp(str(toast.get("type") or "info"), str(toast.get("content") or ""))
             return _resp("info", "")
         if not _p0_card_action_dedup(msg_id):
             return _resp("info", "已处理 / already handled")
@@ -13415,6 +13868,7 @@ def _monitoring_watchdog_loop() -> None:
                     alert_chat,
                     reply,
                     pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+                    alert_kinds=_monitoring_alerting_channel_kinds(payload_c),
                 )
                 logger.info(
                     "monitoring watchdog alert sent (after confirm) chat_prefix=%s... card=%s embedded_png=%s",
@@ -13529,6 +13983,7 @@ def _monitoring_watchdog_loop() -> None:
                     alert_chat,
                     reply,
                     pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
+                    alert_kinds=_monitoring_alerting_channel_kinds(payload),
                 )
                 logger.info(
                     "monitoring watchdog alert sent chat_prefix=%s... card=%s embedded_png=%s",
@@ -13641,10 +14096,13 @@ def _monitoring_background_worker(
             # Never block the Lark reply on Playwright: pre-screenshot-before-send left users with **no**
             # message until Grafana finished (often minutes). Send card/text first; screenshot follows below.
             pre_key: Optional[str] = None
+            card_alert_kinds = (
+                _monitoring_alerting_channel_kinds(payload) if alert_hit and payload else None
+            )
 
             if chat_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "chat_id", chat_id, reply, None
+                    "chat_id", chat_id, reply, None, alert_kinds=card_alert_kinds
                 )
                 sent = True
                 user_visible_send_ok = True
@@ -13657,7 +14115,7 @@ def _monitoring_background_worker(
                 )
             elif open_id:
                 used_interactive_card, embedded_png_in_card = _lark_send_monitoring_user_message(
-                    "open_id", open_id, reply, None
+                    "open_id", open_id, reply, None, alert_kinds=card_alert_kinds
                 )
                 sent = True
                 user_visible_send_ok = True
