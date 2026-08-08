@@ -3,7 +3,9 @@
 grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_TITLE``）、默认端口 **5088**。
 
 - **配置**：文件顶部 ``_CFG``；可用环境变量覆盖同名键。
-- **HTTP**：``LARK_EVENT_MODE=http`` 时 ``POST /webhook/event``；可选 ``ws`` 长连接（见 ``LARK_EVENT_MODE``）。
+- **事件订阅**：默认 ``LARK_EVENT_MODE=ws`` —「订阅方式 → **使用长连接接收事件**」（Subscription mode → receive events
+  through persistent connection），无需 Request URL / 公网端口；开发者后台保存该设置时本进程须在线。卡片按钮点击也走长连接
+  （见 ``LARK_CARD_ACTIONS_ENABLE`` 与 ``_lark_ws_enable_card_actions``）。设 ``LARK_EVENT_MODE=http`` 才改用 ``POST /webhook/event``。
 - **命令**：``MONITORING_TRIGGER_REQUIRES_AT_BOT=1`` 时 **群聊**须 @ **本**机器人再发 ``/mo``；**私聊 p2p** 可直接发 ``/mo``（无 @）。**``/m``、``/c`` 与 ``/mo`` 共用同一套 @ 判定**（群内裸发 ``/m`` 不会触发）。与 **Platform 同群**时 **Game 与 Platform 均须** ``MONITORING_MO_WEAK_NONEMPTY_MENTIONS_ALLOW=0``（默认），并在 ``MONITORING_PEER_BOT_OPEN_IDS`` 填对方 ``open_id``；否则 explicit peer-only mentions + 正文 ``@_user_N`` 占位可能错误落到对方。**explicit meta peer-only** 且正文 **无** peer 的强 ``<at>`` 确认时 **直接 skip**，不再 fall through 到弱路径。``MONITORING_MO_ALLOW_FEISHU_AT_PLACEHOLDER`` 仍用于 **mentions 完全为空** 的兜底。**勿**再搞「单条 peer ``open_id`` + ``@_user_N`` 即强制触发本 bot」。mention 行带本应用 ``app_id`` 时走 ``row_app_id_is_self``。未配 ``LARK_BOT_OPEN_ID`` 时会尝试 ``GET bot/v3/info``。机器人回复为英文。
 
 依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
@@ -45,8 +47,15 @@ from flask import Flask, Response, g, jsonify, request
 _CFG: Dict[str, Any] = {
     "PORT": 5088,
     "HTTP_SERVER": "flask",
-    "LARK_EVENT_MODE": "http",
+    # 订阅方式 = **使用长连接接收事件**（Subscription mode → receive events through persistent
+    # connection）：开发者后台「事件与回调 → 订阅方式」须选长连接并保存成功（保存时本进程要在线），
+    # 无需 Request URL / 公网端口。改回 ``http`` 才走 POST /webhook/event。
+    "LARK_EVENT_MODE": "ws",
+    # 长连接下 HTTP 只作 sidecar（/health、/grafana/ping）；=0 则完全不监听端口
     "ENABLE_HTTP": "1",
+    # 1=把卡片按钮点击（/m 静音卡、告警卡 Mute 30 min / 1 hour、Resend screenshot、P0 确认）
+    # 投递到本进程；长连接下 SDK 默认丢弃 CARD 帧，须由 _lark_ws_enable_card_actions 打补丁
+    "LARK_CARD_ACTIONS_ENABLE": "1",
     "WAITRESS_THREADS": 24,
     "LARK_HOST": "https://open.larksuite.com",
     "LARK_WEBHOOK_PUBLIC_URL": "http://127.0.0.1:5088/webhook/event",
@@ -1377,7 +1386,7 @@ def _lark_skip_http_im_message_when_ws_mode() -> bool:
     # HTTP sidecar is listening — always accept IM on POST /webhook/event (dedupe prevents double reply).
     if _cfg_str("ENABLE_HTTP", "1").strip().lower() in ("1", "true", "yes", "on"):
         return False
-    if _cfg_str("LARK_EVENT_MODE", "http").strip().lower() != "ws":
+    if _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() != "ws":
         return False
     # Fail-safe: if WS path is configured but we haven't seen any WS DATA frame yet,
     # do not drop HTTP IM events (otherwise webhook returns 200 but bot never replies).
@@ -13375,6 +13384,19 @@ def _p0_card_buttons_enabled() -> bool:
     return _lark_env_truthy_or_default("P0_CARD_BUTTONS_ENABLE", default=True)
 
 
+def _lark_card_actions_enabled() -> bool:
+    """
+    True when card **button clicks** must be delivered to this process.
+
+    Under 「订阅方式 → 使用长连接接收事件」 the SDK drops CARD frames unless we patch it and
+    register a handler. That used to hang off ``P0_CARD_BUTTONS_ENABLE``, which silently killed
+    every *monitoring* card click (``/m`` mute cards, the alert card's Mute 30 min / 1 hour row,
+    *Resend screenshot*) whenever p0bot's buttons were switched off. Those cards always carry
+    callback buttons, so this is on by default; ``LARK_CARD_ACTIONS_ENABLE=0`` opts out entirely.
+    """
+    return _lark_env_truthy_or_default("LARK_CARD_ACTIONS_ENABLE", default=True)
+
+
 _p0_card_seen_lock = threading.Lock()
 _p0_card_seen_msgs: Dict[str, float] = {}   # open_message_id -> ts, to dedup redelivery / double-click
 
@@ -13441,10 +13463,12 @@ def _p0_detect_prompt_card(cid: str) -> Dict[str, Any]:
     }
 
 
-def _p0_card_action_handler(data: Any) -> Any:
-    """card.action.trigger handler (reached over WS via the card→event frame patch). Handles the P0
-    Confirm/Cancel buttons: returns a toast + a buttonless updated card, and does the heavy work
-    (roster read + /openmeeting) in a background thread to stay within the ~3s callback window."""
+def _lark_ws_card_action_handler(data: Any) -> Any:
+    """The one card.action.trigger handler for the long connection (reached via the card→event
+    frame patch). P0 Confirm/Cancel is answered here — toast + a buttonless updated card, with the
+    heavy work (roster read + /openmeeting) on a background thread to stay inside the ~3s callback
+    window. Every other button (monitoring / mute) is handed to :func:`_lark_dispatch_card_action`,
+    the same router the HTTP webhook uses."""
     from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
 
     def _resp(toast_type: str, toast_content: str, new_card: Optional[Dict[str, Any]] = None) -> Any:
@@ -14988,7 +15012,7 @@ def _lark_ws_enable_card_actions(client_cls: Any) -> None:
     actually pushes these frames. Applied BEFORE the transport-log wrapper so that still logs 'card'.
     """
     global _lark_ws_card_action_patched
-    if _lark_ws_card_action_patched or not _p0_card_buttons_enabled():
+    if _lark_ws_card_action_patched or not _lark_card_actions_enabled():
         return
     try:
         from lark_oapi.ws.const import HEADER_TYPE
@@ -15172,13 +15196,21 @@ def start_lark_ws_client_blocking() -> None:
             (_p0_om_host_open_id()[:12] or "?"),
             bool(_p0_om_announce_chat_default()),
         )
-    if _p0_card_buttons_enabled():
+    if _lark_card_actions_enabled():
         try:
-            bld = bld.register_p2_card_action_trigger(_p0_card_action_handler)
-            logger.info("p0 card buttons enabled — registered card.action.trigger handler "
-                        "(needs console 回调配置 → 使用长连接接收事件).")
+            bld = bld.register_p2_card_action_trigger(_lark_ws_card_action_handler)
+            logger.info(
+                "card buttons enabled — registered card.action.trigger handler for monitoring "
+                "(/m mute, alert Mute 30 min / 1 hour, Resend screenshot) and p0 Confirm/Cancel "
+                "(needs console 订阅方式 → 使用长连接接收事件)."
+            )
         except Exception:
             logger.exception("register_p2_card_action_trigger failed — card buttons unavailable")
+    else:
+        logger.warning(
+            "LARK_CARD_ACTIONS_ENABLE=0 — card button clicks are NOT delivered; alert quick-mute "
+            "and /m cards will do nothing when tapped."
+        )
     handler = bld.build()
     pmap = getattr(handler, "_processorMap", None) or {}
     logger.info("Lark WS p2 processors registered: %s", sorted(pmap.keys()))
@@ -15277,7 +15309,7 @@ def _p0_oauth_callback():
 
 @app.route("/health", methods=["GET"])
 def health():
-    mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower() or "http"
+    mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower() or "ws"
     last_im = float(_lark_ws_last_im_monotonic or 0.0)
     ws_im_age: Optional[float] = None
     if last_im > 0:
@@ -15568,8 +15600,8 @@ def run_monitoring_bot() -> None:
             "GRAFANA_QUERY_LOOKBACK_SECONDS=%s (default 900 = 15m) — /monitoring Prometheus window differs from default 15 minutes",
             GRAFANA_QUERY_LOOKBACK_SECONDS,
         )
-    raw_mode = _cfg_str("LARK_EVENT_MODE", "http").strip().lower()
-    mode = raw_mode if raw_mode else "http"
+    raw_mode = _cfg_str("LARK_EVENT_MODE", "ws").strip().lower()
+    mode = raw_mode if raw_mode else "ws"
     if not MONITORING_LIVESLOT_BET_ENABLE:
         logger.info(
             "Liveslot 下注Bet/min monitoring disabled (MONITORING_LIVESLOT_BET_ENABLE=0) — no fetch, no alerts"
