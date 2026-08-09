@@ -10,9 +10,11 @@ grafanagamebot — Lark + Grafana「Online Number」主面板（``GRAFANA_PANEL_
 
 依赖：Playwright 截图见 ``GRAFANA_SCREENSHOT_ENABLE``；详见 ``_CFG`` 内注释。
 默认 ``MONITORING_MESSAGE_CARD_ENABLE=1``：交互卡片；``MONITORING_CARD_EMBED_SCREENSHOT=1``（默认）时截图嵌卡片内 — **一条消息**；embed=``0`` 则卡片 + 单独图片两条。``MONITORING_MESSAGE_CARD_BUTTON_ENABLE=1`` 时有 **Resend screenshot**。若 ``MONITORING_MESSAGE_CARD_ENABLE=0`` 则为纯文字 + 独立图。
-告警卡片额外附带 **Mute 30 min / Mute 1 hour** 快捷静音按钮（``MONITORING_ALERT_QUICK_MUTE_ENABLE=1``，只静音本次告警的面板）。
-告警截图默认只截 **触发告警的那个图**（``GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE=1``），并由本地 Qwen **复核两次**
-（``MONITORING_AI_SECOND_REVIEW_ENABLE=1``）都判定 ABNORMAL 后才发出。
+告警 = **一条告警一张卡片**（一个「面板 + 序列」= 一张卡）：卡内嵌 **只属于它自己** 的截图（裁剪到该面板、图例只留该序列，
+``GRAFANA_SCREENSHOT_ALERT_CROP_PANEL_ENABLE=1``），并带 **Mute 30 min / Mute 1 hour** 快捷静音按钮
+（``MONITORING_ALERT_QUICK_MUTE_ENABLE=1``，只静音这张卡的面板）。每张卡各自由本地 Qwen **复核两次**
+（``MONITORING_AI_SECOND_REVIEW_ENABLE=1``）都判定 ABNORMAL 才发出——某个序列是噪声只掉它自己，不牵连其它卡。
+所有截图来自 **同一次** dashboard 加载（``_grafana_playwright_render_alert_unit_pngs``）。
 """
 
 import base64
@@ -6463,26 +6465,21 @@ def _grafana_playwright_pre_screenshot_paint_flush(page: Any) -> None:
             pass
 
 
-def _grafana_playwright_render_dashboard_and_png(
+def _grafana_playwright_prepare_dashboard(
     page: Any,
     url: str,
     timeout_ms: int,
     *,
     skip_nav_and_refresh: bool = False,
-    legend_targets: Optional[List[Dict[str, str]]] = None,
-    crop_panel_titles: Optional[List[str]] = None,
-) -> bytes:
+) -> None:
     """
-    Navigate ``page`` to dashboard ``url`` and return a PNG after the same wait/stabilize path
-    as ephemeral screenshots (shared with :class:`GrafanaPlaywrightKeeper`).
-    Caller must have injected Grafana cookies (and optional boot-warm root ``/``) beforehand.
+    Navigate ``page`` to dashboard ``url`` and run the full wait/stabilize/blank-recovery path,
+    leaving it ready for one or more captures. Caller must have injected Grafana cookies
+    (and optional boot-warm root ``/``) beforehand.
 
     ``skip_nav_and_refresh=True`` (persistent keeper jobs): ``goto`` already loads the target range —
     skip Dock + Refresh + second Dock to avoid redundant work and reload fallbacks.
     Blank-chart recovery paths below still run Refresh/Dock when needed.
-
-    ``crop_panel_titles`` (alert path): capture **only those panels** by clipping to their bounding
-    box instead of the whole dashboard; falls back to the full capture when they cannot be located.
     """
     page.goto(url, wait_until="load", timeout=timeout_ms)
     page.wait_for_timeout(120)
@@ -6546,9 +6543,16 @@ def _grafana_playwright_render_dashboard_and_png(
     _grafana_close_open_menus(page)
     if not skip_nav_and_refresh:
         _grafana_playwright_dock_nav_only(page, timeout_ms)
-    if legend_targets:
-        _grafana_playwright_click_alert_series_legends(page, legend_targets)
-        page.wait_for_timeout(180)
+
+
+def _grafana_playwright_capture_png(
+    page: Any, crop_panel_titles: Optional[List[str]] = None
+) -> bytes:
+    """
+    Shutter only — assumes :func:`_grafana_playwright_prepare_dashboard` already ran (and any
+    legend isolation already happened). ``crop_panel_titles`` clips to those panels instead of
+    capturing the whole dashboard, falling back to the full page when they cannot be located.
+    """
     _grafana_playwright_pre_screenshot_paint_flush(page)
     # Alert path: clip to the firing panel(s). ``clip`` selects a region of the *captured image*,
     # so it needs ``full_page=True`` — with a viewport capture Playwright rejects any panel below
@@ -6571,6 +6575,73 @@ def _grafana_playwright_render_dashboard_and_png(
         return page.screenshot(type="png", full_page=full_page, animations="disabled")
     except TypeError:
         return page.screenshot(type="png", full_page=full_page)
+
+
+def _grafana_playwright_render_dashboard_and_png(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    *,
+    skip_nav_and_refresh: bool = False,
+    legend_targets: Optional[List[Dict[str, str]]] = None,
+    crop_panel_titles: Optional[List[str]] = None,
+) -> bytes:
+    """Prepare the dashboard, optionally isolate the alerting series, and take one PNG."""
+    _grafana_playwright_prepare_dashboard(
+        page, url, timeout_ms, skip_nav_and_refresh=skip_nav_and_refresh
+    )
+    if legend_targets:
+        _grafana_playwright_click_alert_series_legends(page, legend_targets)
+        page.wait_for_timeout(180)
+    return _grafana_playwright_capture_png(page, crop_panel_titles)
+
+
+def _grafana_playwright_render_alert_unit_pngs(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    targets: List[Dict[str, str]],
+    *,
+    skip_nav_and_refresh: bool = False,
+) -> List[Optional[bytes]]:
+    """
+    One PNG per ``{panel, series}`` target — each cropped to that panel with **that** series
+    isolated in the legend — from a **single** dashboard load.
+
+    Grafana's legend click means "show only this series", so isolating the next target replaces
+    the previous isolate; re-shooting between clicks costs milliseconds, while a separate page
+    load per series would cost a full Grafana render each. That is what lets every alert card
+    carry a picture of its own series instead of sharing one dashboard-wide screenshot.
+
+    Returns a list aligned with ``targets``; an entry is ``None`` only when that capture failed.
+    """
+    _grafana_playwright_prepare_dashboard(
+        page, url, timeout_ms, skip_nav_and_refresh=skip_nav_and_refresh
+    )
+    out: List[Optional[bytes]] = []
+    for i, tgt in enumerate(targets or []):
+        panel = str(tgt.get("panel") or "").strip()
+        series = str(tgt.get("series") or "").strip()
+        try:
+            if panel and series:
+                _grafana_playwright_click_alert_series_legends(page, [{"panel": panel, "series": series}])
+                page.wait_for_timeout(180)
+            png = _grafana_playwright_capture_png(page, [panel] if panel else None)
+            out.append(png)
+            logger.info(
+                "Grafana screenshot: alert capture %s/%s panel=%r series=%r bytes=%s",
+                i + 1,
+                len(targets),
+                panel,
+                series,
+                len(png),
+            )
+        except Exception:
+            logger.exception(
+                "Grafana screenshot: alert capture failed panel=%r series=%r", panel, series
+            )
+            out.append(None)
+    return out
 
 
 class GrafanaPlaywrightKeeper:
@@ -6603,25 +6674,61 @@ class GrafanaPlaywrightKeeper:
         legend_targets: Optional[List[Dict[str, str]]] = None,
         crop_panel_titles: Optional[List[str]] = None,
     ) -> bytes:
-        warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
-        if not self._ready.wait(timeout=warm_wait):
-            raise TimeoutError("GrafanaPlaywrightKeeper not ready (warm-up still running or failed)")
-        if self._fatal is not None:
-            raise RuntimeError("GrafanaPlaywrightKeeper failed during warm-up") from self._fatal
-        job_timeout = max(30.0, _cfg_float("GRAFANA_PERSISTENT_BROWSER_JOB_TIMEOUT_SECONDS", 180.0))
-        ev = threading.Event()
-        box: Dict[str, Any] = {}
-        self._q.put(
+        box = self._run_job(
             {
                 "op": "png",
                 "url": url,
                 "timeout_ms": int(timeout_ms),
                 "legend_targets": legend_targets,
                 "crop_panel_titles": crop_panel_titles,
-                "ev": ev,
-                "box": box,
-            }
+            },
+            timeout_ms,
         )
+        png = box.get("png")
+        if not isinstance(png, (bytes, bytearray)):
+            raise RuntimeError("keeper returned no PNG bytes")
+        return bytes(png)
+
+    def request_alert_unit_pngs(
+        self, url: str, timeout_ms: int, targets: List[Dict[str, str]]
+    ) -> List[Optional[bytes]]:
+        """One cropped, series-isolated PNG per target — see
+        :func:`_grafana_playwright_render_alert_unit_pngs`. Aligned with ``targets``."""
+        box = self._run_job(
+            {
+                "op": "png_units",
+                "url": url,
+                "timeout_ms": int(timeout_ms),
+                "targets": list(targets or []),
+            },
+            timeout_ms,
+            # Each extra series adds a legend click + shutter, not a page load.
+            extra_seconds=20.0 * max(0, len(targets or []) - 1),
+        )
+        pngs = box.get("pngs")
+        if not isinstance(pngs, list):
+            raise RuntimeError("keeper returned no PNG list")
+        return [bytes(p) if isinstance(p, (bytes, bytearray)) else None for p in pngs]
+
+    def _run_job(
+        self, job: Dict[str, Any], timeout_ms: int, *, extra_seconds: float = 0.0
+    ) -> Dict[str, Any]:
+        warm_wait = max(120.0, float(timeout_ms) / 1000.0 + 45.0)
+        if not self._ready.wait(timeout=warm_wait):
+            raise TimeoutError("GrafanaPlaywrightKeeper not ready (warm-up still running or failed)")
+        if self._fatal is not None:
+            raise RuntimeError("GrafanaPlaywrightKeeper failed during warm-up") from self._fatal
+        job_timeout = max(
+            30.0,
+            _cfg_float("GRAFANA_PERSISTENT_BROWSER_JOB_TIMEOUT_SECONDS", 180.0)
+            + max(0.0, float(extra_seconds)),
+        )
+        ev = threading.Event()
+        box: Dict[str, Any] = {}
+        j = dict(job)
+        j["ev"] = ev
+        j["box"] = box
+        self._q.put(j)
         if not ev.wait(timeout=job_timeout):
             raise TimeoutError("GrafanaPlaywrightKeeper screenshot job timed out")
         err = box.get("err")
@@ -6629,10 +6736,7 @@ class GrafanaPlaywrightKeeper:
             if isinstance(err, BaseException):
                 raise err
             raise RuntimeError(str(err))
-        png = box.get("png")
-        if not isinstance(png, (bytes, bytearray)):
-            raise RuntimeError("keeper returned no PNG bytes")
-        return bytes(png)
+        return box
 
     def _run(self) -> None:
         try:
@@ -6701,9 +6805,10 @@ class GrafanaPlaywrightKeeper:
                     except Exception as ex:
                         logger.debug("GrafanaPlaywrightKeeper idle refresh: %s", ex)
                     continue
-                if job.get("op") == "stop":
+                op = job.get("op")
+                if op == "stop":
                     break
-                if job.get("op") != "png":
+                if op not in ("png", "png_units"):
                     continue
                 ev: threading.Event = job["ev"]
                 box: Dict[str, Any] = job["box"]
@@ -6721,14 +6826,23 @@ class GrafanaPlaywrightKeeper:
                     else:
                         context.clear_cookies()
                         context.add_cookies(ck)
-                    box["png"] = _grafana_playwright_render_dashboard_and_png(
-                        page,
-                        jurl,
-                        max(5000, jto),
-                        skip_nav_and_refresh=True,
-                        legend_targets=job.get("legend_targets"),
-                        crop_panel_titles=job.get("crop_panel_titles"),
-                    )
+                    if op == "png_units":
+                        box["pngs"] = _grafana_playwright_render_alert_unit_pngs(
+                            page,
+                            jurl,
+                            max(5000, jto),
+                            list(job.get("targets") or []),
+                            skip_nav_and_refresh=True,
+                        )
+                    else:
+                        box["png"] = _grafana_playwright_render_dashboard_and_png(
+                            page,
+                            jurl,
+                            max(5000, jto),
+                            skip_nav_and_refresh=True,
+                            legend_targets=job.get("legend_targets"),
+                            crop_panel_titles=job.get("crop_panel_titles"),
+                        )
                 except Exception as ex:
                     box["err"] = ex
                 finally:
@@ -6770,32 +6884,12 @@ def _start_grafana_playwright_keeper_if_enabled() -> None:
             _grafana_pw_keeper = None
 
 
-def _grafana_headless_screenshot_png(
-    session: requests.Session,
-    start_unix: int,
-    end_unix: int,
-    *,
-    relative_from: Optional[str] = None,
-    relative_to: Optional[str] = None,
-    timezone_param: Optional[str] = None,
-    legend_targets: Optional[List[Dict[str, str]]] = None,
-    crop_panel_titles: Optional[List[str]] = None,
-) -> bytes:
+def _grafana_with_ephemeral_page(session: requests.Session, timeout_ms: int, fn: Any) -> Any:
     """
-    Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
-    Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
+    Run ``fn(page)`` on a throwaway Chromium carrying this Grafana session's cookies.
 
-    ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): ``page.screenshot(full_page=True)`` — full scroll height
-    so KPI rows below the fold are included. ``0`` captures only the viewport (``WIDTH``×``HEIGHT``).
-
-    Defaults favor **low latency** (short sleeps, tight spinner/populate caps). If captures go blank,
-    raise ``GRAFANA_SCREENSHOT_POPULATE_MAX_MS`` and ``GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS`` first.
-
-    Optional ``relative_from`` / ``relative_to`` / ``timezone_param`` override the URL query for this
-    capture only (watchdog uses ``now-15m`` … ``now`` + ``timezone=browser`` while Prometheus uses a shorter eval window).
-
-    When ``GRAFANA_PERSISTENT_BROWSER=1`` and the background :class:`GrafanaPlaywrightKeeper` is running,
-    screenshots reuse one Chromium tab (warm at process start) instead of launching a new browser each time.
+    Used when :class:`GrafanaPlaywrightKeeper` is off or its job failed; the keeper's warm tab is
+    always preferred because launching a browser per capture costs seconds.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -6804,40 +6898,7 @@ def _grafana_headless_screenshot_png(
             "Playwright not installed — pip install playwright && playwright install chromium"
         ) from e
 
-    url = _grafana_build_screenshot_dashboard_url(
-        start_unix,
-        end_unix,
-        relative_from=relative_from,
-        relative_to=relative_to,
-        timezone_param=timezone_param,
-    )
     cookies = _playwright_cookie_list(session)
-    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
-    rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(
-        (relative_from or "").strip() or (relative_to or "").strip()
-    )
-    logger.info(
-        "Grafana screenshot: relative_range=%s url=%s",
-        rel_eff,
-        url[:300] + ("…" if len(url) > 300 else ""),
-    )
-
-    k = _grafana_pw_keeper
-    if k is not None and _grafana_persistent_browser_enabled():
-        try:
-            logger.info("Grafana screenshot: using persistent Playwright keeper")
-            return k.request_png(
-                url,
-                timeout_ms,
-                legend_targets=legend_targets,
-                crop_panel_titles=crop_panel_titles,
-            )
-        except Exception as e:
-            logger.warning(
-                "Grafana persistent keeper screenshot failed (%s); falling back to ephemeral browser",
-                e,
-            )
-
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -6874,15 +6935,82 @@ def _grafana_headless_screenshot_png(
                 page.goto(f"{base}/", wait_until="domcontentloaded", timeout=min(20000, timeout_ms))
                 page.wait_for_timeout(140)
 
-            return _grafana_playwright_render_dashboard_and_png(
-                page,
+            return fn(page)
+        finally:
+            browser.close()
+
+
+def _grafana_headless_screenshot_png(
+    session: requests.Session,
+    start_unix: int,
+    end_unix: int,
+    *,
+    relative_from: Optional[str] = None,
+    relative_to: Optional[str] = None,
+    timezone_param: Optional[str] = None,
+    legend_targets: Optional[List[Dict[str, str]]] = None,
+    crop_panel_titles: Optional[List[str]] = None,
+) -> bytes:
+    """
+    Headless Chromium (Playwright) opens the same dashboard URL as the UI, with session cookies.
+    Requires: ``pip install playwright`` and ``playwright install chromium`` on the server.
+
+    ``GRAFANA_SCREENSHOT_FULL_PAGE=1`` (default): ``page.screenshot(full_page=True)`` — full scroll height
+    so KPI rows below the fold are included. ``0`` captures only the viewport (``WIDTH``×``HEIGHT``).
+
+    Defaults favor **low latency** (short sleeps, tight spinner/populate caps). If captures go blank,
+    raise ``GRAFANA_SCREENSHOT_POPULATE_MAX_MS`` and ``GRAFANA_SCREENSHOT_POST_REFRESH_SPINNER_MS`` first.
+
+    Optional ``relative_from`` / ``relative_to`` / ``timezone_param`` override the URL query for this
+    capture only (watchdog uses ``now-15m`` … ``now`` + ``timezone=browser`` while Prometheus uses a shorter eval window).
+
+    When ``GRAFANA_PERSISTENT_BROWSER=1`` and the background :class:`GrafanaPlaywrightKeeper` is running,
+    screenshots reuse one Chromium tab (warm at process start) instead of launching a new browser each time.
+    """
+    url = _grafana_build_screenshot_dashboard_url(
+        start_unix,
+        end_unix,
+        relative_from=relative_from,
+        relative_to=relative_to,
+        timezone_param=timezone_param,
+    )
+    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
+    rel_eff = GRAFANA_SCREENSHOT_RELATIVE_RANGE or bool(
+        (relative_from or "").strip() or (relative_to or "").strip()
+    )
+    logger.info(
+        "Grafana screenshot: relative_range=%s url=%s",
+        rel_eff,
+        url[:300] + ("…" if len(url) > 300 else ""),
+    )
+
+    k = _grafana_pw_keeper
+    if k is not None and _grafana_persistent_browser_enabled():
+        try:
+            logger.info("Grafana screenshot: using persistent Playwright keeper")
+            return k.request_png(
                 url,
                 timeout_ms,
                 legend_targets=legend_targets,
                 crop_panel_titles=crop_panel_titles,
             )
-        finally:
-            browser.close()
+        except Exception as e:
+            logger.warning(
+                "Grafana persistent keeper screenshot failed (%s); falling back to ephemeral browser",
+                e,
+            )
+
+    return _grafana_with_ephemeral_page(
+        session,
+        timeout_ms,
+        lambda page: _grafana_playwright_render_dashboard_and_png(
+            page,
+            url,
+            timeout_ms,
+            legend_targets=legend_targets,
+            crop_panel_titles=crop_panel_titles,
+        ),
+    )
 
 
 def _analysis_hit_alert_series_labels(analysis: Dict[str, Any]) -> List[str]:
@@ -6920,51 +7048,16 @@ def _monitoring_collect_alert_legend_targets(payload: Dict[str, Any]) -> List[Di
         seen.add(key)
         out.append({"panel": p, "series": s})
 
-    if MONITORING_HTTP_PRIMARY_ENABLE and not _monitoring_alert_channel_muted("http"):
-        for lbl in _analysis_hit_alert_series_labels(_http_analysis_for_payload(payload)):
-            append(GRAFANA_PANEL_TITLE, lbl)
-
-    for ex in payload.get("extraPanels") or []:
-        if not isinstance(ex, dict):
-            continue
-        kind = (ex.get("kind") or "")
-        logical = _extra_panel_logical_kind(kind)
-        if logical not in (
-            MONITORING_EXTRA_KIND_EGAME_ONLINE,
-            MONITORING_EXTRA_KIND_EGAMES_BET,
-            MONITORING_EXTRA_KIND_LIVESLOT_BET,
-            MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT,
-        ):
-            continue
-        if _monitoring_extra_channel_muted(kind):
-            continue
-        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
-        if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE:
-            panel_title = GRAFANA_PANEL_TITLE_EGAME_ONLINE
-            analysis = _analysis_for_egame_online_payload(p2)
-            fallbacks: Tuple[str, ...] = (
-                (MONITORING_EGAME_ONLINE_SERIES_KEYWORD,) if MONITORING_EGAME_ONLINE_SERIES_KEYWORD else ()
-            )
-        elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
-            panel_title = GRAFANA_PANEL_TITLE_EGAMES_BET
-            analysis = _analysis_for_egames_bet_payload(p2)
-            inc = (MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD or "").strip()
-            fallbacks = tuple(_parse_monitoring_series_keywords(inc))
-        elif logical == MONITORING_EXTRA_KIND_LIVESLOT_BET:
-            panel_title = GRAFANA_PANEL_TITLE_LIVESLOT_BET
-            analysis = _analysis_for_liveslot_bet_payload(p2)
-            fallbacks = (MONITORING_LIVESLOT_BET_SERIES_INCLUDE or "total spins",)
-        else:
-            panel_title = GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET
-            analysis = _analysis_for_liveslot_spin_count_payload(p2)
-            fallbacks = (MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE or "spin_count",)
-
+    for spec in _monitoring_alert_panel_specs(payload):
+        panel_title = str(spec["panel"])
+        analysis = spec["analysis"]
         hit_labels = _analysis_hit_alert_series_labels(analysis)
         if hit_labels:
             for lbl in hit_labels:
                 append(panel_title, lbl)
         elif _analysis_aggregate_hit_alert(analysis):
-            for fb in fallbacks:
+            # HTTP primary has no configured fallback label — nothing to isolate there.
+            for fb in spec["fallbacks"]:
                 append(panel_title, fb)
 
     return out
@@ -7023,6 +7116,72 @@ def _grafana_watchdog_alert_screenshot_png(
     independent of the shorter Prometheus eval window on the payload.
     """
     return _grafana_monitoring_screenshot_png(session, payload, for_alert=True)
+
+
+def _grafana_alert_screenshot_url() -> str:
+    """The watchdog alert dashboard URL (browser range ``now-1h`` … ``now`` by default)."""
+    su, eu = _monitoring_watch_eval_window_unix()
+    rf = _cfg_str("MONITORING_WATCH_SCREENSHOT_FROM", "now-1h").strip() or "now-1h"
+    rt = _cfg_str("MONITORING_WATCH_SCREENSHOT_TO", "now").strip() or "now"
+    tz = _cfg_str("GRAFANA_SCREENSHOT_TIMEZONE", "browser").strip()
+    return _grafana_build_screenshot_dashboard_url(
+        su, eu, relative_from=rf, relative_to=rt, timezone_param=tz or None
+    )
+
+
+def _grafana_alert_unit_screenshots(
+    session: requests.Session, units: List[Dict[str, str]]
+) -> List[Optional[bytes]]:
+    """
+    One screenshot per alert unit — cropped to that unit's panel with that unit's series isolated —
+    so every alert card carries a picture of exactly the series its text is about.
+
+    All captures come from a **single** dashboard load. Returns a list aligned with ``units``;
+    ``None`` means that capture is unavailable (screenshots off, Playwright missing, or it failed).
+    """
+    n = len(units or [])
+    if not n:
+        return []
+    if not _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        return [None] * n
+    targets = [
+        {"panel": str(u.get("panel") or ""), "series": str(u.get("series") or "")} for u in units
+    ]
+    url = _grafana_alert_screenshot_url()
+    timeout_ms = max(5000, int(GRAFANA_SCREENSHOT_TIMEOUT_MS))
+    logger.info(
+        "Grafana alert screenshots: %s unit(s) from one dashboard load url=%s",
+        n,
+        url[:200] + ("…" if len(url) > 200 else ""),
+    )
+
+    k = _grafana_pw_keeper
+    if k is not None and _grafana_persistent_browser_enabled():
+        try:
+            pngs = k.request_alert_unit_pngs(url, timeout_ms, targets)
+            if len(pngs) == n:
+                return pngs
+            logger.warning(
+                "Grafana alert screenshots: keeper returned %s of %s — falling back", len(pngs), n
+            )
+        except Exception as e:
+            logger.warning(
+                "Grafana persistent keeper alert captures failed (%s); falling back to ephemeral browser",
+                e,
+            )
+    try:
+        pngs = _grafana_with_ephemeral_page(
+            session,
+            timeout_ms,
+            lambda page: _grafana_playwright_render_alert_unit_pngs(page, url, timeout_ms, targets),
+        )
+    except Exception:
+        logger.exception("Grafana alert screenshots failed — cards will be sent without images")
+        return [None] * n
+    if len(pngs) != n:
+        logger.warning("Grafana alert screenshots: got %s captures for %s units", len(pngs), n)
+        pngs = (list(pngs) + [None] * n)[:n]
+    return pngs
 
 
 def _metric_series_is_http_leg(metric: Dict[str, Any]) -> bool:
@@ -8311,16 +8470,23 @@ def _format_trigger_fallback_line(
     return None
 
 
-def _format_alert_reason_chunks_for_analysis(
+def _format_alert_reason_units_for_analysis(
     graph_label: str,
     default_series_disp: str,
     analysis: Dict[str, Any],
     fast_threshold_pct: float,
     continuous_threshold_pct: float,
     window_seconds: int,
-) -> List[str]:
-    """Build one or more alert markdown chunks (per-game lines when ``per_series`` is set)."""
-    chunks: List[str] = []
+) -> List[Tuple[str, str]]:
+    """
+    ``[(series_label, markdown_chunk), …]`` — one entry per alerting series (per-game lines when
+    ``per_series`` is set, otherwise a single merged entry).
+
+    The label rides along with its chunk so an alert can be split into one card per series, each
+    with the matching legend-isolated screenshot (:func:`_monitoring_alert_units`);
+    :func:`_format_alert_trigger_reply` joins the same chunks into the combined message.
+    """
+    units: List[Tuple[str, str]] = []
     per = analysis.get("per_series")
     if isinstance(per, list) and per:
         for sub in per:
@@ -8353,8 +8519,8 @@ def _format_alert_reason_chunks_for_analysis(
                     _format_alert_series_table_footer(graph_label, s_one, sub)
                 )
             if reasons:
-                chunks.append("\n\n".join(reasons))
-        return chunks
+                units.append((s_one, "\n\n".join(reasons)))
+        return units
 
     s_disp = (default_series_disp or "").strip() or "all series merged"
     reasons2 = _format_trigger_lines(
@@ -8381,8 +8547,8 @@ def _format_alert_reason_chunks_for_analysis(
     elif reasons2 and not MONITORING_SIMPLE_ALERT_TEXT:
         reasons2.append(_format_alert_series_table_footer(graph_label, s_disp, analysis))
     if reasons2:
-        chunks.append("\n\n".join(reasons2))
-    return chunks
+        units.append((s_disp, "\n\n".join(reasons2)))
+    return units
 
 
 def _append_monitoring_alert_target_user_mention(lines: List[str]) -> None:
@@ -8401,29 +8567,38 @@ def _append_monitoring_alert_target_user_mention(lines: List[str]) -> None:
     lines.append(f"<at id={TARGET_USER_OPEN_ID}></at>")
 
 
-def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
+_MONITORING_ALERT_HEADER_LINES: Tuple[str, ...] = (
+    "[ALERT] Monitoring thresholds exceeded",
+    "Fast = sharpest move within ~3 minutes; Continuous = longest steady climb or drop.",
+    "",
+)
+
+
+def _monitoring_alert_panel_specs(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Alert-only concise content:
-    which graph/series, spike or drop, from value/time -> to value/time.
+    One descriptor per **enabled and unmuted** monitored panel present in ``payload``, in the order
+    alerts are reported: HTTP primary first, then ``extraPanels`` as they arrive.
+
+    Single source of truth for the alert text, the legend-isolation targets, the screenshot crop
+    and the quick-mute channel — these used to be three copies of the same if/elif chain, and a
+    drift between them meant a card whose picture showed a different series than its text.
+    Keys: ``channel``, ``panel``, ``analysis``, ``series_disp``, ``fallbacks``, ``fast``, ``cont``.
     """
-    _mute_purge_expired()
-    lines: List[str] = [
-        "[ALERT] Monitoring thresholds exceeded",
-        "Fast = sharpest move within ~3 minutes; Continuous = longest steady climb or drop.",
-        "",
-    ]
-    reason_blocks: List[str] = []
+    specs: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return specs
     if MONITORING_HTTP_PRIMARY_ENABLE and not _monitoring_alert_channel_muted("http"):
-        a_http = _http_analysis_for_payload(payload)
-        for chunk in _format_alert_reason_chunks_for_analysis(
-            GRAFANA_PANEL_TITLE,
-            "",
-            a_http,
-            MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT,
-            MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
-            MONITORING_ALERT_WINDOW_SECONDS,
-        ):
-            reason_blocks.append(chunk)
+        specs.append(
+            {
+                "channel": "http",
+                "panel": GRAFANA_PANEL_TITLE,
+                "analysis": _http_analysis_for_payload(payload),
+                "series_disp": "",
+                "fallbacks": (),
+                "fast": MONITORING_LIVESLOTS_FAST_DROP_ALERT_PCT,
+                "cont": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+            }
+        )
     for ex in payload.get("extraPanels") or []:
         if not isinstance(ex, dict):
             continue
@@ -8440,42 +8615,106 @@ def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
             continue
         p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         if logical == MONITORING_EXTRA_KIND_EGAME_ONLINE:
-            g_lbl = GRAFANA_PANEL_TITLE_EGAME_ONLINE
-            s_lbl = MONITORING_EGAME_ONLINE_SERIES_KEYWORD
-            a2 = _analysis_for_egame_online_payload(p2)
-            fast2 = MONITORING_EGAME_FAST_DROP_ALERT_PCT
-            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+            spec = {
+                "panel": GRAFANA_PANEL_TITLE_EGAME_ONLINE,
+                "analysis": _analysis_for_egame_online_payload(p2),
+                "series_disp": MONITORING_EGAME_ONLINE_SERIES_KEYWORD,
+                "fallbacks": (
+                    (MONITORING_EGAME_ONLINE_SERIES_KEYWORD,)
+                    if MONITORING_EGAME_ONLINE_SERIES_KEYWORD
+                    else ()
+                ),
+                "fast": MONITORING_EGAME_FAST_DROP_ALERT_PCT,
+                "cont": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+            }
         elif logical == MONITORING_EXTRA_KIND_EGAMES_BET:
-            g_lbl = GRAFANA_PANEL_TITLE_EGAMES_BET
-            s_lbl = MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD
-            a2 = _analysis_for_egames_bet_payload(p2)
-            fast2 = MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT
-            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+            inc = (
+                MONITORING_EGAMES_BET_SERIES_INCLUDE or MONITORING_EGAMES_BET_SERIES_KEYWORD or ""
+            ).strip()
+            spec = {
+                "panel": GRAFANA_PANEL_TITLE_EGAMES_BET,
+                "analysis": _analysis_for_egames_bet_payload(p2),
+                "series_disp": MONITORING_EGAMES_BET_SERIES_INCLUDE
+                or MONITORING_EGAMES_BET_SERIES_KEYWORD,
+                "fallbacks": tuple(_parse_monitoring_series_keywords(inc)),
+                "fast": MONITORING_EGAMES_BET_FAST_DROP_ALERT_PCT,
+                "cont": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+            }
         elif logical == MONITORING_EXTRA_KIND_LIVESLOT_BET:
-            g_lbl = GRAFANA_PANEL_TITLE_LIVESLOT_BET
-            s_lbl = ""
-            a2 = _analysis_for_liveslot_bet_payload(p2)
-            fast2 = MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT
-            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
+            spec = {
+                "panel": GRAFANA_PANEL_TITLE_LIVESLOT_BET,
+                "analysis": _analysis_for_liveslot_bet_payload(p2),
+                "series_disp": "",
+                "fallbacks": (MONITORING_LIVESLOT_BET_SERIES_INCLUDE or "total spins",),
+                "fast": MONITORING_LIVESLOT_BET_FAST_DROP_ALERT_PCT,
+                "cont": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+            }
         else:
-            g_lbl = GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET
-            s_lbl = MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE
-            a2 = _analysis_for_liveslot_spin_count_payload(p2)
-            fast2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
-            cont2 = MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT
-        for chunk in _format_alert_reason_chunks_for_analysis(
-            g_lbl,
-            s_lbl,
-            a2,
-            fast2,
-            cont2,
+            spec = {
+                "panel": GRAFANA_PANEL_TITLE_LIVESLOT_SPIN_BET,
+                "analysis": _analysis_for_liveslot_spin_count_payload(p2),
+                "series_disp": MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE,
+                "fallbacks": (MONITORING_LIVESLOT_SPIN_COUNT_SERIES_INCLUDE or "spin_count",),
+                "fast": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+                "cont": MONITORING_PANEL_FAST_ONLY_CONTINUOUS_PCT,
+            }
+        spec["channel"] = logical
+        specs.append(spec)
+    return specs
+
+
+def _monitoring_alert_units(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Split an alert into its individual **panel + series** alerts — one per ``────────`` block of
+    the combined message. Each unit is sent as its own card with its own screenshot.
+
+    Keys: ``channel`` (for quick-mute), ``panel`` (screenshot crop), ``series`` (legend isolate)
+    and ``text`` (that alert's markdown, identical to its block in the combined message).
+    """
+    _mute_purge_expired()
+    units: List[Dict[str, str]] = []
+    for spec in _monitoring_alert_panel_specs(payload):
+        for series, text in _format_alert_reason_units_for_analysis(
+            str(spec["panel"]),
+            str(spec["series_disp"] or ""),
+            spec["analysis"],
+            float(spec["fast"]),
+            float(spec["cont"]),
             MONITORING_ALERT_WINDOW_SECONDS,
         ):
-            reason_blocks.append(chunk)
-    if not reason_blocks:
+            units.append(
+                {
+                    "channel": str(spec["channel"]),
+                    "panel": str(spec["panel"]),
+                    "series": (series or "").strip(),
+                    "text": text,
+                }
+            )
+    return units
+
+
+def _format_alert_unit_reply(unit: Dict[str, str]) -> str:
+    """One unit's card body — same header as the combined message so ``[ALERT]`` styling holds."""
+    lines: List[str] = list(_MONITORING_ALERT_HEADER_LINES)
+    lines.append(str(unit.get("text") or ""))
+    _append_monitoring_alert_target_user_mention(lines)
+    return "\n".join(lines)
+
+
+def _format_alert_trigger_reply(payload: Dict[str, Any]) -> str:
+    """
+    Alert-only concise content:
+    which graph/series, spike or drop, from value/time -> to value/time.
+
+    All alerting series in one message — used by ``/mo`` and as the fallback when the per-series
+    cards (:func:`_monitoring_alert_units`) cannot be built.
+    """
+    units = _monitoring_alert_units(payload)
+    lines: List[str] = list(_MONITORING_ALERT_HEADER_LINES)
+    if not units:
         lines.append("Alert fired but no panel matched text details (no analyzable points).")
     else:
-        lines.append("\n────────\n".join(reason_blocks))
+        lines.append("\n────────\n".join(u["text"] for u in units))
     _append_monitoring_alert_target_user_mention(lines)
     return "\n".join(lines)
 
@@ -8530,34 +8769,15 @@ def _monitoring_alerting_channel_kinds(payload: Optional[Dict[str, Any]]) -> Lis
     """
     _mute_purge_expired()
     out: List[str] = []
-    if not isinstance(payload, dict):
-        return out
-    if (
-        MONITORING_HTTP_PRIMARY_ENABLE
-        and not _monitoring_alert_channel_muted("http")
-        and _analysis_aggregate_hit_alert(_http_analysis_for_payload(payload))
-    ):
-        out.append("http")
-    analyzers = {
-        MONITORING_EXTRA_KIND_EGAME_ONLINE: _analysis_for_egame_online_payload,
-        MONITORING_EXTRA_KIND_EGAMES_BET: _analysis_for_egames_bet_payload,
-        MONITORING_EXTRA_KIND_LIVESLOT_BET: _analysis_for_liveslot_bet_payload,
-        MONITORING_EXTRA_KIND_LIVESLOT_SPIN_COUNT: _analysis_for_liveslot_spin_count_payload,
-    }
-    for ex in payload.get("extraPanels") or []:
-        if not isinstance(ex, dict):
+    for spec in _monitoring_alert_panel_specs(payload):
+        ch = str(spec["channel"])
+        if ch in out:
             continue
-        k = (ex.get("kind") or "")
-        logical = _extra_panel_logical_kind(k)
-        analyzer = analyzers.get(logical)
-        if analyzer is None or logical in out or _monitoring_extra_channel_muted(k):
-            continue
-        p2 = ex.get("payload") if isinstance(ex.get("payload"), dict) else {}
         try:
-            if _analysis_aggregate_hit_alert(analyzer(p2)):
-                out.append(logical)
+            if _analysis_aggregate_hit_alert(spec["analysis"]):
+                out.append(ch)
         except Exception:
-            logger.exception("alerting-kinds analysis failed for kind=%r", k)
+            logger.exception("alerting-kinds analysis failed for channel=%r", ch)
     return out
 
 
@@ -9204,6 +9424,147 @@ def _monitoring_ai_gate_decide(alert_pngs: List[bytes], reply: str) -> Tuple[boo
     if explanation:
         reply = f"{reply}\n\n{explanation}"
     return True, reply
+
+
+def _monitoring_send_alert_unit_cards(
+    receive_id_type: str,
+    receive_id: str,
+    units: List[Dict[str, str]],
+    pngs: List[Optional[bytes]],
+) -> Tuple[int, int]:
+    """
+    **One card per alerting panel + series.** Each card carries only that alert's text, its own
+    legend-isolated screenshot embedded inside it, its own quick-mute buttons, and gets its own
+    two-round AI review — so a noisy series is dropped on its own instead of dragging the whole
+    batch through (or suppressing real ones alongside it).
+
+    Returns ``(cards_sent, units_suppressed_by_ai)``.
+    """
+    rid = (receive_id or "").strip()
+    if not rid:
+        raise ValueError("empty receive_id for alert cards")
+    embed = _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT")
+    sent = 0
+    suppressed = 0
+    for i, unit in enumerate(units or []):
+        png = pngs[i] if i < len(pngs) else None
+        panel = str(unit.get("panel") or "")
+        series = str(unit.get("series") or "")
+        body = _format_alert_unit_reply(unit)
+        ai_ok, body = _monitoring_ai_gate_decide([png] if png is not None else [], body)
+        if not ai_ok:
+            suppressed += 1
+            logger.info(
+                "alert card suppressed by AI gate panel=%r series=%r", panel, series
+            )
+            continue
+
+        img_key: Optional[str] = None
+        if png is not None and embed:
+            try:
+                img_key = _lark_upload_png_image_key(png)
+            except Exception:
+                logger.exception("alert card: screenshot upload failed panel=%r", panel)
+        channel = str(unit.get("channel") or "").strip()
+        try:
+            used_card, embedded = _lark_send_monitoring_user_message(
+                receive_id_type,
+                rid,
+                body,
+                img_key,
+                alert_kinds=[channel] if channel else None,
+            )
+            sent += 1
+            logger.info(
+                "alert card sent panel=%r series=%r card=%s embedded_png=%s chat_prefix=%s...",
+                panel,
+                series,
+                used_card,
+                embedded,
+                rid[:16],
+            )
+        except Exception:
+            logger.exception("alert card send failed panel=%r series=%r", panel, series)
+            continue
+        # Card went out but the image did not ride along — send it as its own message so the
+        # alert is never text-only.
+        if png is not None and not embedded:
+            try:
+                _lark_send_image_message(
+                    receive_id_type, rid, img_key or _lark_upload_png_image_key(png)
+                )
+            except Exception:
+                logger.exception("alert card: separate image send failed panel=%r", panel)
+    return sent, suppressed
+
+
+def _monitoring_dispatch_alert(
+    session: requests.Session, payload: Dict[str, Any], alert_chat: str
+) -> int:
+    """
+    Deliver one fired alert to ``alert_chat`` as **one card per panel + series**, each with its own
+    screenshot and quick-mute buttons. Returns the number of cards sent (0 = everything suppressed
+    by the AI gate, or nothing could be sent).
+
+    Falls back to the previous single combined card when the payload has no per-series detail.
+    """
+    units = _monitoring_alert_units(payload)
+    if units:
+        pngs = _grafana_alert_unit_screenshots(session, units)
+        sent, suppressed = _monitoring_send_alert_unit_cards("chat_id", alert_chat, units, pngs)
+        logger.info(
+            "monitoring watchdog: %s/%s alert card(s) sent (%s suppressed by AI gate) chat_prefix=%s...",
+            sent,
+            len(units),
+            suppressed,
+            alert_chat[:16],
+        )
+        return sent
+
+    # No analyzable per-series blocks — keep the old combined behaviour rather than going silent.
+    reply = _format_alert_trigger_reply(payload)
+    alert_png: Optional[bytes] = None
+    if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
+        try:
+            alert_png = _grafana_watchdog_alert_screenshot_png(session, payload)
+        except Exception:
+            logger.exception("monitoring watchdog pre-screenshot failed")
+    ai_ok, reply = _monitoring_ai_gate_decide(
+        [alert_png] if alert_png is not None else [], reply
+    )
+    if not ai_ok:
+        logger.info(
+            "monitoring watchdog: combined alert suppressed by AI gate chat_prefix=%s...",
+            alert_chat[:16],
+        )
+        return 0
+    pre_key: Optional[str] = None
+    if alert_png is not None and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
+        try:
+            pre_key = _lark_upload_png_image_key(alert_png)
+        except Exception:
+            logger.exception("monitoring watchdog pre-screenshot upload failed")
+    used_card, embedded = _lark_send_monitoring_user_message(
+        "chat_id",
+        alert_chat,
+        reply,
+        pre_key,
+        alert_kinds=_monitoring_alerting_channel_kinds(payload),
+    )
+    logger.info(
+        "monitoring watchdog combined alert sent chat_prefix=%s... card=%s embedded_png=%s",
+        alert_chat[:16],
+        used_card,
+        embedded,
+    )
+    if alert_png is not None and not embedded:
+        try:
+            _lark_send_image_message(
+                "chat_id", alert_chat, pre_key or _lark_upload_png_image_key(alert_png)
+            )
+        except Exception:
+            logger.exception("monitoring watchdog screenshot send failed")
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -13858,68 +14219,11 @@ def _monitoring_watchdog_loop() -> None:
                         continue
                     _monitoring_watch_last_alert_at = now_m
 
-                reply = _format_alert_trigger_reply(payload_c)
-                pre_key: Optional[str] = None
-                # Screenshot up-front (series-isolated) so the AI can review it before we post.
-                alert_png: Optional[bytes] = None
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        alert_png = _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot failed")
-
-                # Second review: only page the group if the local AI (Qwen) judges the isolated
-                # screenshot abnormal; the AI explanation is appended to ``reply``.
-                ai_ok, reply = _monitoring_ai_gate_decide(
-                    [alert_png] if alert_png is not None else [], reply
-                )
-                if not ai_ok:
-                    logger.info(
-                        "monitoring watchdog: alert suppressed by AI gate (after confirm) chat_prefix=%s...",
-                        alert_chat[:16],
-                    )
-                    time.sleep(sec)
-                    continue
-
-                if alert_png is not None and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
-                    try:
-                        pre_key = _lark_upload_png_image_key(alert_png)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot upload failed")
-
-                used_card, embedded = _lark_send_monitoring_user_message(
-                    "chat_id",
-                    alert_chat,
-                    reply,
-                    pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
-                    alert_kinds=_monitoring_alerting_channel_kinds(payload_c),
-                )
-                logger.info(
-                    "monitoring watchdog alert sent (after confirm) chat_prefix=%s... card=%s embedded_png=%s",
-                    alert_chat[:16],
-                    used_card,
-                    embedded,
-                )
-
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and not embedded:
-                    if pre_key:
-                        try:
-                            _lark_send_image_message("chat_id", alert_chat, pre_key)
-                            logger.info("monitoring watchdog screenshot sent via pre_key")
-                        except Exception:
-                            logger.exception("monitoring watchdog pre_key image send failed")
-                    else:
-                        try:
-                            png = (
-                                alert_png
-                                if alert_png is not None
-                                else _grafana_watchdog_alert_screenshot_png(sess_c, payload_c)
-                            )
-                            key = _lark_upload_png_image_key(png)
-                            _lark_send_image_message("chat_id", alert_chat, key)
-                            logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
-                        except Exception:
-                            logger.exception("monitoring watchdog screenshot send failed")
+                # One card per alerting panel+series, each with its own screenshot and AI review.
+                try:
+                    _monitoring_dispatch_alert(sess_c, payload_c, alert_chat)
+                except Exception:
+                    logger.exception("monitoring watchdog alert dispatch failed (after confirm)")
                 time.sleep(sec)
                 continue
 
@@ -13973,68 +14277,11 @@ def _monitoring_watchdog_loop() -> None:
                 with _monitoring_reply_dispatch_lock:
                     _monitoring_watch_last_alert_at = now_m
 
-                reply = _format_alert_trigger_reply(payload)
-                pre_key = None
-                # Screenshot up-front (series-isolated) so the AI can review it before we post.
-                alert_png = None
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE"):
-                    try:
-                        alert_png = _grafana_watchdog_alert_screenshot_png(sess, payload)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot failed")
-
-                # Second review: only page the group if the local AI (Qwen) judges the isolated
-                # screenshot abnormal; the AI explanation is appended to ``reply``.
-                ai_ok, reply = _monitoring_ai_gate_decide(
-                    [alert_png] if alert_png is not None else [], reply
-                )
-                if not ai_ok:
-                    logger.info(
-                        "monitoring watchdog: alert suppressed by AI gate chat_prefix=%s...",
-                        alert_chat[:16],
-                    )
-                    time.sleep(sec)
-                    continue
-
-                if alert_png is not None and _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT"):
-                    try:
-                        pre_key = _lark_upload_png_image_key(alert_png)
-                    except Exception:
-                        logger.exception("monitoring watchdog pre-screenshot upload failed")
-
-                used_card, embedded = _lark_send_monitoring_user_message(
-                    "chat_id",
-                    alert_chat,
-                    reply,
-                    pre_key if _lark_env_truthy("MONITORING_CARD_EMBED_SCREENSHOT") else None,
-                    alert_kinds=_monitoring_alerting_channel_kinds(payload),
-                )
-                logger.info(
-                    "monitoring watchdog alert sent chat_prefix=%s... card=%s embedded_png=%s",
-                    alert_chat[:16],
-                    used_card,
-                    embedded,
-                )
-
-                if _lark_env_truthy("GRAFANA_SCREENSHOT_ENABLE") and not embedded:
-                    if pre_key:
-                        try:
-                            _lark_send_image_message("chat_id", alert_chat, pre_key)
-                            logger.info("monitoring watchdog screenshot sent via pre_key")
-                        except Exception:
-                            logger.exception("monitoring watchdog pre_key image send failed")
-                    else:
-                        try:
-                            png = (
-                                alert_png
-                                if alert_png is not None
-                                else _grafana_watchdog_alert_screenshot_png(sess, payload)
-                            )
-                            key = _lark_upload_png_image_key(png)
-                            _lark_send_image_message("chat_id", alert_chat, key)
-                            logger.info("monitoring watchdog screenshot sent bytes=%s", len(png))
-                        except Exception:
-                            logger.exception("monitoring watchdog screenshot send failed")
+                # One card per alerting panel+series, each with its own screenshot and AI review.
+                try:
+                    _monitoring_dispatch_alert(sess, payload, alert_chat)
+                except Exception:
+                    logger.exception("monitoring watchdog alert dispatch failed")
             finally:
                 _tls_analysis_drop.watchdog = False
         except Exception:
